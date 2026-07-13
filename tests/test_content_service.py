@@ -436,6 +436,38 @@ def test_parse_reply_targets_accepts_common_browser_model_key_variants() -> None
     assert targets[0].url == "https://x.com/user/status/456"
 
 
+def test_parse_reply_targets_recovers_all_items_from_unescaped_reply_quotes() -> None:
+    targets = _parse_reply_targets(
+        r'''
+        {
+          "targets": [
+            {
+              "url": "[https://x.com/NetflixKR/status/2076592469999792472](https://x.com/NetflixKR/status/2076592469999792472)",
+              "target": "@NetflixKR - Park Jihoon new movie release",
+              "target_audience": "Korean drama viewers",
+              "reason": "High velocity official Netflix account post.",
+              "reply": "준비물: 눈물 닦을 휴지 한 박스"
+            },
+            {
+              "url": "[https://x.com/Footballtweet/status/2076598196529180893](https://x.com/Footballtweet/status/2076598196529180893)",
+              "target": "@Footballtweet - Jose Mourinho Netflix documentary",
+              "target_audience": "Football fans",
+              "reason": "Mourinho content drives engagement.",
+              "reply": "If he doesnt say "I am a special one" in the first 5 minutes I am turning it off"
+            }
+          ]
+        }
+        '''
+    )
+
+    assert len(targets) == 2
+    assert targets[0].url == "https://x.com/NetflixKR/status/2076592469999792472"
+    assert targets[1].url == "https://x.com/Footballtweet/status/2076598196529180893"
+    assert targets[1].reply == (
+        'If he doesnt say "I am a special one" in the first 5 minutes I am turning it off'
+    )
+
+
 def test_parse_json_handles_multiple_objects_from_browser_output() -> None:
     payload = _parse_json(
         """

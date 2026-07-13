@@ -4,10 +4,20 @@ const DEFAULTS = {
   timeoutSeconds: 300,
   autoRun: false,
   pollSeconds: 30,
+  automationEnabled: false,
+  activeStart: "08:00",
+  activeEnd: "22:00",
+  replyTargetsMinutes: 30,
+  replyTargetsQuery: "",
+  trendTimes: "09:00,18:00",
+  trendCategory: "auto",
+  nextReplyTargetsAt: 0,
+  trendRunKeys: [],
   lastStatus: "Ready."
 };
 
 const AUTO_ALARM = "x-content-bot-auto-run";
+const AUTOMATION_ALARM = "x-content-bot-scheduled-approvals";
 const FINAL_PROVIDER_URL = "https://gemini.google.com/app";
 const FINAL_PROVIDER_ORIGIN = "https://gemini.google.com";
 const FINAL_PROVIDER_NAME = "Gemini";
@@ -15,10 +25,12 @@ let running = false;
 
 chrome.runtime.onInstalled.addListener(() => {
   ensureAutoAlarm();
+  ensureAutomationAlarm();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   ensureAutoAlarm();
+  ensureAutomationAlarm();
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -26,11 +38,30 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (changes.autoRun || changes.pollSeconds) {
     ensureAutoAlarm();
   }
+  if (
+    changes.automationEnabled || changes.activeStart || changes.activeEnd ||
+    changes.replyTargetsMinutes || changes.trendTimes
+  ) {
+    if (changes.replyTargetsMinutes) {
+      const minutes = Math.max(5, Number(changes.replyTargetsMinutes.newValue || DEFAULTS.replyTargetsMinutes));
+      chromeStorageSet({ nextReplyTargetsAt: Date.now() + minutes * 60 * 1000 })
+        .then(() => ensureAutomationAlarm());
+    } else {
+      ensureAutomationAlarm();
+    }
+  }
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === AUTO_ALARM) {
     runJobs({ force: false, maxJobs: 3 });
+  }
+  if (alarm.name === AUTOMATION_ALARM) {
+    automationTick()
+      .then((result) => result && !result.opened && result.runJobs
+        ? runJobs({ force: true, maxJobs: 3 })
+        : null)
+      .catch((error) => setStatus(`Automation error: ${error.message || error}`));
   }
 });
 
@@ -46,7 +77,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.action === "save-config") {
     saveConfig(message.config || {})
-      .then(() => ensureAutoAlarm())
+      .then(() => Promise.all([ensureAutoAlarm(), ensureAutomationAlarm()]))
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
     return true;
@@ -79,6 +110,159 @@ async function ensureAutoAlarm() {
     periodInMinutes: Math.max(0.5, config.pollSeconds / 60)
   });
   runJobs({ force: false, maxJobs: 3 });
+}
+
+async function ensureAutomationAlarm() {
+  const config = await loadConfig();
+  await chromeAlarmsClear(AUTOMATION_ALARM);
+  if (config.automationEnabled && !config.nextReplyTargetsAt) {
+    await chromeStorageSet({
+      nextReplyTargetsAt: Date.now() + config.replyTargetsMinutes * 60 * 1000
+    });
+  }
+  chrome.alarms.create(AUTOMATION_ALARM, { periodInMinutes: 0.5 });
+  if (config.automationEnabled) {
+    automationTick()
+      .then((result) => result && !result.opened && result.runJobs
+        ? runJobs({ force: true, maxJobs: 3 })
+        : null)
+      .catch((error) => setStatus(`Automation error: ${error.message || error}`));
+  }
+}
+
+async function automationTick() {
+  let config = await loadConfig();
+  config = await syncTelegramAutomationConfig(config);
+  const opened = await openNextApprovedAction(config);
+  if (opened) return { opened: true, runJobs: false };
+  if (!config.automationEnabled || !isInsideActiveWindow(new Date(), config.activeStart, config.activeEnd)) {
+    return { opened: false, runJobs: false };
+  }
+
+  const now = new Date();
+  const nowMs = now.getTime();
+  if (!config.nextReplyTargetsAt) {
+    await chromeStorageSet({
+      nextReplyTargetsAt: nowMs + config.replyTargetsMinutes * 60 * 1000
+    });
+  } else if (nowMs >= config.nextReplyTargetsAt) {
+    await chromeStorageSet({
+      nextReplyTargetsAt: nowMs + config.replyTargetsMinutes * 60 * 1000
+    });
+    await setStatus("Starting scheduled /replytargets...");
+    await bridgeFetch(config, "/automation/triggers/replytargets", {
+      method: "POST",
+      body: { query: config.replyTargetsQuery }
+    });
+  }
+
+  const runKeys = new Set(config.trendRunKeys);
+  for (const time of parseTrendTimes(config.trendTimes)) {
+    const scheduled = scheduledTimeToday(now, time);
+    const ageMs = nowMs - scheduled.getTime();
+    const key = `${localDateKey(now)}|${time}`;
+    if (ageMs >= 0 && ageMs < 10 * 60 * 1000 && !runKeys.has(key)) {
+      runKeys.add(key);
+      await chromeStorageSet({ trendRunKeys: Array.from(runKeys).slice(-14) });
+      await setStatus(`Starting scheduled /tweettrend3 ${config.trendCategory}...`);
+      await bridgeFetch(config, "/automation/triggers/tweettrend3", {
+        method: "POST",
+        body: { category: config.trendCategory }
+      });
+    }
+  }
+  return { opened: false, runJobs: true };
+}
+
+async function syncTelegramAutomationConfig(config) {
+  const remote = await bridgeFetch(config, "/automation/config");
+  const minutes = Number(remote.reply_targets_minutes || 0);
+  if (!Number.isFinite(minutes) || minutes < 5 || minutes === config.replyTargetsMinutes) {
+    return config;
+  }
+  const nextReplyTargetsAt = Date.now() + minutes * 60 * 1000;
+  await chromeStorageSet({ replyTargetsMinutes: minutes, nextReplyTargetsAt });
+  return { ...config, replyTargetsMinutes: minutes, nextReplyTargetsAt };
+}
+
+function isInsideActiveWindow(date, start, end) {
+  const current = date.getHours() * 60 + date.getMinutes();
+  const startMinutes = clockMinutes(start, 0);
+  const endMinutes = clockMinutes(end, 24 * 60 - 1);
+  if (startMinutes === endMinutes) return true;
+  if (startMinutes < endMinutes) {
+    return current >= startMinutes && current < endMinutes;
+  }
+  return current >= startMinutes || current < endMinutes;
+}
+
+function clockMinutes(value, fallback) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(String(value || "").trim());
+  if (!match) return fallback;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return fallback;
+  return hours * 60 + minutes;
+}
+
+function parseTrendTimes(value) {
+  return Array.from(new Set(String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => clockMinutes(item, -1) >= 0)))
+    .sort();
+}
+
+function scheduledTimeToday(now, value) {
+  const minutes = clockMinutes(value, 0);
+  const result = new Date(now);
+  result.setHours(Math.floor(minutes / 60), minutes % 60, 0, 0);
+  return result;
+}
+
+function localDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+async function openNextApprovedAction(config) {
+  if (running) return false;
+  const payload = await bridgeFetch(config, "/automation/approvals/next");
+  if (!payload.action) return false;
+
+  const action = payload.action;
+  try {
+    const targetUrl = action.kind === "reply" ? String(action.target_url || "") : "https://x.com/compose/post";
+    if (!/^https:\/\/(?:www\.)?x\.com\//i.test(targetUrl)) {
+      throw new Error("Approved action has an invalid X URL.");
+    }
+    await setStatus(`Opening approved ${action.kind} in X...`);
+    const tab = await chromeTabsCreate({ url: targetUrl, active: true });
+    await waitForTabComplete(tab.id);
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: injectedPrepareXDraft,
+      args: [action.kind, action.text, action.target_url]
+    });
+    const result = injection ? injection.result : null;
+    if (!result || !result.ok) {
+      throw new Error(result && result.error ? result.error : "Could not prepare the X draft.");
+    }
+    await bridgeFetch(config, `/automation/approvals/${action.id}/complete`, {
+      method: "POST",
+      body: {}
+    });
+    await setStatus(`Approved ${action.kind} is ready in X. Review it and click the final X button.`);
+    return true;
+  } catch (error) {
+    await bridgeFetch(config, `/automation/approvals/${action.id}/error`, {
+      method: "POST",
+      body: { error: error.message || String(error) }
+    });
+    throw error;
+  }
 }
 
 async function runJobs({ force, maxJobs }) {
@@ -1413,6 +1597,77 @@ function injectedSubmitAndFindImage(prompt, timeoutMs) {
   })();
 }
 
+function injectedPrepareXDraft(kind, text, targetUrl) {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const isVisible = (element) => {
+    if (!element) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+  };
+  const findEditor = () => Array.from(document.querySelectorAll(
+    "[data-testid='tweetTextarea_0'], div[role='textbox'][contenteditable='true']"
+  )).find(isVisible);
+  const setEditorText = (editor, value) => {
+    editor.focus();
+    document.execCommand("selectAll", false, null);
+    const inserted = document.execCommand("insertText", false, value);
+    if (!inserted) {
+      editor.textContent = value;
+    }
+    editor.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: value
+    }));
+  };
+
+  return (async () => {
+    const cleanText = String(text || "").trim();
+    if (!cleanText) return { ok: false, error: "The approved draft is empty." };
+
+    if (kind === "reply") {
+      const match = /\/status\/(\d+)/i.exec(String(targetUrl || ""));
+      const statusId = match ? match[1] : "";
+      let replyButton = null;
+      const replyDeadline = Date.now() + 30000;
+      while (Date.now() < replyDeadline && !replyButton) {
+        const articles = Array.from(document.querySelectorAll("article")).filter(isVisible);
+        const targetArticle = statusId
+          ? articles.find((article) => article.querySelector(`a[href*='/status/${statusId}']`))
+          : articles[0];
+        replyButton = targetArticle && targetArticle.querySelector("[data-testid='reply']");
+        if (!replyButton) await sleep(500);
+      }
+      if (!replyButton) {
+        return { ok: false, error: "Could not find the Reply button for the target post. Check X login and page state." };
+      }
+      replyButton.click();
+    }
+
+    const editorDeadline = Date.now() + 30000;
+    let editor = null;
+    while (Date.now() < editorDeadline && !editor) {
+      editor = findEditor();
+      if (!editor) await sleep(500);
+    }
+    if (!editor) {
+      return { ok: false, error: "Could not find the X composer. Check that you are logged in." };
+    }
+    if (String(editor.innerText || editor.textContent || "").trim()) {
+      return { ok: false, error: "The X composer already contains text, so it was not overwritten." };
+    }
+    setEditorText(editor, cleanText);
+    await sleep(500);
+    const finalText = String(editor.innerText || editor.textContent || "").trim();
+    if (!finalText) {
+      return { ok: false, error: "X did not accept the draft text." };
+    }
+    editor.focus();
+    return { ok: true, characters: finalText.length };
+  })();
+}
+
 async function loadConfig() {
   const saved = await chromeStorageGet(DEFAULTS);
   return {
@@ -1421,6 +1676,15 @@ async function loadConfig() {
     timeoutSeconds: Math.max(30, Number(saved.timeoutSeconds || DEFAULTS.timeoutSeconds)),
     autoRun: Boolean(saved.autoRun),
     pollSeconds: Math.max(30, Number(saved.pollSeconds || DEFAULTS.pollSeconds)),
+    automationEnabled: Boolean(saved.automationEnabled),
+    activeStart: String(saved.activeStart || DEFAULTS.activeStart),
+    activeEnd: String(saved.activeEnd || DEFAULTS.activeEnd),
+    replyTargetsMinutes: Math.max(5, Number(saved.replyTargetsMinutes || DEFAULTS.replyTargetsMinutes)),
+    replyTargetsQuery: String(saved.replyTargetsQuery || ""),
+    trendTimes: String(saved.trendTimes || DEFAULTS.trendTimes),
+    trendCategory: String(saved.trendCategory || DEFAULTS.trendCategory),
+    nextReplyTargetsAt: Number(saved.nextReplyTargetsAt || 0),
+    trendRunKeys: Array.isArray(saved.trendRunKeys) ? saved.trendRunKeys : [],
     lastStatus: String(saved.lastStatus || DEFAULTS.lastStatus)
   };
 }
@@ -1431,7 +1695,16 @@ async function saveConfig(config) {
     token: String(config.token || DEFAULTS.token),
     timeoutSeconds: Math.max(30, Number(config.timeoutSeconds || DEFAULTS.timeoutSeconds)),
     autoRun: Boolean(config.autoRun),
-    pollSeconds: Math.max(30, Number(config.pollSeconds || DEFAULTS.pollSeconds))
+    pollSeconds: Math.max(30, Number(config.pollSeconds || DEFAULTS.pollSeconds)),
+    automationEnabled: Boolean(config.automationEnabled),
+    activeStart: String(config.activeStart || DEFAULTS.activeStart),
+    activeEnd: String(config.activeEnd || DEFAULTS.activeEnd),
+    replyTargetsMinutes: Math.max(5, Number(config.replyTargetsMinutes || DEFAULTS.replyTargetsMinutes)),
+    replyTargetsQuery: String(config.replyTargetsQuery || ""),
+    trendTimes: String(config.trendTimes || DEFAULTS.trendTimes),
+    trendCategory: String(config.trendCategory || DEFAULTS.trendCategory),
+    nextReplyTargetsAt: Number(config.nextReplyTargetsAt || 0),
+    trendRunKeys: Array.isArray(config.trendRunKeys) ? config.trendRunKeys : []
   });
 }
 

@@ -14,11 +14,13 @@ Gemini creates a first-pass draft using the existing analysis prompt, then Gemin
 
 - `/tweet <topic>`: create one Vietnamese long-form X post and image from a topic.
 - `/tweetx <topic/search>`: search X first, then create one long-form X post from live context.
-- `/tweettrend3 [auto|trending|news|sport|entertainment]`: scan X, Google Trends, and RSS, then create three Vietnamese long-form post options with images and hashtags.
+- `/tweettrend3 [auto|trending|news|sport|entertainment]`: scan X, Google Trends, and RSS, then create three Vietnamese long-form post options with images, hashtags, and approval buttons.
 - `/dailybrief [trending|news|sport|entertainment]`: create daily-ready long-form post options from multi-source trend context.
 - `/retweet <X post link> | <visual description>`: remix a source X post into a fresh original tweet and image.
 - `/reply <tweet text or X post link>`: create one copy-ready text reply only.
-- `/replytargets [query]`: auto-pick a hot topic, or use your query, then find fresh X posts worth replying to; sends reply text and post link as separate messages.
+- `/automationhere`: use the current Telegram chat for scheduled approval requests.
+- `/replyevery <minutes>`: configure the scheduled `/replytargets` interval from Telegram (5-1440 minutes).
+- `/replytargets [query]`: auto-pick a hot topic, or use your query, then find fresh X posts worth replying to; each result includes approval buttons.
 - `/importcookie [account_name] <auth_token=...; ct0=...>`: import an X cookie for search.
 - `/xaccounts`: list imported X cookie accounts without exposing cookies.
 - `/xremove <account_name>`: remove an imported X cookie account from the twscrape pool.
@@ -113,6 +115,40 @@ Use this when you have Gemini web access but no API keys.
    - Auto Run: ON if you want jobs to run automatically
 
 When Auto Run is OFF, click **Run next job** after sending a Telegram command. When Auto Run is ON, Chrome checks for pending jobs about every 30 seconds while Chrome is open.
+
+### Scheduled Telegram approvals
+
+The extension can schedule content generation while keeping the final X action manual:
+
+1. Start the bot and send `/automationhere` in the Telegram chat that should receive approvals.
+2. Reload `browser_extension/` from `chrome://extensions` after updating the project.
+3. Open the extension popup and configure **Scheduled approvals**:
+   - **Active from / Active until**: the daily activity window, using the computer's local time. Overnight windows such as `22:00` to `02:00` are supported.
+   - **/replytargets every**: interval in minutes; the minimum is 5 and the default is 30.
+   - **/replytargets query**: optional; leave blank for automatic topic selection.
+   - **/tweettrend3 fixed times**: comma-separated local times, for example `09:00, 13:30, 18:00`.
+   - **/tweettrend3 category**: `auto`, `trending`, `news`, `sport`, or `entertainment`.
+4. Turn **Automation** ON and keep Chrome, the Telegram bot, and the Gemini/X login sessions running.
+
+You can also change **/replytargets every** from the private Telegram approval chat with `/replyevery 30`. The extension picks up the new interval within about 30 seconds and resets the next run using that interval.
+
+For both manual `/replytargets` and `/tweettrend3` commands and their scheduled runs, Telegram sends each draft with **Approve on mobile** and **Reject** buttons. Only the Telegram user who requested a manual draft can approve it.
+
+`/replytargets` approval messages contain only the target X link and the copy-ready reply. If a selected topic returns no usable posts, the bot automatically tries other topics, then widens the search window and relaxes engagement thresholds until it finds at least one result or exhausts all available X fallbacks.
+
+Mobile approval is deliberately two-step because one Telegram button cannot both record a callback and open another app:
+
+1. Tap **Approve on mobile**. The bot records the approval and removes the decision buttons.
+2. Tap **Open X on phone**. The official mobile-friendly X Web Intent opens the matching reply or post composer and pre-populates the draft, so no manual paste is normally needed.
+
+Once a reply target is pending or approved, the bot skips the same target to avoid duplicate approval cards. This history is persisted in `data/automation_approvals.json`, so deduplication survives bot restarts.
+
+- **Open X on phone** uses the official mobile-friendly X Web Intent.
+- **Copy draft** uses Telegram's native clipboard button for drafts up to 256 characters. Telegram limits native copy buttons to 256 characters; longer post drafts still use the pre-filled X mobile intent.
+
+Review or edit the filled draft in X, then submit it yourself. A pending approval expires after 30 minutes. `Auto Run` still controls whether Gemini jobs from manually entered Telegram commands run automatically; when it is OFF, use **Run next job** before approving the returned draft.
+
+The first scheduled run may wait for the configured interval. Fixed `/tweettrend3` times are considered due for ten minutes, which allows for Chrome alarm delays or a briefly sleeping computer. Missed runs are not replayed in bulk.
 
 If Gemini asks for human verification, solve it manually in Chrome and run the job again. This bridge depends on the web UI, so reload the extension after changing files in `browser_extension/`.
 

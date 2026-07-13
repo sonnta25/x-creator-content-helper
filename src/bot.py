@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import replace
 from io import BytesIO
+from typing import Any
+from urllib.parse import urlencode
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from src.ai_service import create_ai_service
+from src.automation import AutomationApproval, AutomationApprovalStore
 from src.config import Settings
 from src.env_store import update_env_value
 from src.models import GeneratedContent, ReplyTargetDraft, TrendPostVariant, XSearchResult
@@ -54,6 +64,11 @@ TWEETTREND_LANGUAGE_ALIASES = {
     "tieng_viet": "Vietnamese",
 }
 
+
+class _SilentStatus:
+    async def edit_text(self, _text: str) -> None:
+        return None
+
 BOT_COMMANDS = [
     BotCommand("start", "Show help and available commands"),
     BotCommand("help", "Show help and available commands"),
@@ -68,6 +83,8 @@ BOT_COMMANDS = [
     BotCommand("xaccounts", "Show imported X cookie accounts"),
     BotCommand("xremove", "Remove an imported X cookie account"),
     BotCommand("reply", "Generate a witty reply from tweet text or an X post link"),
+    BotCommand("automationhere", "Send scheduled approval requests to this chat"),
+    BotCommand("replyevery", "Set scheduled replytargets interval in minutes"),
 ]
 
 
@@ -78,19 +95,31 @@ class ContentBot:
         self.x_search = XSearchService(settings)
         self.trend_sources = TrendSourceService(settings, self.x_search)
         self._x_account_error_notices: dict[str, str] = {}
+        self.approvals = AutomationApprovalStore(settings.automation_approvals_path)
+        self.approval_chat_id = settings.telegram_approval_chat_id
+        self._application: Application | None = None
+        self._automation_running: set[str] = set()
+        self._automation_tasks: set[asyncio.Task[None]] = set()
 
     def build_application(self) -> Application:
         async def post_init(app: Application) -> None:
+            self._application = app
             await _set_bot_commands(app)
             bridge = getattr(self.ai, "bridge", None)
             if bridge is not None:
+                bridge.set_automation_handler(self)
                 await bridge.start()
 
         async def post_shutdown(app: Application) -> None:
             del app
+            for task in tuple(self._automation_tasks):
+                task.cancel()
+            if self._automation_tasks:
+                await asyncio.gather(*self._automation_tasks, return_exceptions=True)
             bridge = getattr(self.ai, "bridge", None)
             if bridge is not None:
                 await bridge.stop()
+            self._application = None
 
         app = (
             Application.builder()
@@ -112,6 +141,11 @@ class ContentBot:
         app.add_handler(CommandHandler("xaccounts", self.xaccounts))
         app.add_handler(CommandHandler("xremove", self.xremove))
         app.add_handler(CommandHandler("reply", self.reply))
+        app.add_handler(CommandHandler("automationhere", self.automationhere))
+        app.add_handler(CommandHandler("replyevery", self.replyevery))
+        app.add_handler(
+            CallbackQueryHandler(self.automation_approval, pattern=r"^automation:")
+        )
         return app
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,9 +163,274 @@ class ContentBot:
             "/xaccounts - show imported X cookie accounts\n"
             "/xremove <account_name> - remove an imported X cookie account\n"
             "/reply <tweet text or X post link> - generate a copy-ready reply\n"
+            "/automationhere - send scheduled approval requests to this chat\n"
+            "/replyevery <minutes> - set the scheduled /replytargets interval\n"
             "\n"
             "AI provider: Chrome extension bridge runs Gemini for all "
             "content commands."
+        )
+
+    async def automationhere(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text(
+                "For approval security, use /automationhere in a private chat with this bot."
+            )
+            return
+        self.approval_chat_id = int(chat.id)
+        self.settings = replace(
+            self.settings,
+            telegram_approval_chat_id=self.approval_chat_id,
+        )
+        update_env_value("TELEGRAM_APPROVAL_CHAT_ID", str(self.approval_chat_id))
+        await message.reply_text(
+            "Automation approvals will be sent to this chat.\n"
+            "Use /replyevery <minutes> to configure /replytargets from Telegram."
+        )
+
+    async def replyevery(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text("Use /replyevery in a private chat with this bot.")
+            return
+        if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
+            await message.reply_text(
+                "Only the chat configured with /automationhere can change this schedule."
+            )
+            return
+        if not context.args:
+            current = self.settings.telegram_reply_targets_minutes
+            value = f"{current} minutes" if current is not None else "Chrome extension setting"
+            await message.reply_text(
+                f"Current /replytargets interval: {value}.\n"
+                "Set it with /replyevery 30 (minimum 5 minutes)."
+            )
+            return
+        try:
+            minutes = int(context.args[0])
+        except (TypeError, ValueError):
+            await message.reply_text("Use a whole number, for example: /replyevery 30")
+            return
+        if minutes < 5 or minutes > 1440:
+            await message.reply_text("Interval must be between 5 and 1440 minutes.")
+            return
+        self.settings = replace(
+            self.settings,
+            telegram_reply_targets_minutes=minutes,
+        )
+        update_env_value("TELEGRAM_REPLY_TARGETS_MINUTES", str(minutes))
+        await message.reply_text(
+            f"Scheduled /replytargets interval set to {minutes} minutes. "
+            "Chrome will sync it within about 30 seconds."
+        )
+
+    async def get_automation_config(self) -> dict[str, Any]:
+        return {
+            "reply_targets_minutes": self.settings.telegram_reply_targets_minutes,
+        }
+
+    async def automation_approval(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        query = update.callback_query
+        if query is None or query.message is None:
+            return
+        parts = str(query.data or "").split(":", 2)
+        if len(parts) != 3 or parts[0] != "automation":
+            await query.answer("Invalid approval request.", show_alert=True)
+            return
+        decision, approval_id = parts[1], parts[2]
+        if decision not in {"approve", "mobile", "reject"}:
+            await query.answer("Unknown approval action.", show_alert=True)
+            return
+        try:
+            approval = self.approvals.decide(
+                approval_id,
+                approve=decision in {"approve", "mobile"},
+                chat_id=query.message.chat.id,
+                user_id=query.from_user.id,
+                destination="mobile",
+            )
+            await query.answer()
+            original = str(query.message.text or "").strip()
+            await query.edit_message_text(
+                (
+                    original
+                    if approval.status == "mobile_approved"
+                    else f"{original}\n\nRejected."
+                ),
+                reply_markup=(
+                    _approval_keyboard(approval, include_decisions=False)
+                    if approval.status == "mobile_approved"
+                    else None
+                ),
+            )
+        except Exception as exc:
+            await query.answer(_friendly_error(exc), show_alert=True)
+
+    async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]:
+        query = str(payload.get("query", "")).strip()
+        return self._spawn_automation(
+            "replytargets",
+            lambda: self._run_scheduled_replytargets(query),
+        )
+
+    async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]:
+        category = str(payload.get("category", "auto")).strip().lower() or "auto"
+        if category not in {"auto", "best", *AUTO_TREND_CATEGORIES}:
+            raise RuntimeError("tweettrend3 category must be auto, trending, news, sport, or entertainment.")
+        return self._spawn_automation(
+            "tweettrend3",
+            lambda: self._run_scheduled_tweettrend3(category),
+        )
+
+    async def next_approved_action(self) -> dict[str, Any] | None:
+        approval = self.approvals.claim_next()
+        return approval.as_extension_payload() if approval is not None else None
+
+    async def finish_approved_action(
+        self,
+        approval_id: str,
+        *,
+        success: bool,
+        error: str = "",
+    ) -> None:
+        approval = self.approvals.finish(
+            approval_id,
+            success=success,
+            error=error,
+        )
+        if self._application is None:
+            return
+        if success:
+            detail = "Reply draft" if approval.kind == "reply" else "Post draft"
+            text = f"{detail} opened and filled in X. Review it, then click the final X button."
+        else:
+            text = f"Could not fill the approved {approval.kind} in X: {error or 'unknown error'}"
+        await self._application.bot.send_message(chat_id=approval.chat_id, text=text)
+
+    def _spawn_automation(self, kind: str, factory) -> dict[str, Any]:
+        if self._application is None:
+            raise RuntimeError("Telegram bot is not ready.")
+        if self.approval_chat_id is None:
+            raise RuntimeError("No approval chat configured. Send /automationhere in Telegram first.")
+        if kind in self._automation_running:
+            return {"ok": True, "status": "already-running", "kind": kind}
+
+        self._automation_running.add(kind)
+
+        async def runner() -> None:
+            try:
+                await factory()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.exception("Scheduled %s failed", kind)
+                if self._application is not None and self.approval_chat_id is not None:
+                    await self._application.bot.send_message(
+                        chat_id=self.approval_chat_id,
+                        text=f"Scheduled /{kind} failed: {_friendly_error(exc)}",
+                    )
+            finally:
+                self._automation_running.discard(kind)
+
+        task = asyncio.create_task(runner(), name=f"automation-{kind}")
+        self._automation_tasks.add(task)
+        task.add_done_callback(self._automation_tasks.discard)
+        return {"ok": True, "status": "accepted", "kind": kind}
+
+    async def _run_scheduled_replytargets(self, query: str) -> None:
+        if self._application is None or self.approval_chat_id is None:
+            raise RuntimeError("Automation chat is not ready.")
+        status = _SilentStatus()
+        search_query, results, _auto_note = await self._get_reply_target_context(query, status)
+        if not results:
+            await self._application.bot.send_message(
+                chat_id=self.approval_chat_id,
+                text=_no_reply_targets_message(search_query, auto=not query),
+            )
+            return
+        drafts = await self.ai.generate_reply_targets(
+            search_query,
+            summarize_reply_target_context(results, max_items=5),
+        )
+        for draft in drafts:
+            target_url = _format_reply_target_link(draft)
+            if self.approvals.has_active_target(target_url):
+                continue
+            approval = self.approvals.create(
+                kind="reply",
+                text=_format_reply_target_reply(draft),
+                chat_id=self.approval_chat_id,
+                approver_user_id=self.approval_chat_id,
+                target_url=target_url,
+                target_label=draft.target,
+            )
+            await self._send_approval(approval, reason=draft.reason)
+
+    async def _run_scheduled_tweettrend3(self, category: str) -> None:
+        if self._application is None or self.approval_chat_id is None:
+            raise RuntimeError("Automation chat is not ready.")
+        status = _SilentStatus()
+        if category in {"auto", "best"}:
+            topic, x_context, source, _results, selected_category = (
+                await self._get_auto_trend_context(status)
+            )
+        else:
+            topic, x_context, source, _results = await self._get_trend_context(
+                category,
+                status,
+            )
+            selected_category = category
+        variants = await self.ai.generate_trend_post_variants(
+            topic,
+            x_context,
+            output_language="Vietnamese",
+        )
+        for variant in variants:
+            approval = self.approvals.create(
+                kind="post",
+                text=_format_trend_variant_copy(variant),
+                chat_id=self.approval_chat_id,
+                approver_user_id=self.approval_chat_id,
+                target_label=topic,
+            )
+            await self._send_approval(
+                approval,
+                reason=f"{source} · {selected_category} · {variant.angle}",
+            )
+
+    async def _send_approval(
+        self,
+        approval: AutomationApproval,
+        *,
+        reason: str = "",
+    ) -> None:
+        if self._application is None:
+            raise RuntimeError("Telegram bot is not ready.")
+        body = _approval_message_text(approval, reason=reason)
+        await self._application.bot.send_message(
+            chat_id=approval.chat_id,
+            text=body[:4096],
+            reply_markup=_approval_keyboard(approval),
         )
 
     async def tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -187,10 +486,26 @@ class ContentBot:
                 f"Category: {category}\n"
                 f"Language: {output_language}\n"
                 f"Topic: {topic}\n\n"
-                "Sending tweet options with images..."
+                "Sending tweet options with approval buttons and images..."
+            )
+            approver_user_id = (
+                update.effective_user.id if update.effective_user is not None else message.chat.id
             )
             for index, variant in enumerate(variants, start=1):
-                await self._send_trend_variant(message, variant, index)
+                approval = self.approvals.create(
+                    kind="post",
+                    text=_format_trend_variant_copy(variant),
+                    chat_id=message.chat.id,
+                    approver_user_id=approver_user_id,
+                    target_label=topic,
+                )
+                await self._send_trend_variant(
+                    message,
+                    variant,
+                    index,
+                    approval=approval,
+                    approval_reason=f"{source} | {category} | {variant.angle}",
+                )
             await status.edit_text(
                 f"Source: {source}\n"
                 f"Category: {category}\n"
@@ -349,14 +664,24 @@ class ContentBot:
                 search_query,
                 summarize_reply_target_context(results, max_items=5),
             )
-            await status.edit_text(
-                f"Reply targets for: {search_query}\n"
-                f"{auto_note}"
-                "Sending each reply and post link as separate messages..."
+            del auto_note
+            await status.delete()
+            approver_user_id = (
+                update.effective_user.id if update.effective_user is not None else message.chat.id
             )
             for draft in drafts:
-                await message.reply_text(_format_reply_target_reply(draft))
-                await message.reply_text(_format_reply_target_link(draft))
+                target_url = _format_reply_target_link(draft)
+                if self.approvals.has_active_target(target_url):
+                    continue
+                approval = self.approvals.create(
+                    kind="reply",
+                    text=_format_reply_target_reply(draft),
+                    chat_id=message.chat.id,
+                    approver_user_id=approver_user_id,
+                    target_url=target_url,
+                    target_label=draft.target,
+                )
+                await self._send_approval(approval, reason=draft.reason)
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -598,48 +923,74 @@ class ContentBot:
         query: str,
         status,
     ) -> tuple[str, list[XSearchResult], str]:
-        if query:
-            search_query, results = await self._search_rank_reply_targets(query)
-            return search_query, results, ""
+        candidates = _dedupe_queries(
+            ([query] if query else []) + await self._auto_reply_target_queries()
+        )
+        last_search_query = query or "auto hot topics"
 
-        best_query = ""
-        best_results: list[XSearchResult] = []
-        tried: list[str] = []
-        for candidate in await self._auto_reply_target_queries():
-            if candidate in tried:
-                continue
-            tried.append(candidate)
-            await status.edit_text(
-                "Auto-picking reply targets...\n"
-                f"Trying: {candidate}"
-            )
-            try:
-                search_query, results = await self._search_rank_reply_targets(candidate)
-            except Exception:
-                continue
-            if not best_query:
-                best_query = search_query
-            if _reply_target_batch_score(results) > _reply_target_batch_score(best_results):
-                best_query = search_query
-                best_results = results
-            if len(best_results) >= 3 and _reply_target_batch_score(best_results) >= 20:
-                break
+        for relaxed in (False, True):
+            for candidate in candidates:
+                await status.edit_text(
+                    "Finding a usable reply target...\n"
+                    f"Trying: {candidate}\n"
+                    f"Mode: {'wider fallback' if relaxed else 'fresh high-signal'}"
+                )
+                try:
+                    search_query, results = await self._search_rank_reply_targets(
+                        candidate,
+                        relaxed=relaxed,
+                    )
+                except Exception:
+                    continue
+                last_search_query = search_query
+                if results:
+                    note = (
+                        "Auto-selected a wider fallback topic.\n"
+                        if relaxed or (query and candidate != query)
+                        else "Auto-selected topic.\n"
+                    )
+                    return search_query, results, note
 
-        auto_note = "Auto-selected topic.\n"
-        return best_query or "auto hot topics", best_results, auto_note
+        return last_search_query, [], ""
 
-    async def _search_rank_reply_targets(self, query: str) -> tuple[str, list[XSearchResult]]:
+    async def _search_rank_reply_targets(
+        self,
+        query: str,
+        *,
+        relaxed: bool = False,
+    ) -> tuple[str, list[XSearchResult]]:
+        since_minutes = 180 if relaxed else 30
         search_query, recent_results = await self.x_search.search_recent(
             query,
-            since_minutes=30,
+            since_minutes=since_minutes,
             limit=max(REPLY_TARGET_SEARCH_LIMIT, self.settings.x_search_limit),
             product="Latest",
         )
-        return search_query, rank_fast_growing_posts(
+        ranked = rank_fast_growing_posts(
             recent_results,
             max_items=5,
-            max_age_minutes=30,
+            max_age_minutes=since_minutes,
+            min_engagement_score=0 if relaxed else MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
+            min_velocity_score=0 if relaxed else MIN_REPLY_TARGET_VELOCITY_SCORE,
+            min_view_count=0 if relaxed else MIN_REPLY_TARGET_VIEW_COUNT,
         )
+        if relaxed and not ranked:
+            ranked = sorted(
+                (result for result in recent_results if result.url and result.text),
+                key=lambda result: (
+                    result.like_count
+                    + result.reply_count * 2
+                    + result.retweet_count * 3
+                    + result.quote_count * 3
+                ),
+                reverse=True,
+            )[:5]
+        unseen = [
+            result
+            for result in ranked
+            if not self.approvals.has_active_target(result.url)
+        ]
+        return search_query, unseen
 
     async def _auto_reply_target_queries(self) -> list[str]:
         queries: list[str] = []
@@ -706,9 +1057,14 @@ class ContentBot:
         variant: TrendPostVariant,
         index: int,
         label: str = "Option",
+        approval: AutomationApproval | None = None,
+        approval_reason: str = "",
     ) -> None:
         copy_text = _format_trend_variant_copy(variant)
-        await message.reply_text(copy_text)
+        if approval is None:
+            await message.reply_text(copy_text)
+        else:
+            await self._send_approval(approval, reason=approval_reason)
 
         if not self.settings.generate_images:
             return
@@ -761,6 +1117,79 @@ def _format_reply_target_reply(draft: ReplyTargetDraft) -> str:
 
 def _format_reply_target_link(draft: ReplyTargetDraft) -> str:
     return draft.url.strip()
+
+
+def _mobile_x_intent_url(approval: AutomationApproval) -> str:
+    params = {"text": approval.text}
+    if approval.kind == "reply":
+        tweet_id = extract_tweet_id(approval.target_url)
+        if tweet_id is not None:
+            params["in_reply_to"] = str(tweet_id)
+    return f"https://x.com/intent/tweet?{urlencode(params)}"
+
+
+def _approval_message_text(
+    approval: AutomationApproval,
+    *,
+    reason: str = "",
+) -> str:
+    if approval.kind == "reply":
+        return f"{approval.target_url}\n\n{approval.text}".strip()
+
+    context_lines = []
+    if approval.target_label:
+        context_lines.append(f"Topic: {approval.target_label}")
+    if reason:
+        context_lines.append(f"Source: {reason}")
+    context_text = "\n".join(context_lines)
+    return (
+        f"{context_text}\n\n{approval.text}\n\n"
+        "Approve on mobile to continue."
+    ).strip()
+
+
+def _approval_keyboard(
+    approval: AutomationApproval,
+    *,
+    include_decisions: bool = True,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if include_decisions:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Approve on mobile",
+                    callback_data=f"automation:mobile:{approval.id}",
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Open X on phone",
+                    url=_mobile_x_intent_url(approval),
+                )
+            ]
+        )
+    final_row: list[InlineKeyboardButton] = []
+    if len(approval.text) <= 256:
+        final_row.append(
+            InlineKeyboardButton(
+                "Copy draft",
+                copy_text=CopyTextButton(approval.text),
+            )
+        )
+    if include_decisions:
+        final_row.append(
+            InlineKeyboardButton(
+                "Reject",
+                callback_data=f"automation:reject:{approval.id}",
+            )
+        )
+    if final_row:
+        rows.append(final_row)
+    return InlineKeyboardMarkup(rows)
 
 
 def _trend_context_score(

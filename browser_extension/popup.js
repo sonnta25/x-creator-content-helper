@@ -4,6 +4,13 @@ const DEFAULTS = {
   timeoutSeconds: 300,
   autoRun: false,
   pollSeconds: 30,
+  automationEnabled: false,
+  activeStart: "08:00",
+  activeEnd: "22:00",
+  replyTargetsMinutes: 30,
+  replyTargetsQuery: "",
+  trendTimes: "09:00,18:00",
+  trendCategory: "auto",
   lastStatus: "Ready."
 };
 
@@ -13,6 +20,13 @@ const els = {
   timeoutSeconds: document.getElementById("timeoutSeconds"),
   pollSeconds: document.getElementById("pollSeconds"),
   autoRun: document.getElementById("autoRun"),
+  automationEnabled: document.getElementById("automationEnabled"),
+  activeStart: document.getElementById("activeStart"),
+  activeEnd: document.getElementById("activeEnd"),
+  replyTargetsMinutes: document.getElementById("replyTargetsMinutes"),
+  replyTargetsQuery: document.getElementById("replyTargetsQuery"),
+  trendTimes: document.getElementById("trendTimes"),
+  trendCategory: document.getElementById("trendCategory"),
   save: document.getElementById("save"),
   run: document.getElementById("run"),
   diagnoseGemini: document.getElementById("diagnoseGemini"),
@@ -36,6 +50,14 @@ els.autoRun.addEventListener("click", async () => {
   await saveConfig(currentConfig);
   renderConfig(currentConfig);
   setStatus(currentConfig.autoRun ? "Auto Run is ON." : "Auto Run is OFF.");
+});
+
+els.automationEnabled.addEventListener("click", async () => {
+  currentConfig = readConfigFromForm();
+  currentConfig.automationEnabled = !currentConfig.automationEnabled;
+  await saveConfig(currentConfig);
+  renderConfig(currentConfig);
+  setStatus(currentConfig.automationEnabled ? "Scheduled approvals are ON." : "Scheduled approvals are OFF.");
 });
 
 els.run.addEventListener("click", async () => {
@@ -109,9 +131,18 @@ function renderConfig(config) {
   els.token.value = config.token;
   els.timeoutSeconds.value = String(config.timeoutSeconds);
   els.pollSeconds.value = String(config.pollSeconds);
+  els.activeStart.value = config.activeStart;
+  els.activeEnd.value = config.activeEnd;
+  els.replyTargetsMinutes.value = String(config.replyTargetsMinutes);
+  els.replyTargetsQuery.value = config.replyTargetsQuery;
+  els.trendTimes.value = config.trendTimes;
+  els.trendCategory.value = config.trendCategory;
   els.autoRun.textContent = config.autoRun ? "ON" : "OFF";
   els.autoRun.classList.toggle("is-on", config.autoRun);
   els.autoRun.setAttribute("aria-pressed", config.autoRun ? "true" : "false");
+  els.automationEnabled.textContent = config.automationEnabled ? "ON" : "OFF";
+  els.automationEnabled.classList.toggle("is-on", config.automationEnabled);
+  els.automationEnabled.setAttribute("aria-pressed", config.automationEnabled ? "true" : "false");
 }
 
 function readConfigFromForm() {
@@ -120,7 +151,16 @@ function readConfigFromForm() {
     token: els.token.value.trim() || DEFAULTS.token,
     timeoutSeconds: Math.max(30, Number(els.timeoutSeconds.value || DEFAULTS.timeoutSeconds)),
     pollSeconds: Math.max(30, Number(els.pollSeconds.value || DEFAULTS.pollSeconds)),
-    autoRun: Boolean(currentConfig.autoRun)
+    autoRun: Boolean(currentConfig.autoRun),
+    automationEnabled: Boolean(currentConfig.automationEnabled),
+    activeStart: els.activeStart.value || DEFAULTS.activeStart,
+    activeEnd: els.activeEnd.value || DEFAULTS.activeEnd,
+    replyTargetsMinutes: Math.max(5, Number(els.replyTargetsMinutes.value || DEFAULTS.replyTargetsMinutes)),
+    replyTargetsQuery: els.replyTargetsQuery.value.trim(),
+    trendTimes: els.trendTimes.value.trim() || DEFAULTS.trendTimes,
+    trendCategory: els.trendCategory.value || DEFAULTS.trendCategory,
+    nextReplyTargetsAt: Number(currentConfig.nextReplyTargetsAt || 0),
+    trendRunKeys: Array.isArray(currentConfig.trendRunKeys) ? currentConfig.trendRunKeys : []
   };
 }
 

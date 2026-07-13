@@ -6,7 +6,7 @@ import json
 import secrets
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
 
 from src.config import Settings
@@ -14,6 +14,24 @@ from src.extension_prompts import gemini_single_pass_prompt
 
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
+
+
+class AutomationBridgeHandler(Protocol):
+    async def get_automation_config(self) -> dict[str, Any]: ...
+
+    async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def next_approved_action(self) -> dict[str, Any] | None: ...
+
+    async def finish_approved_action(
+        self,
+        approval_id: str,
+        *,
+        success: bool,
+        error: str = "",
+    ) -> None: ...
 
 
 @dataclass
@@ -33,6 +51,10 @@ class ExtensionBridgeServer:
         self._jobs: OrderedDict[str, ExtensionBridgeJob] = OrderedDict()
         self._server: asyncio.AbstractServer | None = None
         self._lock = asyncio.Lock()
+        self._automation_handler: AutomationBridgeHandler | None = None
+
+    def set_automation_handler(self, handler: AutomationBridgeHandler) -> None:
+        self._automation_handler = handler
 
     async def start(self) -> None:
         if self._server is not None:
@@ -155,6 +177,25 @@ class ExtensionBridgeServer:
         if path == "/jobs/next" and method == "GET":
             return await self._next_job()
 
+        if path == "/automation/config" and method == "GET":
+            handler = self._require_automation_handler()
+            return _json_response(200, await handler.get_automation_config())
+
+        if path == "/automation/triggers/replytargets" and method == "POST":
+            handler = self._require_automation_handler()
+            result = await handler.trigger_replytargets(_json_body(request["body"]))
+            return _json_response(202, result)
+
+        if path == "/automation/triggers/tweettrend3" and method == "POST":
+            handler = self._require_automation_handler()
+            result = await handler.trigger_tweettrend3(_json_body(request["body"]))
+            return _json_response(202, result)
+
+        if path == "/automation/approvals/next" and method == "GET":
+            handler = self._require_automation_handler()
+            action = await handler.next_approved_action()
+            return _json_response(200, {"action": action})
+
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[0] == "jobs":
             job_id = parts[1]
@@ -165,7 +206,28 @@ class ExtensionBridgeServer:
             if action == "error" and method == "POST":
                 return await self._accept_error(job_id, payload)
 
+        if len(parts) == 4 and parts[:2] == ["automation", "approvals"]:
+            handler = self._require_automation_handler()
+            approval_id = parts[2]
+            action = parts[3]
+            payload = _json_body(request["body"])
+            if action == "complete" and method == "POST":
+                await handler.finish_approved_action(approval_id, success=True)
+                return _json_response(200, {"ok": True})
+            if action == "error" and method == "POST":
+                await handler.finish_approved_action(
+                    approval_id,
+                    success=False,
+                    error=str(payload.get("error", "")),
+                )
+                return _json_response(200, {"ok": True})
+
         return _json_response(404, {"error": "Not found."})
+
+    def _require_automation_handler(self) -> AutomationBridgeHandler:
+        if self._automation_handler is None:
+            raise RuntimeError("Automation is not ready. Start the Telegram bot first.")
+        return self._automation_handler
 
     def _authorized(self, query: dict[str, list[str]], headers: dict[str, str]) -> bool:
         expected = self.settings.extension_bridge_token
@@ -349,6 +411,7 @@ def _empty_response(status: int) -> bytes:
 def _response_headers(status: int, content_type: str, length: int) -> bytes:
     reason = {
         200: "OK",
+        202: "Accepted",
         204: "No Content",
         400: "Bad Request",
         401: "Unauthorized",

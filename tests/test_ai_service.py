@@ -97,3 +97,70 @@ def test_bridge_claims_each_text_job_once_for_a_single_gemini_pass() -> None:
         assert duplicate["job"] is None
 
     asyncio.run(exercise())
+
+
+def test_bridge_routes_scheduled_trigger_to_automation_handler() -> None:
+    class FakeAutomation:
+        async def get_automation_config(self):
+            return {"reply_targets_minutes": 45}
+
+        async def trigger_replytargets(self, payload):
+            return {"ok": True, "query": payload.get("query", "")}
+
+        async def trigger_tweettrend3(self, payload):
+            return {"ok": True}
+
+        async def next_approved_action(self):
+            return None
+
+        async def finish_approved_action(self, approval_id, *, success, error=""):
+            return None
+
+    async def exercise() -> None:
+        settings = Settings(
+            telegram_bot_token="123:ABC",
+            extension_bridge_token="test-token",
+        )
+        server = ExtensionBridgeServer(settings)
+        server.set_automation_handler(FakeAutomation())
+        body = b'{"query":"AI agents"}'
+        response = await server._route(
+            {
+                "method": "POST",
+                "target": "/automation/triggers/replytargets",
+                "headers": {"x-extension-bridge-token": "test-token"},
+                "body": body,
+            }
+        )
+
+        assert response.startswith(b"HTTP/1.1 202 Accepted")
+        assert b'"query": "AI agents"' in response
+
+    asyncio.run(exercise())
+
+
+def test_bridge_exposes_telegram_automation_config() -> None:
+    class FakeAutomation:
+        async def get_automation_config(self):
+            return {"reply_targets_minutes": 45}
+
+    async def exercise() -> None:
+        settings = Settings(
+            telegram_bot_token="123:ABC",
+            extension_bridge_token="test-token",
+        )
+        server = ExtensionBridgeServer(settings)
+        server.set_automation_handler(FakeAutomation())
+        response = await server._route(
+            {
+                "method": "GET",
+                "target": "/automation/config",
+                "headers": {"x-extension-bridge-token": "test-token"},
+                "body": b"",
+            }
+        )
+
+        assert response.startswith(b"HTTP/1.1 200 OK")
+        assert b'"reply_targets_minutes": 45' in response
+
+    asyncio.run(exercise())

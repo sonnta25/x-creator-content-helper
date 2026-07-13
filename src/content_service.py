@@ -864,6 +864,8 @@ CRITICAL FORMAT RULES:
 - The top-level object must contain a "targets" array.
 - Do not return "replies", "items", "results", "options", or plain text.
 - Each target must include url, target, reason, and reply.
+- URL values must be plain https://x.com/... strings, never Markdown links.
+- Escape every double quote inside a JSON string as \\\". The complete response must parse as JSON.
 
 For each candidate, write:
 - Link: exact URL from the candidate
@@ -1125,7 +1127,10 @@ def _image_prompt_from_tweet(tweet_text: str) -> str:
 
 
 def _parse_reply_targets(raw: str) -> list[ReplyTargetDraft]:
-    payload = _parse_json(raw)
+    try:
+        payload = _parse_json(raw)
+    except (json.JSONDecodeError, ModelJsonParseError):
+        payload = {}
     raw_targets = _first_list_value(
         payload,
         "targets",
@@ -1137,6 +1142,11 @@ def _parse_reply_targets(raw: str) -> list[ReplyTargetDraft]:
     )
     if raw_targets is None and _looks_like_reply_target(payload):
         raw_targets = [payload]
+    recovered_targets = _recover_reply_target_items(raw)
+    if recovered_targets and (
+        not isinstance(raw_targets, list) or len(recovered_targets) > len(raw_targets)
+    ):
+        raw_targets = recovered_targets
     if not isinstance(raw_targets, list):
         raise RuntimeError("AI response missed required targets list.")
 
@@ -1144,7 +1154,7 @@ def _parse_reply_targets(raw: str) -> list[ReplyTargetDraft]:
     for item in raw_targets[:5]:
         if not isinstance(item, dict):
             continue
-        url = str(item.get("url", "")).strip()
+        url = _clean_reply_target_url(str(item.get("url", "")))
         reply = _limit_x_text(str(item.get("reply", "")).strip())
         if _looks_like_prompt_leak(reply):
             continue
@@ -1162,6 +1172,68 @@ def _parse_reply_targets(raw: str) -> list[ReplyTargetDraft]:
     if not targets:
         raise RuntimeError("AI response did not contain usable reply targets.")
     return targets
+
+
+def _recover_reply_target_items(raw: str) -> list[dict[str, str]]:
+    """Recover target objects when a browser model forgets to escape quotes in a value."""
+    list_marker = re.search(
+        r'(?i)"(?:targets|reply_targets|replyTargets|replies|items|results)"\s*:\s*\[',
+        str(raw or ""),
+    )
+    if list_marker is None:
+        return []
+    tail = str(raw)[list_marker.end() :]
+    blocks: list[str] = []
+    depth = 0
+    start: int | None = None
+    for index, char in enumerate(tail):
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                blocks.append(tail[start : index + 1])
+                start = None
+        elif char == "]" and depth == 0:
+            break
+
+    items: list[dict[str, str]] = []
+    for block in blocks[:5]:
+        fields = _recover_loose_json_string_fields(block)
+        if fields.get("url") and fields.get("reply"):
+            items.append(fields)
+    return items
+
+
+def _recover_loose_json_string_fields(block: str) -> dict[str, str]:
+    markers = list(re.finditer(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"', block))
+    fields: dict[str, str] = {}
+    for index, marker in enumerate(markers):
+        value_start = marker.end()
+        value_end = markers[index + 1].start() if index + 1 < len(markers) else len(block) - 1
+        segment = block[value_start:value_end]
+        segment = re.sub(r'"\s*,\s*$', "", segment, count=1).strip()
+        segment = re.sub(r'"\s*$', "", segment, count=1).strip()
+        segment = (
+            segment.replace(r"\n", "\n")
+            .replace(r"\r", "\r")
+            .replace(r"\t", "\t")
+            .replace(r'\"', '"')
+            .replace(r"\\", "\\")
+        )
+        fields[marker.group(1)] = segment
+    return fields
+
+
+def _clean_reply_target_url(value: str) -> str:
+    text = str(value or "").strip()
+    markdown = re.fullmatch(r"\[([^\]]+)\]\((https?://[^)]+)\)", text)
+    if markdown:
+        return markdown.group(2).strip()
+    match = re.search(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/[^\s)\]]+", text, re.I)
+    return match.group(0).rstrip(".,;:") if match else text
 
 
 def _parse_single_reply(raw: str) -> str:

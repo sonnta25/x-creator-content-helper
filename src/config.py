@@ -31,6 +31,9 @@ class Settings:
     extension_bridge_port: int = 8765
     extension_bridge_token: str = "local-bridge-change-me"
     extension_bridge_timeout_seconds: int = 300
+    telegram_approval_chat_id: int | None = None
+    telegram_reply_targets_minutes: int | None = None
+    automation_approvals_path: str = ""
     gemini_image_prompt_prefix: str = (
         "Create one square realistic image for this social post. Return the image only, "
         "with no extra text."
@@ -94,6 +97,15 @@ class Settings:
             ).strip()
             or "local-bridge-change-me",
             extension_bridge_timeout_seconds=_int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 300),
+            telegram_approval_chat_id=_optional_int_env("TELEGRAM_APPROVAL_CHAT_ID"),
+            telegram_reply_targets_minutes=_optional_int_env(
+                "TELEGRAM_REPLY_TARGETS_MINUTES"
+            ),
+            automation_approvals_path=os.getenv(
+                "AUTOMATION_APPROVALS_PATH",
+                "data/automation_approvals.json",
+            ).strip()
+            or "data/automation_approvals.json",
             gemini_image_prompt_prefix=(
                 os.getenv("GEMINI_IMAGE_PROMPT_PREFIX")
                 or os.getenv(
@@ -142,6 +154,16 @@ def _int_env(name: str, default: int) -> int:
     if value <= 0:
         raise RuntimeError(f"{name} must be positive, got {raw!r}")
     return value
+
+
+def _optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
 
 
 def _choice_env(name: str, default: str, choices: set[str]) -> str:

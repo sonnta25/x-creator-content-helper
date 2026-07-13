@@ -14,10 +14,22 @@ main {
   padding: 14px;
 }
 
-h1 {
+h1,
+h2 {
   margin: 0 0 12px;
   font-size: 16px;
   font-weight: 700;
+}
+
+h2 {
+  margin-top: 0;
+  font-size: 14px;
+}
+
+section {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #e5e5e5;
 }
 
 label {
@@ -27,7 +39,8 @@ label {
   font-weight: 600;
 }
 
-input {
+input,
+select {
   width: 100%;
   margin-top: 5px;
   padding: 8px;
@@ -36,6 +49,18 @@ input {
   background: #fff;
   color: #171717;
   font: inherit;
+}
+
+.two-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.hint {
+  margin: 8px 0 0;
+  color: #666;
+  font-size: 12px;
 }
 
 .toggle-row {

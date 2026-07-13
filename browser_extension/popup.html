@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>X Content Bot Bridge</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>X Content Bot Bridge v0.1.8</h1>
+
+      <label>
+        Bridge URL
+        <input id="bridgeUrl" spellcheck="false">
+      </label>
+
+      <label>
+        Token
+        <input id="token" spellcheck="false">
+      </label>
+
+      <label>
+        Timeout seconds
+        <input id="timeoutSeconds" type="number" min="30" step="30">
+      </label>
+
+      <label>
+        Poll seconds
+        <input id="pollSeconds" type="number" min="30" step="30">
+      </label>
+
+      <div class="toggle-row">
+        <span>Auto Run</span>
+        <button id="autoRun" class="toggle" type="button" aria-pressed="false">OFF</button>
+      </div>
+
+      <div class="actions">
+        <button id="save">Save</button>
+        <button id="run">Run next job</button>
+        <button id="diagnoseGemini" type="button">Diagnose Gemini DOM</button>
+      </div>
+
+      <pre id="status">Ready.</pre>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

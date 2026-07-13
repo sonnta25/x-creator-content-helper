@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "X Content Bot Bridge",
+  "version": "0.1.8",
+  "description": "Runs Gemini web jobs from the local Telegram bot bridge.",
+  "permissions": ["storage", "tabs", "scripting", "alarms", "activeTab"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*",
+    "https://gemini.google.com/*",
+    "https://*.googleusercontent.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "X Content Bot Bridge"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

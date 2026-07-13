@@ -1,0 +1,155 @@
+name: Deploy to Ubuntu VPS
+
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+
+concurrency:
+  group: x-content-bot-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pytest
+
+      - name: Build deploy archive
+        run: |
+          mkdir -p dist
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.venv' \
+            --exclude='.env' \
+            --exclude='data' \
+            --exclude='logs' \
+            --exclude='dist' \
+            --exclude='__pycache__' \
+            --exclude='.pytest_cache' \
+            --exclude='*.egg-info' \
+            -czf dist/x-content-bot-${GITHUB_SHA}.tar.gz .
+
+      - name: Configure SSH
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          if [ -z "$VPS_HOST" ]; then echo "::error::Missing VPS_HOST secret"; exit 1; fi
+          if [ -z "$VPS_USER" ]; then echo "::error::Missing VPS_USER secret"; exit 1; fi
+          if [ -z "$VPS_SSH_KEY" ]; then echo "::error::Missing VPS_SSH_KEY secret"; exit 1; fi
+
+          SSH_PORT="${VPS_PORT:-22}"
+          echo "SSH_PORT=$SSH_PORT" >> "$GITHUB_ENV"
+          echo "REMOTE_ARCHIVE=/tmp/x-content-bot-${GITHUB_SHA}.tar.gz" >> "$GITHUB_ENV"
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SSH_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload archive
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          scp -i ~/.ssh/deploy_key -P "$SSH_PORT" \
+            dist/x-content-bot-${GITHUB_SHA}.tar.gz \
+            "$VPS_USER@$VPS_HOST:$REMOTE_ARCHIVE"
+
+      - name: Deploy and restart service
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
+          VPS_PYTHON_BIN: ${{ secrets.VPS_PYTHON_BIN }}
+          VPS_SERVICE_NAME: ${{ secrets.VPS_SERVICE_NAME }}
+        run: |
+          DEPLOY_PATH="${VPS_DEPLOY_PATH:-/opt/x-content-bot}"
+          PYTHON_BIN="${VPS_PYTHON_BIN:-python3.11}"
+          SERVICE_NAME="${VPS_SERVICE_NAME:-x-content-bot}"
+
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$VPS_USER@$VPS_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' PYTHON_BIN='$PYTHON_BIN' SERVICE_NAME='$SERVICE_NAME' REMOTE_ARCHIVE='$REMOTE_ARCHIVE' bash -s" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          else
+            SUDO="sudo"
+          fi
+
+          $SUDO mkdir -p "$DEPLOY_PATH"
+          $SUDO tar -xzf "$REMOTE_ARCHIVE" -C "$DEPLOY_PATH"
+          if [ "$(id -u)" -ne 0 ]; then
+            $SUDO chown -R "$(id -u):$(id -g)" "$DEPLOY_PATH"
+          fi
+
+          cd "$DEPLOY_PATH"
+
+          if [ ! -f .env ]; then
+            cp .env.example .env
+            echo "Created $DEPLOY_PATH/.env from .env.example."
+            echo "Fill TELEGRAM_BOT_TOKEN and production settings on the VPS, then rerun this workflow."
+            exit 1
+          fi
+
+          if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+            PYTHON_BIN=python3
+          fi
+
+          "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'
+
+          if [ ! -x .venv/bin/python ]; then
+            "$PYTHON_BIN" -m venv .venv
+          fi
+
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e .
+          if grep -Eq '^(CONTENT_PROVIDER|IMAGE_PROVIDER)=(grok_playwright|chatgpt_playwright|grok_chatgpt_playwright|chatgpt_grok_playwright)' .env; then
+            .venv/bin/python -m playwright install chromium
+          fi
+
+          if ! systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+            $SUDO tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<SERVICE_FILE
+          [Unit]
+          Description=X Content Telegram Bot
+          Wants=network-online.target
+          After=network-online.target ollama.service
+
+          [Service]
+          Type=simple
+          WorkingDirectory=$DEPLOY_PATH
+          ExecStart=$DEPLOY_PATH/.venv/bin/python -m src.main
+          Restart=always
+          RestartSec=10
+          Environment=PYTHONUNBUFFERED=1
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE_FILE
+            $SUDO systemctl daemon-reload
+            $SUDO systemctl enable "$SERVICE_NAME"
+          fi
+
+          $SUDO systemctl daemon-reload
+          $SUDO systemctl restart "$SERVICE_NAME"
+          $SUDO systemctl status "$SERVICE_NAME" --no-pager -l
+          rm -f "$REMOTE_ARCHIVE"
+          REMOTE_SCRIPT

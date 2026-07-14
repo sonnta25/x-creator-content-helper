@@ -21,12 +21,13 @@ from src.bot import (
     _parse_persona_args,
     _parse_retweet_args,
     _parse_tweettrend3_args,
+    _reply_target_interval_minutes,
     _reply_target_batch_score,
     _x_account_error_notifications,
 )
 from src.config import Settings
 from src.models import GeneratedContent
-from src.models import ReplyTargetDraft, TrendPostVariant, XSearchResult
+from src.models import ReplyTargetDraft, TrendPostVariant, TrendSignal, XSearchResult
 
 
 def test_parse_importcookie_args_default_account() -> None:
@@ -330,6 +331,13 @@ def test_reply_target_batch_score_prefers_velocity_and_count() -> None:
     assert _reply_target_batch_score([result]) == 4.5
 
 
+def test_reply_target_interval_is_clamped_to_supported_schedule_range() -> None:
+    assert _reply_target_interval_minutes(45, default=30) == 45
+    assert _reply_target_interval_minutes("bad", default=30) == 30
+    assert _reply_target_interval_minutes(1, default=30) == 5
+    assert _reply_target_interval_minutes(9999, default=30) == 1440
+
+
 def test_replytargets_tries_other_topics_and_relaxed_mode_until_one_result() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
     attempts = []
@@ -349,8 +357,8 @@ def test_replytargets_tries_other_topics_and_relaxed_mode_until_one_result() -> 
     async def auto_queries():
         return ["empty topic", "working topic"]
 
-    async def search(query, *, relaxed=False):
-        attempts.append((query, relaxed))
+    async def search(query, *, relaxed=False, interval_minutes=30):
+        attempts.append((query, relaxed, interval_minutes))
         if query == "working topic" and relaxed:
             return "working topic lang:en", [expected]
         return f"{query} lang:en", []
@@ -366,17 +374,92 @@ def test_replytargets_tries_other_topics_and_relaxed_mode_until_one_result() -> 
     assert search_query == "working topic lang:en"
     assert "wider fallback" in note
     assert attempts == [
-        ("empty topic", False),
-        ("working topic", False),
-        ("empty topic", True),
-        ("working topic", True),
+        ("empty topic", False, 30),
+        ("working topic", False, 30),
+        ("empty topic", True, 30),
+        ("working topic", True, 30),
     ]
+
+
+def test_replytargets_uses_broad_fallback_after_hot_topics_are_empty() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    expected = XSearchResult(
+        id=3,
+        username="user",
+        display_name="User",
+        text="Post",
+        created_at="",
+        url="https://x.com/user/status/3",
+    )
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    async def auto_queries():
+        return ["first topic", "second topic"]
+
+    async def ranked(_query, **_kwargs):
+        return "no results", []
+
+    async def broad(query):
+        if query == "second topic":
+            return "second topic since_time:1", [expected]
+        return "first topic since_time:1", []
+
+    bot._auto_reply_target_queries = auto_queries
+    bot._search_rank_reply_targets = ranked
+    bot._search_any_reply_targets = broad
+
+    search_query, results, note = asyncio.run(
+        bot._get_reply_target_context("", Status())
+    )
+
+    assert search_query == "second topic since_time:1"
+    assert results == [expected]
+    assert "broad fallback" in note
+
+
+def test_tweettrend3_collects_three_distinct_topics() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    searched = []
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    class Trends:
+        async def collect(self, category):
+            return [
+                TrendSignal(title="Topic one", source="RSS", category=category, score=30),
+                TrendSignal(title="Topic two", source="RSS", category=category, score=20),
+                TrendSignal(title="Topic three", source="RSS", category=category, score=10),
+            ], []
+
+    class XSearch:
+        async def search_recent(self, query, **_kwargs):
+            searched.append(query)
+            return query, []
+
+    bot.trend_sources = Trends()
+    bot.x_search = XSearch()
+
+    contexts = asyncio.run(
+        bot._get_trend_contexts_for_tweettrend3("news", Status())
+    )
+
+    assert [context[0] for context in contexts] == [
+        "Topic one",
+        "Topic two",
+        "Topic three",
+    ]
+    assert searched == ["Topic one", "Topic two", "Topic three"]
 
 
 def test_no_reply_targets_message_allows_auto_mode() -> None:
     message = _no_reply_targets_message("auto hot topics", auto=True)
 
-    assert "auto-scanning hot topics" in message
+    assert "broad fallback topics" in message
     assert "/replytargets crypto" in message
 
 

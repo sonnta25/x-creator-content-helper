@@ -153,6 +153,32 @@ def test_trend_variants_stay_grounded_in_the_supplied_context() -> None:
     assert "creator/founder lesson" not in service.last_prompt
 
 
+def test_single_trend_post_is_grounded_in_one_topic() -> None:
+    class CaptureTrendService(ContentService):
+        def __init__(self) -> None:
+            super().__init__(Settings(telegram_bot_token="123:ABC"))
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"text":"Pistons are trending.","topic":"Detroit Pistons",'
+                '"image_prompt":"realistic basketball arena"}'
+            )
+
+    service = CaptureTrendService()
+    generated = asyncio.run(
+        service.generate_trend_post(
+            "Detroit Pistons",
+            "Pistons won a Summer League game.",
+            "Vietnamese",
+        )
+    )
+
+    assert generated.topic == "Detroit Pistons"
+    assert "about this specific trend" in service.last_prompt
+
+
 def test_editorial_visual_strategist_prompt_targets_real_photos() -> None:
     assert "Editorial Visual Strategist" in EDITORIAL_VISUAL_STRATEGIST_INSTRUCTIONS
     assert "look like a real photograph" in EDITORIAL_VISUAL_STRATEGIST_INSTRUCTIONS

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Content Bot Bridge",
-  "version": "0.2.1",
+  "version": "0.2.4",
   "description": "Runs Gemini bridge jobs and prepares approved X drafts from Telegram.",
   "permissions": ["storage", "tabs", "scripting", "alarms", "activeTab"],
   "host_permissions": [

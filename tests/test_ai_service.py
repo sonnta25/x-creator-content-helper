@@ -27,6 +27,7 @@ def test_extension_bridge_service_covers_text_generation_methods() -> None:
     for method_name in (
         "generate_topic_post",
         "generate_topic_post_from_x_context",
+        "generate_trend_post",
         "generate_trend_post_variants",
         "generate_daily_brief",
         "generate_retweet_remix",

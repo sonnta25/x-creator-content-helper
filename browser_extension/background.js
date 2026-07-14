@@ -59,7 +59,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === AUTOMATION_ALARM) {
     automationTick()
       .then((result) => result && !result.opened && result.runJobs
-        ? runJobs({ force: true, maxJobs: 3 })
+        ? runJobs({ force: true, maxJobs: 1 })
         : null)
       .catch((error) => setStatus(`Automation error: ${error.message || error}`));
   }
@@ -124,7 +124,7 @@ async function ensureAutomationAlarm() {
   if (config.automationEnabled) {
     automationTick()
       .then((result) => result && !result.opened && result.runJobs
-        ? runJobs({ force: true, maxJobs: 3 })
+        ? runJobs({ force: true, maxJobs: 1 })
         : null)
       .catch((error) => setStatus(`Automation error: ${error.message || error}`));
   }
@@ -152,7 +152,10 @@ async function automationTick() {
     await setStatus("Starting scheduled /replytargets...");
     await bridgeFetch(config, "/automation/triggers/replytargets", {
       method: "POST",
-      body: { query: config.replyTargetsQuery }
+      body: {
+        query: config.replyTargetsQuery,
+        reply_targets_minutes: config.replyTargetsMinutes
+      }
     });
   }
 
@@ -334,6 +337,7 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
       method: "POST",
       body: { output: finalOutput }
     });
+    await closeProviderTabs(FINAL_PROVIDER_ORIGIN);
     await setStatus(`Done.\n\n${finalOutput.slice(0, 600)}`);
   } catch (error) {
     if (reportError) {
@@ -360,6 +364,7 @@ async function runImageJob(config, job) {
       method: "POST",
       body: { image_data_url: dataUrl }
     });
+    await closeProviderTabs(FINAL_PROVIDER_ORIGIN);
     await setStatus("Image returned to bot.");
   } catch (error) {
     await reportJobError(config, job.id, error);

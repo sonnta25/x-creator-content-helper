@@ -499,6 +499,31 @@ class ContentService:
         raw = await self._generate_text(prompt)
         return _parse_trend_variants(raw, char_limit=self.settings.x_post_char_limit)
 
+    async def generate_trend_post(
+        self,
+        topic: str,
+        x_context: str,
+        output_language: str = "English",
+    ) -> GeneratedContent:
+        language = _normalize_output_language(output_language)
+        prompt = _tweet_engine_prompt(
+            self.settings,
+            topic=topic,
+            brief=(
+                f"Create one {language} long-form X post about this specific trend. "
+                "Use one clear, context-grounded point of view. Do not turn it into a "
+                "generic creator, founder, startup, or business lesson unless the supplied "
+                "context itself makes that connection. Treat the live X context as the "
+                "factual boundary and do not add unsupported claims or copy source phrasing."
+            ),
+            context=f"Recent X context:\n{x_context}",
+            output_language=language,
+            output_contract=_single_tweet_output_contract(
+                self.settings.x_post_char_limit
+            ),
+        )
+        return await self._generate_content(prompt)
+
     async def generate_daily_brief(
         self,
         category: str,
@@ -862,6 +887,7 @@ def _reply_targets_output_contract() -> str:
 CRITICAL FORMAT RULES:
 - Return JSON only. No markdown. No prose before or after JSON.
 - The top-level object must contain a "targets" array.
+- Return at most 3 targets, choosing the strongest available candidates.
 - Do not return "replies", "items", "results", "options", or plain text.
 - Each target must include url, target, reason, and reply.
 - URL values must be plain https://x.com/... strings, never Markdown links.

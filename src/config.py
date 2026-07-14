@@ -30,7 +30,7 @@ class Settings:
     extension_bridge_host: str = "127.0.0.1"
     extension_bridge_port: int = 8765
     extension_bridge_token: str = "local-bridge-change-me"
-    extension_bridge_timeout_seconds: int = 300
+    extension_bridge_timeout_seconds: int = 360
     telegram_approval_chat_id: int | None = None
     telegram_reply_targets_minutes: int | None = None
     automation_approvals_path: str = ""
@@ -96,7 +96,7 @@ class Settings:
                 "local-bridge-change-me",
             ).strip()
             or "local-bridge-change-me",
-            extension_bridge_timeout_seconds=_int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 300),
+            extension_bridge_timeout_seconds=_int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 360),
             telegram_approval_chat_id=_optional_int_env("TELEGRAM_APPROVAL_CHAT_ID"),
             telegram_reply_targets_minutes=_optional_int_env(
                 "TELEGRAM_REPLY_TARGETS_MINUTES"

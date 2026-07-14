@@ -27,7 +27,7 @@ def test_settings_defaults() -> None:
     assert settings.extension_bridge_host == "127.0.0.1"
     assert settings.extension_bridge_port == 8765
     assert settings.extension_bridge_token == "local-bridge-change-me"
-    assert settings.extension_bridge_timeout_seconds == 300
+    assert settings.extension_bridge_timeout_seconds == 360
     assert settings.telegram_approval_chat_id is None
     assert settings.telegram_reply_targets_minutes is None
     assert settings.automation_approvals_path == ""

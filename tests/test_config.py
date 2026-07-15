@@ -15,15 +15,18 @@ def test_settings_defaults() -> None:
     assert settings.x_search_limit == 8
     assert settings.x_search_product == "Top"
     assert settings.x_post_char_limit == 2000
+    assert settings.reply_target_min_author_followers == 50_000
+    assert settings.reply_target_min_views == 500
     assert settings.trend_sources == "x,google_trends,rss"
     assert settings.google_trends_geo == "US"
     assert settings.trend_rss_urls == ""
     assert settings.hashtag_mode == "auto"
-    assert settings.creator_niche == "AI tools, creator growth, and online business"
+    assert "gold markets" in settings.creator_niche
+    assert "ChatGPT" in settings.creator_niche
     assert settings.creator_voice == (
         "witty, practical, dry, slightly contrarian, with a sharp creator POV"
     )
-    assert settings.target_audience == "Vietnamese X users, creators, founders, and indie hackers"
+    assert "Vietnamese retail investors" in settings.target_audience
     assert settings.extension_bridge_host == "127.0.0.1"
     assert settings.extension_bridge_port == 8765
     assert settings.extension_bridge_token == "local-bridge-change-me"

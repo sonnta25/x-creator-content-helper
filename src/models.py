@@ -41,6 +41,8 @@ class XSearchResult:
     quote_count: int = 0
     like_count: int = 0
     view_count: int | None = None
+    author_followers_count: int | None = None
+    author_verified: bool = False
     velocity_score: float = 0.0
     media_urls: list[str] | None = None
 

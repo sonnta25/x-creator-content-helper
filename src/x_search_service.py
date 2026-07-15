@@ -23,6 +23,7 @@ REPLY_TARGET_SEARCH_LIMIT = 40
 MIN_REPLY_TARGET_ENGAGEMENT_SCORE = 10.0
 MIN_REPLY_TARGET_VELOCITY_SCORE = 1.0
 MIN_REPLY_TARGET_VIEW_COUNT = 500
+MIN_REPLY_TARGET_AUTHOR_FOLLOWERS = 50_000
 
 
 class XSearchService:
@@ -179,6 +180,8 @@ def format_x_results(results: list[XSearchResult]) -> str:
         )
         if result.view_count is not None:
             metrics = f"{metrics}, {result.view_count} views"
+        if result.author_followers_count is not None:
+            metrics = f"{metrics}, {result.author_followers_count} author followers"
         lines.append(
             f"{index}. {author} - {result.created_at}\n"
             f"{_compact_text(result.text, 420)}\n"
@@ -206,7 +209,8 @@ def summarize_reply_target_context(results: list[XSearchResult], max_items: int 
             f"Author: @{result.username}\n"
             f"Metrics: {result.like_count} likes, {result.retweet_count} reposts, "
             f"{result.quote_count} quotes, {result.reply_count} replies, "
-            f"{_format_views(result)}, velocity {result.velocity_score:.2f}/min\n"
+            f"{_format_views(result)}, {_format_author_reach(result)}, "
+            f"engagement velocity {result.velocity_score:.2f}/min\n"
             f"Age: {_format_age_minutes(result)}\n"
             f"Post: {_compact_text(result.text, 360)}"
         )
@@ -241,6 +245,11 @@ def _to_search_result(tweet: Any) -> XSearchResult:
         quote_count=int(getattr(tweet, "quoteCount", 0) or 0),
         like_count=int(getattr(tweet, "likeCount", 0) or 0),
         view_count=_optional_int(getattr(tweet, "viewCount", None)),
+        author_followers_count=_optional_int(getattr(user, "followersCount", None)),
+        author_verified=bool(
+            getattr(user, "verified", False)
+            or getattr(user, "blue", False)
+        ),
         media_urls=_media_urls(tweet),
     )
 
@@ -304,6 +313,7 @@ def rank_fast_growing_posts(
     min_engagement_score: float = MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
     min_velocity_score: float = MIN_REPLY_TARGET_VELOCITY_SCORE,
     min_view_count: int = MIN_REPLY_TARGET_VIEW_COUNT,
+    min_author_followers: int = 0,
 ) -> list[XSearchResult]:
     now = datetime.now(timezone.utc).timestamp()
     ranked: list[XSearchResult] = []
@@ -319,6 +329,11 @@ def rank_fast_growing_posts(
             continue
         if result.view_count is not None and result.view_count < min_view_count:
             continue
+        if min_author_followers > 0 and (
+            result.author_followers_count is None
+            or result.author_followers_count < min_author_followers
+        ):
+            continue
         if not _has_reply_target_signal(result):
             continue
         ranked.append(replace(result, velocity_score=velocity))
@@ -326,6 +341,8 @@ def rank_fast_growing_posts(
     return sorted(
         ranked,
         key=lambda result: (
+            _view_velocity(result, now),
+            result.author_followers_count or 0,
             result.velocity_score,
             _engagement_score(result),
             result.created_at_timestamp or 0,
@@ -372,6 +389,22 @@ def _format_views(result: XSearchResult) -> str:
     if result.view_count is None:
         return "views unknown"
     return f"{result.view_count} views"
+
+
+def _format_author_reach(result: XSearchResult) -> str:
+    if result.author_followers_count is None:
+        return "author followers unknown"
+    verified = ", verified" if result.author_verified else ""
+    return f"{result.author_followers_count} author followers{verified}"
+
+
+def _view_velocity(result: XSearchResult, now_timestamp: float) -> float:
+    if result.view_count is None:
+        return 0.0
+    age_minutes = _age_minutes(result, now_timestamp)
+    if age_minutes is None:
+        return 0.0
+    return result.view_count / max(age_minutes, 5.0)
 
 
 def _optional_int(value: Any) -> int | None:

@@ -1,9 +1,15 @@
 import asyncio
 import json
+import time
 
 from src.ai_service import create_ai_service
 from src.config import Settings
-from src.extension_bridge import ExtensionBridgeJob, ExtensionBridgeServer, _clean_final_image_prompt
+from src.extension_bridge import (
+    JOB_LEASE_SECONDS,
+    ExtensionBridgeJob,
+    ExtensionBridgeServer,
+    _clean_final_image_prompt,
+)
 from src.extension_bridge_service import ExtensionBridgeService
 
 
@@ -93,9 +99,38 @@ def test_bridge_claims_each_text_job_once_for_a_single_gemini_pass() -> None:
         assert first["job"]["stage"] == "final"
         assert first["job"]["final_prompt"] == "Write one final reply."
         assert job.phase == "final_running"
+        assert job.claim_attempts == 1
+        assert job.last_heartbeat_at > 0
+
+        previous_heartbeat = job.last_heartbeat_at
+        await server._accept_heartbeat(job.id)
+        assert job.last_heartbeat_at >= previous_heartbeat
 
         duplicate = json.loads((await server._next_job()).split(b"\r\n\r\n", 1)[1])
         assert duplicate["job"] is None
+
+    asyncio.run(exercise())
+
+
+def test_bridge_requeues_a_job_after_its_extension_lease_expires() -> None:
+    async def exercise() -> None:
+        server = ExtensionBridgeServer(Settings(telegram_bot_token="123:ABC"))
+        job = ExtensionBridgeJob(
+            id="job-stale",
+            kind="text",
+            original_prompt="Reply task",
+            phase="final_running",
+            final_prompt="Write one reply.",
+            last_heartbeat_at=time.monotonic() - JOB_LEASE_SECONDS - 1,
+            claim_attempts=1,
+        )
+        server._jobs[job.id] = job
+
+        reclaimed = json.loads((await server._next_job()).split(b"\r\n\r\n", 1)[1])
+
+        assert reclaimed["job"]["id"] == job.id
+        assert job.phase == "final_running"
+        assert job.claim_attempts == 2
 
     asyncio.run(exercise())
 

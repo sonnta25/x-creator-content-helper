@@ -20,6 +20,9 @@ const DEFAULTS = {
 
 const AUTO_ALARM = "x-content-bot-auto-run";
 const AUTOMATION_ALARM = "x-content-bot-scheduled-approvals";
+const RUNTIME_WATCHDOG_ALARM = "x-content-bot-runtime-watchdog";
+const FOLLOW_UP_ALARM = "x-content-bot-follow-up";
+const BRIDGE_FETCH_TIMEOUT_MS = 15000;
 const FINAL_PROVIDER_URL = "https://gemini.google.com/app";
 const FINAL_PROVIDER_NAME = "Gemini";
 const PROVIDER_RECYCLE_AFTER_JOBS = 10;
@@ -28,14 +31,17 @@ let running = false;
 let lastStatusCache = "";
 
 chrome.runtime.onInstalled.addListener(() => {
-  ensureAutoAlarm();
-  ensureAutomationAlarm();
+  bootstrapRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  ensureAutoAlarm();
-  ensureAutomationAlarm();
+  bootstrapRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
 });
+
+// Chrome recommends checking critical alarms whenever an extension service
+// worker starts because alarm persistence can be unpredictable across browser
+// restarts and extension reloads. Top-level bootstrap runs on every worker wake.
+bootstrapRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
@@ -58,7 +64,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === AUTO_ALARM) {
-    runJobs({ force: false, maxJobs: 1 });
+    runJobs({ force: false, maxJobs: 1 })
+      .catch((error) => setStatus(`Auto Run error: ${error.message || error}`));
   }
   if (alarm.name === AUTOMATION_ALARM) {
     automationTick()
@@ -66,6 +73,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         ? runJobs({ force: true, maxJobs: 1 })
         : null)
       .catch((error) => setStatus(`Automation error: ${error.message || error}`));
+  }
+  if (alarm.name === RUNTIME_WATCHDOG_ALARM) {
+    bootstrapRuntime()
+      .catch((error) => setStatus(`Runtime watchdog error: ${error.message || error}`));
+  }
+  if (alarm.name === FOLLOW_UP_ALARM) {
+    runJobs({ force: false, maxJobs: 1 })
+      .catch((error) => setStatus(`Follow-up error: ${error.message || error}`));
   }
 });
 
@@ -104,22 +119,36 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
+async function bootstrapRuntime() {
+  await ensureWatchdogAlarm();
+  await Promise.all([ensureAutoAlarm(), ensureAutomationAlarm()]);
+}
+
+async function ensureWatchdogAlarm() {
+  const existing = await chromeAlarmsGet(RUNTIME_WATCHDOG_ALARM);
+  if (!existing || Number(existing.periodInMinutes || 0) !== 1) {
+    chrome.alarms.create(RUNTIME_WATCHDOG_ALARM, { periodInMinutes: 1 });
+  }
+}
+
 async function ensureAutoAlarm() {
   const config = await loadConfig();
-  await chromeAlarmsClear(AUTO_ALARM);
   if (!config.autoRun) {
+    await chromeAlarmsClear(AUTO_ALARM);
     return;
   }
-  chrome.alarms.create(AUTO_ALARM, {
-    periodInMinutes: Math.max(0.5, config.pollSeconds / 60)
-  });
-  runJobs({ force: false, maxJobs: 1 });
+  const periodInMinutes = Math.max(0.5, config.pollSeconds / 60);
+  const existing = await chromeAlarmsGet(AUTO_ALARM);
+  if (!existing || Number(existing.periodInMinutes || 0) !== periodInMinutes) {
+    chrome.alarms.create(AUTO_ALARM, { periodInMinutes });
+  }
+  await runJobs({ force: false, maxJobs: 1 });
 }
 
 async function ensureAutomationAlarm() {
   const config = await loadConfig();
-  await chromeAlarmsClear(AUTOMATION_ALARM);
   if (!config.automationEnabled) {
+    await chromeAlarmsClear(AUTOMATION_ALARM);
     return;
   }
   if (!config.nextReplyTargetsAt) {
@@ -127,12 +156,14 @@ async function ensureAutomationAlarm() {
       nextReplyTargetsAt: Date.now() + config.replyTargetsMinutes * 60 * 1000
     });
   }
-  chrome.alarms.create(AUTOMATION_ALARM, { periodInMinutes: 0.5 });
-  automationTick()
-    .then((result) => result && result.runJobs
-      ? runJobs({ force: true, maxJobs: 1 })
-      : null)
-    .catch((error) => setStatus(`Automation error: ${error.message || error}`));
+  const existing = await chromeAlarmsGet(AUTOMATION_ALARM);
+  if (!existing || Number(existing.periodInMinutes || 0) !== 0.5) {
+    chrome.alarms.create(AUTOMATION_ALARM, { periodInMinutes: 0.5 });
+  }
+  const result = await automationTick();
+  if (result && result.runJobs) {
+    await runJobs({ force: true, maxJobs: 1 });
+  }
 }
 
 async function automationTick() {
@@ -264,7 +295,6 @@ function localDateKey(date) {
 
 async function runJobs({ force, maxJobs }) {
   if (running) {
-    await setStatus("Already running a job.");
     return { ok: true, status: "already-running" };
   }
 
@@ -283,6 +313,11 @@ async function runJobs({ force, maxJobs }) {
     }
     if (processed === 0) {
       await setStatus(`No pending job. Last checked ${new Date().toLocaleTimeString()}.`);
+    } else {
+      // The bot often queues the next /tweettrend3 or repair job immediately
+      // after receiving this result. Keep one low-frequency follow-up wake so
+      // it is not left waiting if the primary repeating alarm disappears.
+      chrome.alarms.create(FOLLOW_UP_ALARM, { delayInMinutes: 0.5 });
     }
     return { ok: true, processed };
   } catch (error) {
@@ -313,6 +348,7 @@ async function runOneJob(config) {
 async function runGeminiTextJob(config, job, { reportError = true } = {}) {
   let providerStarted = false;
   let providerCompleted = false;
+  const stopHeartbeat = startJobHeartbeat(config, job.id);
   try {
     const finalPrompt = job.final_prompt || job.grok_prompt;
     if (!finalPrompt) {
@@ -347,12 +383,15 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
       await recycleProviderAfterFailure();
     }
     throw error;
+  } finally {
+    stopHeartbeat();
   }
 }
 
 async function runImageJob(config, job) {
   let providerStarted = false;
   let providerCompleted = false;
+  const stopHeartbeat = startJobHeartbeat(config, job.id);
   try {
     await setStatus(`Image job ${job.id}\nUsing existing ${FINAL_PROVIDER_NAME} tab...`);
     providerStarted = true;
@@ -381,7 +420,32 @@ async function runImageJob(config, job) {
       await recycleProviderAfterFailure();
     }
     throw error;
+  } finally {
+    stopHeartbeat();
   }
+}
+
+function startJobHeartbeat(config, jobId) {
+  let stopped = false;
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      await bridgeFetch(config, `/jobs/${jobId}/heartbeat`, {
+        method: "POST",
+        body: {},
+        timeoutMs: 5000
+      });
+    } catch (_error) {
+      // A temporary bridge failure is tolerated. If the worker actually dies,
+      // the server-side lease expires and another worker can reclaim the job.
+    }
+  };
+  tick();
+  const timer = setInterval(tick, 10000);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 async function reportJobError(config, jobId, error) {
@@ -799,6 +863,9 @@ async function waitForTabComplete(tabId) {
 
 async function bridgeFetch(config, path, options = {}) {
   let response;
+  const controller = new AbortController();
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || BRIDGE_FETCH_TIMEOUT_MS));
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     response = await fetch(`${config.bridgeUrl}${path}`, {
       method: options.method || "GET",
@@ -806,13 +873,19 @@ async function bridgeFetch(config, path, options = {}) {
         "Content-Type": "application/json",
         "X-Extension-Bridge-Token": config.token
       },
-      body: options.body ? JSON.stringify(options.body) : undefined
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal
     });
   } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error(`Bridge request timed out after ${Math.round(timeoutMs / 1000)} seconds: ${path}`);
+    }
     throw new Error(
       `Cannot reach bridge at ${config.bridgeUrl}. Start the Telegram bot with ` +
       `python -m src.main, keep CONTENT_PROVIDER=extension_bridge, then try again.`
     );
+  } finally {
+    clearTimeout(timeout);
   }
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
@@ -1998,6 +2071,10 @@ function chromeTabsRemove(tabIds) {
 
 function chromeAlarmsClear(name) {
   return new Promise((resolve) => chrome.alarms.clear(name, resolve));
+}
+
+function chromeAlarmsGet(name) {
+  return new Promise((resolve) => chrome.alarms.get(name, resolve));
 }
 
 function chromeCaptureVisibleTab(windowId, options) {

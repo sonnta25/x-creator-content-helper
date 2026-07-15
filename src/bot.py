@@ -27,7 +27,6 @@ from src.trend_source_service import TrendSourceService, summarize_trend_signals
 from src.x_search_service import (
     MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
     MIN_REPLY_TARGET_VELOCITY_SCORE,
-    MIN_REPLY_TARGET_VIEW_COUNT,
     TREND_FALLBACK_QUERIES,
     XSearchService,
     default_english_query,
@@ -43,14 +42,15 @@ LOGGER = logging.getLogger(__name__)
 
 AUTO_TREND_CATEGORIES = ("trending", "news", "entertainment", "sport")
 AUTO_REPLY_TARGET_FALLBACK_QUERIES = (
-    "AI",
-    "OpenAI",
-    "crypto",
+    "breaking news",
+    "politics",
     "business",
-    "technology",
     "sports",
     "entertainment",
+    "technology",
     "internet culture",
+    "crypto",
+    "AI",
 )
 REPLY_TARGET_MAX_CANDIDATES = 6
 REPLY_TARGET_RESULT_LIMIT = 12
@@ -1114,7 +1114,7 @@ class ContentBot:
         searched: list[tuple[str, str, list[XSearchResult]]] = []
         for candidate in candidates:
             await status.edit_text(
-                "Finding a usable reply target...\n"
+                "Finding a high-reach post from a large account...\n"
                 f"Trying: {candidate}\n"
                 f"Freshness limit: {interval_minutes} minutes"
             )
@@ -1171,7 +1171,9 @@ class ContentBot:
                 REPLY_TARGET_RESULT_LIMIT,
                 max(self.settings.x_search_limit, 8),
             ),
-            product="Latest",
+            # Top + since_time lets X surface the strongest fresh distribution
+            # instead of returning a purely chronological stream of small posts.
+            product="Top",
         )
 
     def _rank_reply_target_pool(
@@ -1188,28 +1190,12 @@ class ContentBot:
             max_age_minutes=freshness_minutes,
             min_engagement_score=0 if relaxed else MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
             min_velocity_score=0 if relaxed else MIN_REPLY_TARGET_VELOCITY_SCORE,
-            min_view_count=0 if relaxed else MIN_REPLY_TARGET_VIEW_COUNT,
+            # View count is a hard quality floor whenever X exposes it. Topic
+            # rotation may relax engagement and velocity, but must not promote
+            # a nearly unseen post merely because it is very new.
+            min_view_count=self.settings.reply_target_min_views,
+            min_author_followers=self.settings.reply_target_min_author_followers,
         )
-        if relaxed and not ranked:
-            cutoff = datetime.now(UTC).timestamp() - freshness_minutes * 60
-            ranked = sorted(
-                (
-                    result
-                    for result in recent_results
-                    if result.url
-                    and result.text
-                    and result.created_at_timestamp is not None
-                    and result.created_at_timestamp >= cutoff
-                ),
-                key=lambda result: (
-                    result.created_at_timestamp or 0,
-                    result.like_count
-                    + result.reply_count * 2
-                    + result.retweet_count * 3
-                    + result.quote_count * 3,
-                ),
-                reverse=True,
-            )[:5]
         unseen = [
             result
             for result in ranked
@@ -1218,7 +1204,10 @@ class ContentBot:
         return unseen
 
     async def _auto_reply_target_queries(self) -> list[str]:
-        queries: list[str] = [self.settings.creator_niche]
+        # /replytargets is deliberately independent from CREATOR_NICHE. Its job
+        # is reach discovery across today's largest conversations; niche-led
+        # discovery remains the responsibility of /tweettrend3.
+        queries: list[str] = []
         try:
             trends = await asyncio.wait_for(
                 self.x_search.trends("trending", limit=4),
@@ -1228,8 +1217,6 @@ class ContentBot:
             trends = []
         queries.extend(trend.name for trend in trends if trend.name)
 
-        for category in AUTO_TREND_CATEGORIES:
-            queries.extend(TREND_FALLBACK_QUERIES.get(category, []))
         queries.extend(AUTO_REPLY_TARGET_FALLBACK_QUERIES)
         return _dedupe_queries(queries)[:12]
 

@@ -355,6 +355,8 @@ def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
         created_at="",
         url="https://x.com/user/status/2",
         created_at_timestamp=int(datetime.now(UTC).timestamp()),
+        like_count=5,
+        author_followers_count=50_000,
     )
 
     class Status:
@@ -377,13 +379,74 @@ def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
         bot._get_reply_target_context("", Status())
     )
 
-    assert results == [expected]
+    assert [result.id for result in results] == [expected.id]
+    assert results[0].velocity_score > 0
     assert search_query == "working topic lang:en"
     assert "fresh fallback" in note
     assert attempts == [
         ("empty topic", 30),
         ("working topic", 30),
     ]
+
+
+def test_replytargets_relaxed_ranking_keeps_view_count_as_a_hard_floor() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    now = int(datetime.now(UTC).timestamp())
+    low_view = XSearchResult(
+        id=9,
+        username="lowview",
+        display_name="Low View",
+        text="One minute old but almost unseen",
+        created_at="",
+        url="https://x.com/lowview/status/9",
+        created_at_timestamp=now - 60,
+        like_count=9,
+        view_count=9,
+        author_followers_count=500_000,
+    )
+    qualified = XSearchResult(
+        id=10,
+        username="qualified",
+        display_name="Qualified",
+        text="Fresh post with real distribution",
+        created_at="",
+        url="https://x.com/qualified/status/10",
+        created_at_timestamp=now - 120,
+        like_count=5,
+        view_count=500,
+        author_followers_count=500_000,
+    )
+
+    ranked = bot._rank_reply_target_pool(
+        [low_view, qualified],
+        relaxed=True,
+        interval_minutes=15,
+    )
+
+    assert [result.id for result in ranked] == [10]
+
+
+def test_replytargets_relaxed_ranking_rejects_fresh_posts_without_signal() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    no_signal = XSearchResult(
+        id=11,
+        username="nosignal",
+        display_name="No Signal",
+        text="Fresh but no visible engagement",
+        created_at="",
+        url="https://x.com/nosignal/status/11",
+        created_at_timestamp=int(datetime.now(UTC).timestamp()) - 60,
+        view_count=None,
+        author_followers_count=500_000,
+    )
+
+    ranked = bot._rank_reply_target_pool(
+        [no_signal],
+        relaxed=True,
+        interval_minutes=15,
+    )
+
+    assert ranked == []
 
 
 def test_replytargets_never_accepts_posts_older_than_interval() -> None:
@@ -435,8 +498,25 @@ def test_replytargets_auto_topic_discovery_uses_one_bounded_trend_call() -> None
     queries = asyncio.run(bot._auto_reply_target_queries())
 
     assert calls == [("trending", 4)]
-    assert queries[0] == bot.settings.creator_niche
-    assert "AI launch" in queries
+    assert queries[0] == "AI launch"
+    assert bot.settings.creator_niche not in queries
+
+
+def test_replytargets_searches_top_posts_within_the_freshness_window() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    calls = []
+
+    class XSearch:
+        async def search_recent(self, query, **kwargs):
+            calls.append((query, kwargs))
+            return "news lang:en since_time:1", []
+
+    bot.x_search = XSearch()
+    asyncio.run(bot._search_reply_target_pool("news", interval_minutes=15))
+
+    assert calls[0][0] == "news"
+    assert calls[0][1]["since_minutes"] == 15
+    assert calls[0][1]["product"] == "Top"
 
 
 def test_tweettrend3_collects_three_distinct_topics() -> None:

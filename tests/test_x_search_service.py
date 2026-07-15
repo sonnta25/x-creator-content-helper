@@ -7,6 +7,7 @@ import pytest
 from src.x_search_service import (
     TREND_CATEGORIES,
     TREND_FALLBACK_QUERIES,
+    _to_search_result,
     default_english_query,
     extract_tweet_id,
     normalize_account_name,
@@ -136,6 +137,68 @@ def test_rank_fast_growing_posts_filters_weak_low_view_posts() -> None:
     ranked = rank_fast_growing_posts([weak, good], max_items=5, max_age_minutes=30)
 
     assert [result.username for result in ranked] == ["good"]
+
+
+def test_rank_fast_growing_posts_requires_large_accounts_when_configured() -> None:
+    now = datetime.now(timezone.utc)
+    small = XSearchResult(
+        id=20,
+        username="small",
+        display_name="Small",
+        text="High engagement from a small account",
+        created_at=str(now - timedelta(minutes=5)),
+        created_at_timestamp=int((now - timedelta(minutes=5)).timestamp()),
+        url="https://x.com/small/status/20",
+        like_count=100,
+        view_count=10_000,
+        author_followers_count=10_000,
+    )
+    large = XSearchResult(
+        id=21,
+        username="large",
+        display_name="Large",
+        text="Fresh post from a large account",
+        created_at=str(now - timedelta(minutes=5)),
+        created_at_timestamp=int((now - timedelta(minutes=5)).timestamp()),
+        url="https://x.com/large/status/21",
+        like_count=10,
+        view_count=1_000,
+        author_followers_count=100_000,
+    )
+
+    ranked = rank_fast_growing_posts(
+        [small, large],
+        max_age_minutes=30,
+        min_author_followers=50_000,
+    )
+
+    assert [result.id for result in ranked] == [21]
+
+
+def test_to_search_result_captures_author_reach() -> None:
+    class User:
+        username = "large"
+        displayname = "Large Account"
+        followersCount = 250_000
+        verified = True
+        blue = False
+
+    class Tweet:
+        id = 22
+        user = User()
+        rawContent = "A current high-reach post"
+        date = datetime.now(timezone.utc)
+        replyCount = 2
+        retweetCount = 3
+        quoteCount = 1
+        likeCount = 20
+        viewCount = 4_000
+        media = None
+
+    result = _to_search_result(Tweet())
+
+    assert result.author_followers_count == 250_000
+    assert result.author_verified is True
 
 
 def test_trends_consumes_async_generator() -> None:

@@ -363,6 +363,41 @@ def test_reply_prompt_requires_source_matched_natural_voice() -> None:
     assert "one narrow reaction" in prompt
 
 
+def test_replytargets_prompt_does_not_force_creator_niche() -> None:
+    class ReplyTargetService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/large/status/1",'
+                '"target":"@large current event","reason":"High reach",'
+                '"reply":"That second-order effect is the part people are missing."}]}'
+            )
+
+    service = ReplyTargetService(
+        Settings(
+            telegram_bot_token="123:ABC",
+            creator_niche="gold and crypto only",
+            target_audience="gold investors only",
+        )
+    )
+    asyncio.run(
+        service.generate_reply_targets(
+            "NBA Finals",
+            "Candidate post about a basketball game",
+        )
+    )
+
+    assert "large accounts" in service.last_prompt
+    assert "Do not force the creator's content niche" in service.last_prompt
+    assert "gold and crypto only" not in service.last_prompt
+    assert "gold investors only" not in service.last_prompt
+    assert "readers already participating in the source post's conversation" in service.last_prompt
+
+
 def test_looks_like_prompt_leak_detects_user_reported_output() -> None:
     assert _looks_like_prompt_leak(
         "You are a Twitter/X Tweet QA + Humanizer. Your input is ONE generated tweet."
@@ -538,6 +573,57 @@ def test_parse_reply_targets_accepts_common_browser_model_key_variants() -> None
 
     assert len(targets) == 1
     assert targets[0].url == "https://x.com/user/status/456"
+
+
+def test_parse_reply_targets_accepts_url_and_reply_field_variants() -> None:
+    targets = _parse_reply_targets(
+        """
+        {
+          "targets": [
+            {
+              "tweet_url": "https://x.com/large/status/789",
+              "target": "@large - current event",
+              "reason": "Large account with fast distribution.",
+              "draft_reply": "That timing changes the whole read."
+            }
+          ]
+        }
+        """,
+        allowed_urls=["https://x.com/large/status/789"],
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url == "https://x.com/large/status/789"
+    assert targets[0].reply == "That timing changes the whole read"
+
+
+def test_generate_reply_targets_repairs_an_empty_first_response() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return '{"targets":[]}'
+            return (
+                '{"targets":[{"url":"https://x.com/large/status/999",'
+                '"target":"@large - news","reason":"Fast distribution",'
+                '"reply":"That detail is doing more work than the headline."}]}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "breaking news",
+            "1. URL: https://x.com/large/status/999\nPost: Current event update",
+        )
+    )
+
+    assert len(service.prompts) == 2
+    assert "repairing an unusable reply-target response" in service.prompts[1]
+    assert targets[0].url == "https://x.com/large/status/999"
 
 
 def test_parse_reply_targets_recovers_all_items_from_unescaped_reply_quotes() -> None:

@@ -58,3 +58,16 @@ def test_gemini_prompt_is_inserted_atomically_with_a_fallback() -> None:
     assert "for (const chunk of chunks)" not in background_js.split(
         "async function injectedSubmitPrompt(prompt)", 1
     )[1].split("function injectedReadProviderResponse", 1)[0]
+
+
+def test_auto_run_self_heals_alarms_and_heartbeats_claimed_jobs() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "bootstrapRuntime().catch" in background_js
+    assert "RUNTIME_WATCHDOG_ALARM" in background_js
+    assert "chromeAlarmsGet(AUTO_ALARM)" in background_js
+    assert "startJobHeartbeat(config, job.id)" in background_js
+    assert "/heartbeat`" in background_js
+    assert "BRIDGE_FETCH_TIMEOUT_MS = 15000" in background_js

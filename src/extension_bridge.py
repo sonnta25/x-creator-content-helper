@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import secrets
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -14,6 +15,7 @@ from src.extension_prompts import gemini_single_pass_prompt
 
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
+JOB_LEASE_SECONDS = 75
 
 
 class AutomationBridgeHandler(Protocol):
@@ -42,6 +44,8 @@ class ExtensionBridgeJob:
     phase: str = "draft_pending"
     draft_prompt: str = ""
     final_prompt: str = ""
+    last_heartbeat_at: float = 0.0
+    claim_attempts: int = 0
     future: asyncio.Future[str | bytes] = field(default_factory=asyncio.Future)
 
 
@@ -205,6 +209,8 @@ class ExtensionBridgeServer:
                 return await self._accept_result(job_id, payload)
             if action == "error" and method == "POST":
                 return await self._accept_error(job_id, payload)
+            if action == "heartbeat" and method == "POST":
+                return await self._accept_heartbeat(job_id)
 
         if len(parts) == 4 and parts[:2] == ["automation", "approvals"]:
             handler = self._require_automation_handler()
@@ -236,6 +242,20 @@ class ExtensionBridgeServer:
 
     async def _next_job(self) -> bytes:
         async with self._lock:
+            now = time.monotonic()
+            for candidate in self._jobs.values():
+                if (
+                    candidate.phase in {"draft_running", "final_running"}
+                    and candidate.last_heartbeat_at > 0
+                    and now - candidate.last_heartbeat_at > JOB_LEASE_SECONDS
+                    and not candidate.future.done()
+                ):
+                    candidate.phase = (
+                        "draft_pending"
+                        if candidate.phase == "draft_running"
+                        else "final_pending"
+                    )
+                    candidate.last_heartbeat_at = 0.0
             job = next(
                 (
                     candidate
@@ -250,6 +270,8 @@ class ExtensionBridgeServer:
                     if job.phase == "draft_pending"
                     else "final_running"
                 )
+                job.last_heartbeat_at = now
+                job.claim_attempts += 1
         if job is None:
             return _json_response(200, {"job": None})
         if job.kind == "image" or job.phase == "final_running":
@@ -306,6 +328,21 @@ class ExtensionBridgeServer:
             job.future.set_exception(RuntimeError(message))
         job.phase = "failed"
         return _json_response(200, {"ok": True})
+
+    async def _accept_heartbeat(self, job_id: str) -> bytes:
+        job = await self._job(job_id)
+        if job.future.done():
+            return _json_response(200, {"ok": True, "phase": job.phase})
+        if job.phase not in {"draft_running", "final_running"}:
+            return _json_response(
+                409,
+                {"error": f"Job is not running. Current phase: {job.phase}."},
+            )
+        job.last_heartbeat_at = time.monotonic()
+        return _json_response(
+            200,
+            {"ok": True, "phase": job.phase, "claim_attempts": job.claim_attempts},
+        )
 
     async def _job(self, job_id: str) -> ExtensionBridgeJob:
         async with self._lock:
@@ -416,6 +453,7 @@ def _response_headers(status: int, content_type: str, length: int) -> bytes:
         400: "Bad Request",
         401: "Unauthorized",
         404: "Not Found",
+        409: "Conflict",
         500: "Internal Server Error",
     }.get(status, "OK")
     lines = [

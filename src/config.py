@@ -33,6 +33,7 @@ class Settings:
     extension_bridge_timeout_seconds: int = 360
     telegram_approval_chat_id: int | None = None
     telegram_reply_targets_minutes: int | None = None
+    telegram_reply_targets_updated_at: int | None = None
     automation_approvals_path: str = ""
     gemini_image_prompt_prefix: str = (
         "Create one square realistic image for this social post. Return the image only, "
@@ -100,6 +101,9 @@ class Settings:
             telegram_approval_chat_id=_optional_int_env("TELEGRAM_APPROVAL_CHAT_ID"),
             telegram_reply_targets_minutes=_optional_int_env(
                 "TELEGRAM_REPLY_TARGETS_MINUTES"
+            ),
+            telegram_reply_targets_updated_at=_optional_int_env(
+                "TELEGRAM_REPLY_TARGETS_UPDATED_AT"
             ),
             automation_approvals_path=os.getenv(
                 "AUTOMATION_APPROVALS_PATH",

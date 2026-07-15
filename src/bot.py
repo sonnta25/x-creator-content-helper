@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
+from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any
 from urllib.parse import urlencode
@@ -51,9 +52,11 @@ AUTO_REPLY_TARGET_FALLBACK_QUERIES = (
     "entertainment",
     "internet culture",
 )
-REPLY_TARGET_MAX_CANDIDATES = 8
-REPLY_TARGET_RESULT_LIMIT = 20
+REPLY_TARGET_MAX_CANDIDATES = 6
+REPLY_TARGET_RESULT_LIMIT = 12
 REPLY_TARGET_CONTEXT_ITEMS = 3
+REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
+REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
 TREND_CONTEXT_SIGNAL_ITEMS = 3
 TREND_CONTEXT_X_ITEMS = 4
 TWEETTREND_LANGUAGE_ALIASES = {
@@ -76,11 +79,11 @@ class _SilentStatus:
 BOT_COMMANDS = [
     BotCommand("start", "Show help and available commands"),
     BotCommand("help", "Show help and available commands"),
-    BotCommand("tweet", "Generate a Vietnamese X post and image from a topic"),
+    BotCommand("tweet", "Generate a Vietnamese X post with an optional image"),
     BotCommand("tweetx", "Generate an English X post using live X search context"),
     BotCommand("tweettrend3", "Auto-pick or choose a trend and generate 3 Vietnamese posts"),
-    BotCommand("dailybrief", "Generate daily tweet options with images"),
-    BotCommand("retweet", "Remix an X post into an original tweet and image"),
+    BotCommand("dailybrief", "Generate daily tweet options with optional images"),
+    BotCommand("retweet", "Remix an X post with an optional image"),
     BotCommand("replytargets", "Auto-pick or search X posts to reply to"),
     BotCommand("persona", "Show or set creator niche, voice, and audience"),
     BotCommand("importcookie", "Save X auth_token and ct0 cookie for X search"),
@@ -123,6 +126,7 @@ class ContentBot:
             bridge = getattr(self.ai, "bridge", None)
             if bridge is not None:
                 await bridge.stop()
+            await self.trend_sources.aclose()
             self._application = None
 
         app = (
@@ -156,11 +160,11 @@ class ContentBot:
         del context
         await update.effective_message.reply_text(
             "Commands:\n"
-            "/tweet <topic> - generate a Vietnamese X post and image\n"
+            "/tweet <topic> - generate a Vietnamese X post with an optional image\n"
             "/tweetx <topic/search> - generate an English X post using live X context\n"
             "/tweettrend3 [auto|trending|news|sport|entertainment] - generate 3 Vietnamese trend angles\n"
-            "/dailybrief [trending|news|sport|entertainment] - generate daily tweets with images\n"
-            "/retweet <X post link> - remix an X post into an original tweet and image\n"
+            "/dailybrief [trending|news|sport|entertainment] - generate daily tweets with optional images\n"
+            "/retweet <X post link> - remix an X post with an optional image\n"
             "/replytargets [query] - auto-pick or search posts to reply to\n"
             "/persona - show or set niche, voice, and target audience\n"
             "/importcookie <auth_token=...; ct0=...> - save X cookie for search\n"
@@ -236,8 +240,13 @@ class ContentBot:
         self.settings = replace(
             self.settings,
             telegram_reply_targets_minutes=minutes,
+            telegram_reply_targets_updated_at=int(datetime.now(UTC).timestamp() * 1000),
         )
         update_env_value("TELEGRAM_REPLY_TARGETS_MINUTES", str(minutes))
+        update_env_value(
+            "TELEGRAM_REPLY_TARGETS_UPDATED_AT",
+            str(self.settings.telegram_reply_targets_updated_at),
+        )
         await message.reply_text(
             f"Scheduled /replytargets interval set to {minutes} minutes. "
             "Chrome will sync it within about 30 seconds."
@@ -246,6 +255,8 @@ class ContentBot:
     async def get_automation_config(self) -> dict[str, Any]:
         return {
             "reply_targets_minutes": self.settings.telegram_reply_targets_minutes,
+            "reply_targets_updated_at": self.settings.telegram_reply_targets_updated_at,
+            "automation_running": bool(self._automation_running),
         }
 
     async def automation_approval(
@@ -388,39 +399,58 @@ class ContentBot:
     ) -> None:
         if self._application is None or self.approval_chat_id is None:
             raise RuntimeError("Automation chat is not ready.")
-        status = _SilentStatus()
-        search_query, results, _auto_note = await self._get_reply_target_context(
-            query,
-            status,
-            interval_minutes=interval_minutes,
+        status = await self._application.bot.send_message(
+            chat_id=self.approval_chat_id,
+            text=(
+                "Scheduled /replytargets started.\n"
+                f"Freshness limit: {interval_minutes} minutes."
+            ),
         )
-        if not results:
-            await self._application.bot.send_message(
-                chat_id=self.approval_chat_id,
-                text=_no_reply_targets_message(
+        try:
+            search_query, results, _auto_note = await self._get_reply_target_context(
+                query,
+                status,
+                interval_minutes=interval_minutes,
+            )
+            if not results:
+                await status.edit_text(_no_reply_targets_message(
                     search_query,
                     auto=not query,
                     interval_minutes=interval_minutes,
-                ),
+                ))
+                return
+            await status.edit_text(
+                f"Found {len(results)} fresh candidate(s). Generating reply drafts..."
             )
-            return
-        drafts = await self.ai.generate_reply_targets(
-            search_query,
-            summarize_reply_target_context(results, max_items=REPLY_TARGET_CONTEXT_ITEMS),
-        )
-        for draft in drafts:
-            target_url = _format_reply_target_link(draft)
-            if self.approvals.has_active_target(target_url):
-                continue
-            approval = self.approvals.create(
-                kind="reply",
-                text=_format_reply_target_reply(draft),
-                chat_id=self.approval_chat_id,
-                approver_user_id=self.approval_chat_id,
-                target_url=target_url,
-                target_label=draft.target,
+            drafts = await self.ai.generate_reply_targets(
+                search_query,
+                summarize_reply_target_context(results, max_items=REPLY_TARGET_CONTEXT_ITEMS),
             )
-            await self._send_approval(approval, reason=draft.reason)
+            sent = 0
+            for draft in drafts:
+                target_url = _format_reply_target_link(draft)
+                if self.approvals.has_active_target(target_url):
+                    continue
+                approval = self.approvals.create(
+                    kind="reply",
+                    text=_format_reply_target_reply(draft),
+                    chat_id=self.approval_chat_id,
+                    approver_user_id=self.approval_chat_id,
+                    target_url=target_url,
+                    target_label=draft.target,
+                )
+                await self._send_approval(approval, reason=draft.reason)
+                sent += 1
+            if sent:
+                await _delete_message_safely(status)
+            else:
+                await status.edit_text(
+                    "Scheduled /replytargets finished, but every returned target already "
+                    "has an active approval card."
+                )
+        except Exception:
+            await _delete_message_safely(status)
+            raise
 
     async def _run_scheduled_tweettrend3(self, category: str) -> None:
         if self._application is None or self.approval_chat_id is None:
@@ -491,14 +521,7 @@ class ContentBot:
         status = await message.reply_text(status_text)
         try:
             contexts = await self._get_trend_contexts_for_tweettrend3(category, status)
-            await status.edit_text(
-                "Writing 3 Vietnamese posts from 3 different hot topics..."
-            )
-
-            await status.edit_text(
-                f"Language: {output_language}\n"
-                "Sending tweet options with approval buttons and images..."
-            )
+            total = len(contexts)
             approver_user_id = (
                 update.effective_user.id if update.effective_user is not None else message.chat.id
             )
@@ -506,6 +529,12 @@ class ContentBot:
                 contexts,
                 start=1,
             ):
+                await status.edit_text(
+                    f"Generating topic {index}/{total} with Gemini...\n"
+                    f"Topic: {topic}\n"
+                    f"Language: {output_language}\n\n"
+                    "If extension Auto Run is OFF, open its popup and click Run next job."
+                )
                 generated = await self.ai.generate_trend_post(
                     topic,
                     x_context,
@@ -534,9 +563,13 @@ class ContentBot:
                         f"{source} | {selected_category} | {variant.angle}"
                     ),
                 )
+                if index < total:
+                    await status.edit_text(
+                        f"Sent topic {index}/{total}. Preparing Gemini job {index + 1}/{total}..."
+                    )
             await status.edit_text(
                 f"Language: {output_language}\n"
-                "Three topic-based tweet drafts sent."
+                f"All {total} topic-based tweet drafts sent."
             )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
@@ -598,7 +631,7 @@ class ContentBot:
                 f"Source: {source}\n"
                 f"Category: {category}\n"
                 f"Topic: {topic}\n\n"
-                "Sending daily tweet options with images..."
+                "Sending daily tweet options with optional images..."
             )
             for index, variant in enumerate(variants, start=1):
                 await self._send_trend_variant(
@@ -744,6 +777,7 @@ class ContentBot:
                 creator_voice=updates.get("voice", self.settings.creator_voice),
                 target_audience=updates.get("audience", self.settings.target_audience),
             )
+            await self.trend_sources.aclose()
             self.ai = create_ai_service(self.settings)
             self.x_search = XSearchService(self.settings)
             self.trend_sources = TrendSourceService(self.settings, self.x_search)
@@ -783,6 +817,7 @@ class ContentBot:
             if saved_name == self.settings.x_account_name:
                 update_env_value("X_COOKIE", cookie)
                 self.settings = replace(self.settings, x_cookie=cookie)
+                await self.trend_sources.aclose()
                 self.x_search = XSearchService(self.settings)
                 self.trend_sources = TrendSourceService(self.settings, self.x_search)
             await status.edit_text(
@@ -820,6 +855,7 @@ class ContentBot:
             if removed_name == self.settings.x_account_name:
                 update_env_value("X_COOKIE", "")
                 self.settings = replace(self.settings, x_cookie="")
+                await self.trend_sources.aclose()
                 self.x_search = XSearchService(self.settings)
                 self.trend_sources = TrendSourceService(self.settings, self.x_search)
             await status.edit_text(
@@ -1075,117 +1111,102 @@ class ContentBot:
         )[:REPLY_TARGET_MAX_CANDIDATES]
         last_search_query = query or "auto hot topics"
 
-        for relaxed in (False, True):
-            for candidate in candidates:
-                await status.edit_text(
-                    "Finding a usable reply target...\n"
-                    f"Trying: {candidate}\n"
-                    f"Mode: {'wider fallback' if relaxed else 'fresh high-signal'}"
-                )
-                try:
-                    search_query, results = await self._search_rank_reply_targets(
-                        candidate,
-                        relaxed=relaxed,
-                        interval_minutes=interval_minutes,
-                    )
-                except Exception:
-                    continue
-                last_search_query = search_query
-                if results:
-                    note = (
-                        "Auto-selected a wider fallback topic.\n"
-                        if relaxed or (query and candidate != query)
-                        else "Auto-selected topic.\n"
-                    )
-                    return search_query, results, note
-
-        # Do not stop merely because a currently hot topic has weak engagement.
-        # Rotate through broad topics and accept the best replyable post from the
-        # last day, still skipping targets that already have an approval card.
+        searched: list[tuple[str, str, list[XSearchResult]]] = []
         for candidate in candidates:
             await status.edit_text(
                 "Finding a usable reply target...\n"
-                f"Trying broader fallback: {candidate}"
+                f"Trying: {candidate}\n"
+                f"Freshness limit: {interval_minutes} minutes"
             )
             try:
-                search_query, results = await self._search_any_reply_targets(candidate)
+                search_query, recent_results = await asyncio.wait_for(
+                    self._search_reply_target_pool(
+                        candidate,
+                        interval_minutes=interval_minutes,
+                    ),
+                    timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
+                )
             except Exception:
                 continue
             last_search_query = search_query
+            searched.append((candidate, search_query, recent_results))
+            results = self._rank_reply_target_pool(
+                recent_results,
+                interval_minutes=interval_minutes,
+                relaxed=False,
+            )
             if results:
-                return search_query, results, "Auto-selected a broad fallback topic.\n"
+                note = (
+                    "Auto-selected a different fresh topic.\n"
+                    if query and candidate != query
+                    else "Auto-selected topic.\n"
+                )
+                return search_query, results, note
+
+        # Re-rank the same fetched posts with relaxed quality thresholds instead
+        # of repeating every X request. The configured interval remains a hard
+        # freshness ceiling even when engagement metadata is sparse.
+        for candidate, search_query, recent_results in searched:
+            results = self._rank_reply_target_pool(
+                recent_results,
+                interval_minutes=interval_minutes,
+                relaxed=True,
+            )
+            if results:
+                return search_query, results, "Auto-selected a fresh fallback topic.\n"
 
         return last_search_query, [], ""
 
-    async def _search_any_reply_targets(
-        self,
-        query: str,
-    ) -> tuple[str, list[XSearchResult]]:
-        search_query, results = await self.x_search.search_recent(
-            query,
-            since_minutes=24 * 60,
-            limit=min(
-                REPLY_TARGET_RESULT_LIMIT,
-                max(self.settings.x_search_limit, 12),
-            ),
-            product="Latest",
-        )
-        replyable = [
-            result
-            for result in results
-            if result.url
-            and result.text
-            and not self.approvals.has_active_target(result.url)
-        ]
-        return (
-            search_query,
-            sorted(
-                replyable,
-                key=lambda result: (
-                    result.like_count
-                    + result.reply_count * 2
-                    + result.retweet_count * 3
-                    + result.quote_count * 3,
-                    result.created_at_timestamp or 0,
-                ),
-                reverse=True,
-            )[:5],
-        )
-
-    async def _search_rank_reply_targets(
+    async def _search_reply_target_pool(
         self,
         query: str,
         *,
-        relaxed: bool = False,
-        interval_minutes: int = 30,
+        interval_minutes: int,
     ) -> tuple[str, list[XSearchResult]]:
-        base_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
-        since_minutes = max(base_minutes * 6, 180) if relaxed else base_minutes
-        search_query, recent_results = await self.x_search.search_recent(
+        freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
+        return await self.x_search.search_recent(
             query,
-            since_minutes=since_minutes,
+            since_minutes=freshness_minutes,
             limit=min(
                 REPLY_TARGET_RESULT_LIMIT,
-                max(self.settings.x_search_limit, 12),
+                max(self.settings.x_search_limit, 8),
             ),
             product="Latest",
         )
+
+    def _rank_reply_target_pool(
+        self,
+        recent_results: list[XSearchResult],
+        *,
+        relaxed: bool = False,
+        interval_minutes: int = 30,
+    ) -> list[XSearchResult]:
+        freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
         ranked = rank_fast_growing_posts(
             recent_results,
             max_items=5,
-            max_age_minutes=since_minutes,
+            max_age_minutes=freshness_minutes,
             min_engagement_score=0 if relaxed else MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
             min_velocity_score=0 if relaxed else MIN_REPLY_TARGET_VELOCITY_SCORE,
             min_view_count=0 if relaxed else MIN_REPLY_TARGET_VIEW_COUNT,
         )
         if relaxed and not ranked:
+            cutoff = datetime.now(UTC).timestamp() - freshness_minutes * 60
             ranked = sorted(
-                (result for result in recent_results if result.url and result.text),
+                (
+                    result
+                    for result in recent_results
+                    if result.url
+                    and result.text
+                    and result.created_at_timestamp is not None
+                    and result.created_at_timestamp >= cutoff
+                ),
                 key=lambda result: (
+                    result.created_at_timestamp or 0,
                     result.like_count
                     + result.reply_count * 2
                     + result.retweet_count * 3
-                    + result.quote_count * 3
+                    + result.quote_count * 3,
                 ),
                 reverse=True,
             )[:5]
@@ -1194,22 +1215,23 @@ class ContentBot:
             for result in ranked
             if not self.approvals.has_active_target(result.url)
         ]
-        return search_query, unseen
+        return unseen
 
     async def _auto_reply_target_queries(self) -> list[str]:
-        queries: list[str] = []
-        for category in AUTO_TREND_CATEGORIES:
-            try:
-                trends = await self.x_search.trends(category, limit=4)
-            except Exception:
-                trends = []
-            queries.extend(trend.name for trend in trends if trend.name)
+        queries: list[str] = [self.settings.creator_niche]
+        try:
+            trends = await asyncio.wait_for(
+                self.x_search.trends("trending", limit=4),
+                timeout=REPLY_TARGET_TREND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            trends = []
+        queries.extend(trend.name for trend in trends if trend.name)
 
         for category in AUTO_TREND_CATEGORIES:
             queries.extend(TREND_FALLBACK_QUERIES.get(category, []))
         queries.extend(AUTO_REPLY_TARGET_FALLBACK_QUERIES)
-        queries.append(self.settings.creator_niche)
-        return _dedupe_queries(queries)[:16]
+        return _dedupe_queries(queries)[:12]
 
     async def _notify_x_account_errors(
         self,
@@ -1426,12 +1448,6 @@ def _trend_context_score(
     return len(results), len(x_context)
 
 
-def _reply_target_batch_score(results: list[XSearchResult]) -> float:
-    if not results:
-        return 0.0
-    return sum(result.velocity_score for result in results) + len(results)
-
-
 def _dedupe_queries(queries: list[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
@@ -1467,20 +1483,22 @@ def _no_reply_targets_message(
     auto: bool,
     interval_minutes: int = 30,
 ) -> str:
+    freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
     intro = (
-        "No reply-ready posts found after trying hot and broad fallback topics."
+        "No reply-ready posts found in the last "
+        f"{freshness_minutes} minutes after trying several topics."
         if auto
         else (
             "No strong reply targets found in the last "
-            f"{_reply_target_interval_minutes(interval_minutes, default=30)} minutes "
+            f"{freshness_minutes} minutes "
             f"for: {search_query}"
         )
     )
     return (
         f"{intro}\n\n"
-        "The bot already tried fresh high-signal posts, a wider window, and broad "
-        "fallback topics. Check X cookies/account limits, then try again later or use "
-        "a specific topic such as `/replytargets crypto`."
+        "The bot already changed topics and relaxed engagement thresholds without "
+        "accepting older posts. Check X cookies/account limits, then try again later "
+        "or use a specific topic such as `/replytargets crypto`."
     )
 
 

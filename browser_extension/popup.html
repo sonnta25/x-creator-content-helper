@@ -8,7 +8,7 @@
   </head>
   <body>
     <main>
-      <h1>X Content Bot Bridge v0.2.0</h1>
+      <h1>X Content Bot Bridge <span id="version"></span></h1>
 
       <label>
         Bridge URL
@@ -55,9 +55,10 @@
         </div>
 
         <label>
-          /replytargets every (minutes)
+          /replytargets interval + max post age (minutes)
           <input id="replyTargetsMinutes" type="number" min="5" step="1">
         </label>
+        <p id="replyScheduleStatus" class="hint"></p>
 
         <label>
           /replytargets query (optional)

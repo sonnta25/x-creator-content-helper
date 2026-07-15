@@ -150,3 +150,39 @@ def test_trend_source_service_collects_x_and_rss() -> None:
         "Creator Feed",
         "X Trends",
     ]
+
+
+def test_trend_source_service_reuses_and_closes_http_client() -> None:
+    class FakeResponse:
+        text = RSS_SAMPLE
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+            self.closed = False
+
+        async def get(self, url: str):
+            self.urls.append(url)
+            return FakeResponse()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    async def exercise() -> None:
+        settings = Settings(telegram_bot_token="123:ABC")
+        service = TrendSourceService(settings, XSearchService(settings))
+        client = FakeClient()
+        service._http_client = client
+
+        await service._fetch_text("https://example.com/one")
+        await service._fetch_text("https://example.com/two")
+        await service.aclose()
+
+        assert client.urls == ["https://example.com/one", "https://example.com/two"]
+        assert client.closed is True
+        assert service._http_client is None
+
+    asyncio.run(exercise())

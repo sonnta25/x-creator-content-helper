@@ -12,6 +12,8 @@ const DEFAULTS = {
   trendTimes: "09:00,18:00",
   trendCategory: "auto",
   nextReplyTargetsAt: 0,
+  lastReplyTargetsTriggeredAt: 0,
+  replyTargetsConfigUpdatedAt: 0,
   trendRunKeys: [],
   lastStatus: "Ready."
 };
@@ -135,13 +137,17 @@ async function ensureAutomationAlarm() {
 
 async function automationTick() {
   let config = await loadConfig();
-  config = await syncTelegramAutomationConfig(config);
-  if (!config.automationEnabled || !isInsideActiveWindow(new Date(), config.activeStart, config.activeEnd)) {
+  if (!config.automationEnabled) {
     return { runJobs: false };
+  }
+  config = await syncTelegramAutomationConfig(config);
+  if (!isInsideActiveWindow(new Date(), config.activeStart, config.activeEnd)) {
+    return { runJobs: Boolean(config.automationRunning) };
   }
 
   const now = new Date();
   const nowMs = now.getTime();
+  let shouldRunJobs = Boolean(config.automationRunning);
   if (!config.nextReplyTargetsAt) {
     await chromeStorageSet({
       nextReplyTargetsAt: nowMs + config.replyTargetsMinutes * 60 * 1000
@@ -157,7 +163,8 @@ async function automationTick() {
     });
     if (trigger.status === "accepted") {
       await chromeStorageSet({
-        nextReplyTargetsAt: nowMs + config.replyTargetsMinutes * 60 * 1000
+        nextReplyTargetsAt: nowMs + config.replyTargetsMinutes * 60 * 1000,
+        lastReplyTargetsTriggeredAt: nowMs
       });
       return { runJobs: true };
     }
@@ -177,22 +184,40 @@ async function automationTick() {
       if (trigger.status === "accepted") {
         runKeys.add(key);
         await chromeStorageSet({ trendRunKeys: Array.from(runKeys).slice(-14) });
+        shouldRunJobs = true;
         break;
       }
     }
   }
-  return { runJobs: true };
+  return { runJobs: shouldRunJobs };
 }
 
 async function syncTelegramAutomationConfig(config) {
   const remote = await bridgeFetch(config, "/automation/config");
   const minutes = Number(remote.reply_targets_minutes || 0);
-  if (!Number.isFinite(minutes) || minutes < 5 || minutes === config.replyTargetsMinutes) {
-    return config;
+  const updatedAt = Number(remote.reply_targets_updated_at || 0);
+  const automationRunning = Boolean(remote.automation_running);
+  if (!Number.isFinite(minutes) || minutes < 5) {
+    return { ...config, automationRunning };
+  }
+  const intervalChanged = minutes !== config.replyTargetsMinutes;
+  const revisionChanged = updatedAt > 0 && updatedAt !== config.replyTargetsConfigUpdatedAt;
+  if (!intervalChanged && !revisionChanged) {
+    return { ...config, automationRunning };
   }
   const nextReplyTargetsAt = Date.now() + minutes * 60 * 1000;
-  await chromeStorageSet({ replyTargetsMinutes: minutes, nextReplyTargetsAt });
-  return { ...config, replyTargetsMinutes: minutes, nextReplyTargetsAt };
+  await chromeStorageSet({
+    replyTargetsMinutes: minutes,
+    replyTargetsConfigUpdatedAt: updatedAt,
+    nextReplyTargetsAt
+  });
+  return {
+    ...config,
+    replyTargetsMinutes: minutes,
+    replyTargetsConfigUpdatedAt: updatedAt,
+    nextReplyTargetsAt,
+    automationRunning
+  };
 }
 
 function isInsideActiveWindow(date, start, end) {
@@ -315,11 +340,11 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
       : `Gemini tab remains open (${lifecycle.count}/${PROVIDER_RECYCLE_AFTER_JOBS} jobs before recycle).`;
     await setStatus(`Done. ${lifecycleText}\n\n${finalOutput.slice(0, 600)}`);
   } catch (error) {
-    if (providerStarted && !providerCompleted) {
-      await recycleProviderAfterFailure();
-    }
     if (reportError) {
       await reportJobError(config, job.id, error);
+    }
+    if (providerStarted && !providerCompleted) {
+      await recycleProviderAfterFailure();
     }
     throw error;
   }
@@ -351,10 +376,10 @@ async function runImageJob(config, job) {
         : `Image returned to bot. Gemini tab remains open (${lifecycle.count}/${PROVIDER_RECYCLE_AFTER_JOBS} jobs before recycle).`
     );
   } catch (error) {
+    await reportJobError(config, job.id, error);
     if (providerStarted && !providerCompleted) {
       await recycleProviderAfterFailure();
     }
-    await reportJobError(config, job.id, error);
     throw error;
   }
 }
@@ -578,17 +603,28 @@ async function prepareProviderTab(url) {
   await chromeTabsUpdate(tab.id, { active: true });
   await waitForTabComplete(tab.id);
 
+  try {
+    await waitForProviderReady(tab.id);
+  } catch (_error) {
+    await chromeTabsUpdate(tab.id, { url, active: true });
+    await waitForTabComplete(tab.id);
+    await waitForProviderReady(tab.id);
+  }
+
   const [resetResult] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: injectedStartFreshChat
   });
   if (resetResult && resetResult.result) {
-    await delay(800);
+    await delay(1000);
+    await waitForTabComplete(tab.id);
+    await waitForProviderReady(tab.id);
     return await chromeTabsGet(tab.id);
   }
 
   await chromeTabsUpdate(tab.id, { url, active: true });
   await waitForTabComplete(tab.id);
+  await waitForProviderReady(tab.id);
   return await chromeTabsGet(tab.id);
 }
 
@@ -623,23 +659,24 @@ async function recycleProviderTab() {
       await chromeTabsRemove(duplicates.map((tab) => tab.id));
     }
 
-    // Cross-origin blank navigation destroys the old Gemini document and its JS
-    // heap without closing the only Chrome window on a small VPS.
-    await chromeTabsUpdate(primary.id, { url: "about:blank", active: true });
-    await waitForTabComplete(primary.id);
-    await delay(300);
+    // Navigating directly to /app replaces the conversation document and frees
+    // its DOM without leaving the only Chrome tab stranded on about:blank if
+    // the extension worker or a small VPS is interrupted between navigations.
     await chromeTabsUpdate(primary.id, { url: FINAL_PROVIDER_URL, active: true });
     await waitForTabComplete(primary.id);
+    await waitForProviderReady(primary.id);
     return true;
   } catch (_error) {
     try {
       if (primaryId !== null) {
         await chromeTabsUpdate(primaryId, { url: FINAL_PROVIDER_URL, active: true });
         await waitForTabComplete(primaryId);
+        await waitForProviderReady(primaryId);
         return true;
       }
       const replacement = await chromeTabsCreate({ url: FINAL_PROVIDER_URL, active: true });
       await waitForTabComplete(replacement.id);
+      await waitForProviderReady(replacement.id);
       return true;
     } catch (_recoveryError) {
       return false;
@@ -673,6 +710,59 @@ function injectedStartFreshChat() {
   if (!button) return false;
   button.click();
   return true;
+}
+
+async function waitForProviderReady(tabId, timeoutMs = 30000) {
+  const started = Date.now();
+  let lastUrl = "";
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: injectedProviderReady
+      });
+      const state = result ? result.result : null;
+      if (state && state.ready) {
+        return state;
+      }
+      if (state && state.url) {
+        lastUrl = state.url;
+      }
+    } catch (_error) {
+      // Navigation can briefly invalidate the execution context. Retry until
+      // the provider document and its composer are both available.
+    }
+    await delay(500);
+  }
+  throw new Error(
+    `Gemini page loaded but its chat input was not ready within ${Math.round(timeoutMs / 1000)} seconds.` +
+    (lastUrl ? ` Last URL: ${lastUrl}` : "")
+  );
+}
+
+function injectedProviderReady() {
+  const isVisible = (element) => {
+    if (!element) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+  };
+  const selectors = [
+    "#prompt-textarea",
+    ".ProseMirror",
+    "[contenteditable='true']",
+    "div[role='textbox']",
+    "p[data-placeholder]",
+    "textarea"
+  ];
+  const input = selectors
+    .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+    .find(isVisible);
+  return {
+    ready: Boolean(input),
+    url: location.href,
+    title: document.title
+  };
 }
 
 async function waitForTabComplete(tabId) {
@@ -734,20 +824,6 @@ async function bridgeFetch(config, path, options = {}) {
 
 async function injectedSubmitPrompt(prompt) {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const splitInputChunks = (value, maxLength = 1200) => {
-    const text = String(value || "");
-    const chunks = [];
-    for (let start = 0; start < text.length;) {
-      let end = Math.min(text.length, start + maxLength);
-      if (end < text.length) {
-        const boundary = Math.max(text.lastIndexOf("\n", end), text.lastIndexOf(" ", end));
-        if (boundary > start + Math.floor(maxLength / 2)) end = boundary + 1;
-      }
-      chunks.push(text.slice(start, end));
-      start = end;
-    }
-    return chunks.length ? chunks : [""];
-  };
   const compactText = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const asciiLower = (value) => String(value || "")
     .normalize("NFD")
@@ -806,18 +882,19 @@ async function injectedSubmitPrompt(prompt) {
     return candidates.length ? candidates[candidates.length - 1] : "";
   };
 
-  const setInput = async (el, value) => {
+  const inputValue = (el) => compactText(el && (el.innerText || el.textContent || el.value || ""));
+
+  const clearInput = (el) => {
     el.focus();
     el.click();
-    const chunks = splitInputChunks(value);
     if ("value" in el) {
-      el.value = "";
-      for (const chunk of chunks) {
-        el.value += chunk;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        await sleep(25);
-      }
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+      const prototype = el instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+      if (setter) setter.call(el, "");
+      else el.value = "";
+      el.dispatchEvent(new Event("input", { bubbles: true }));
       return;
     }
     const selection = window.getSelection();
@@ -826,13 +903,62 @@ async function injectedSubmitPrompt(prompt) {
     selection.removeAllRanges();
     selection.addRange(range);
     document.execCommand("delete", false, null);
-    for (const chunk of chunks) {
-      const inserted = document.execCommand("insertText", false, chunk);
-      if (!inserted) el.textContent = `${el.textContent || ""}${chunk}`;
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: chunk }));
-      await sleep(25);
+  };
+
+  const insertOnce = (el, value, method) => {
+    if ("value" in el) {
+      const prototype = el instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+      if (setter) setter.call(el, value);
+      else el.value = value;
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: value
+      }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return "native-value";
     }
+
+    if (method === "exec-command") {
+      const inserted = document.execCommand("insertText", false, value);
+      if (inserted) {
+        return method;
+      }
+    }
+
+    // ProseMirror can replace its contenteditable node after an input event.
+    // Replacing the whole value in one DOM operation avoids losing chunks to a
+    // stale node, while the single input event updates Gemini's editor state.
+    el.replaceChildren(document.createTextNode(value));
+    el.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: value
+    }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
+    return "dom-replace";
+  };
+
+  const setInput = async (initialInput, value) => {
+    const expectedLength = compactText(value).length;
+    let input = initialInput;
+    let method = "exec-command";
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      input = findInput() || input;
+      clearInput(input);
+      await sleep(100);
+      method = insertOnce(input, value, attempt === 0 ? "exec-command" : "dom-replace");
+      await sleep(900);
+      input = findInput() || input;
+      const text = inputValue(input);
+      if (text.length >= Math.max(20, Math.floor(expectedLength * 0.98))) {
+        return { input, text, method, attempt: attempt + 1 };
+      }
+    }
+    return { input, text: inputValue(input), method, attempt: 2 };
   };
 
   const clickButton = (button) => {
@@ -895,20 +1021,20 @@ async function injectedSubmitPrompt(prompt) {
   };
 
   const before = visibleAssistantText();
-  const input = findInput();
+  let input = findInput();
   if (!input) {
     return { ok: false, error: "Could not find Gemini input.", debug: `url=${location.href}` };
   }
 
   const expectedText = compactText(prompt);
-  await setInput(input, prompt);
-  await sleep(750);
-  let inputText = compactText(input.innerText || input.textContent || input.value || "");
-  if (expectedText.length > 0 && inputText.length < Math.max(20, Math.floor(expectedText.length * 0.8))) {
+  const insertion = await setInput(input, prompt);
+  input = insertion.input;
+  let inputText = insertion.text;
+  if (expectedText.length > 0 && inputText.length < Math.max(20, Math.floor(expectedText.length * 0.98))) {
     return {
       ok: false,
       error: "Prompt was not fully inserted into the provider input.",
-      debug: `input=${describe(input)}; inputChars=${inputText.length}; expectedChars=${expectedText.length}; inputSample=${inputText.slice(0, 120)}`
+      debug: `input=${describe(input)}; method=${insertion.method}; attempts=${insertion.attempt}; inputChars=${inputText.length}; expectedChars=${expectedText.length}; inputSample=${inputText.slice(0, 120)}`
     };
   }
   let button = null;
@@ -932,7 +1058,7 @@ async function injectedSubmitPrompt(prompt) {
   return {
     ok: true,
     before,
-    debug: `input=${describe(input)}; inputChars=${inputText.length}; send=${submitMethod}`
+    debug: `input=${describe(input)}; insert=${insertion.method}; attempts=${insertion.attempt}; inputChars=${inputText.length}; send=${submitMethod}`
   };
 }
 
@@ -1799,6 +1925,8 @@ async function loadConfig() {
     trendTimes: String(saved.trendTimes || DEFAULTS.trendTimes),
     trendCategory: String(saved.trendCategory || DEFAULTS.trendCategory),
     nextReplyTargetsAt: Number(saved.nextReplyTargetsAt || 0),
+    lastReplyTargetsTriggeredAt: Number(saved.lastReplyTargetsTriggeredAt || 0),
+    replyTargetsConfigUpdatedAt: Number(saved.replyTargetsConfigUpdatedAt || 0),
     trendRunKeys: Array.isArray(saved.trendRunKeys) ? saved.trendRunKeys : [],
     lastStatus: String(session.lastStatus || saved.lastStatus || DEFAULTS.lastStatus)
   };
@@ -1819,6 +1947,8 @@ async function saveConfig(config) {
     trendTimes: String(config.trendTimes || DEFAULTS.trendTimes),
     trendCategory: String(config.trendCategory || DEFAULTS.trendCategory),
     nextReplyTargetsAt: Number(config.nextReplyTargetsAt || 0),
+    lastReplyTargetsTriggeredAt: Number(config.lastReplyTargetsTriggeredAt || 0),
+    replyTargetsConfigUpdatedAt: Number(config.replyTargetsConfigUpdatedAt || 0),
     trendRunKeys: Array.isArray(config.trendRunKeys) ? config.trendRunKeys : []
   });
 }

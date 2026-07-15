@@ -11,10 +11,14 @@ const DEFAULTS = {
   replyTargetsQuery: "",
   trendTimes: "09:00,18:00",
   trendCategory: "auto",
+  nextReplyTargetsAt: 0,
+  lastReplyTargetsTriggeredAt: 0,
+  replyTargetsConfigUpdatedAt: 0,
   lastStatus: "Ready."
 };
 
 const els = {
+  version: document.getElementById("version"),
   bridgeUrl: document.getElementById("bridgeUrl"),
   token: document.getElementById("token"),
   timeoutSeconds: document.getElementById("timeoutSeconds"),
@@ -25,6 +29,7 @@ const els = {
   activeEnd: document.getElementById("activeEnd"),
   replyTargetsMinutes: document.getElementById("replyTargetsMinutes"),
   replyTargetsQuery: document.getElementById("replyTargetsQuery"),
+  replyScheduleStatus: document.getElementById("replyScheduleStatus"),
   trendTimes: document.getElementById("trendTimes"),
   trendCategory: document.getElementById("trendCategory"),
   save: document.getElementById("save"),
@@ -36,6 +41,7 @@ const els = {
 let currentConfig = { ...DEFAULTS };
 
 document.addEventListener("DOMContentLoaded", async () => {
+  els.version.textContent = `v${chrome.runtime.getManifest().version}`;
   await refreshState();
 });
 
@@ -98,6 +104,15 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (changes.lastStatus) {
     setStatus(changes.lastStatus.newValue || "");
   }
+  if (areaName === "local" && (changes.nextReplyTargetsAt || changes.lastReplyTargetsTriggeredAt)) {
+    if (changes.nextReplyTargetsAt) {
+      currentConfig.nextReplyTargetsAt = Number(changes.nextReplyTargetsAt.newValue || 0);
+    }
+    if (changes.lastReplyTargetsTriggeredAt) {
+      currentConfig.lastReplyTargetsTriggeredAt = Number(changes.lastReplyTargetsTriggeredAt.newValue || 0);
+    }
+    renderReplyScheduleStatus(currentConfig);
+  }
 });
 
 async function refreshState() {
@@ -143,6 +158,16 @@ function renderConfig(config) {
   els.automationEnabled.textContent = config.automationEnabled ? "ON" : "OFF";
   els.automationEnabled.classList.toggle("is-on", config.automationEnabled);
   els.automationEnabled.setAttribute("aria-pressed", config.automationEnabled ? "true" : "false");
+  renderReplyScheduleStatus(config);
+}
+
+function renderReplyScheduleStatus(config) {
+  const format = (timestamp) => timestamp
+    ? new Date(timestamp).toLocaleString()
+    : "not yet";
+  els.replyScheduleStatus.textContent = config.automationEnabled
+    ? `Last trigger: ${format(config.lastReplyTargetsTriggeredAt)} · Next run: ${format(config.nextReplyTargetsAt)}`
+    : "Automation is OFF; /replytargets will not run on a schedule.";
 }
 
 function readConfigFromForm() {
@@ -160,6 +185,8 @@ function readConfigFromForm() {
     trendTimes: els.trendTimes.value.trim() || DEFAULTS.trendTimes,
     trendCategory: els.trendCategory.value || DEFAULTS.trendCategory,
     nextReplyTargetsAt: Number(currentConfig.nextReplyTargetsAt || 0),
+    lastReplyTargetsTriggeredAt: Number(currentConfig.lastReplyTargetsTriggeredAt || 0),
+    replyTargetsConfigUpdatedAt: Number(currentConfig.replyTargetsConfigUpdatedAt || 0),
     trendRunKeys: Array.isArray(currentConfig.trendRunKeys) ? currentConfig.trendRunKeys : []
   };
 }

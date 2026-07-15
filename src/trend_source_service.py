@@ -34,6 +34,13 @@ class TrendSourceService:
     def __init__(self, settings: Settings, x_search: XSearchService) -> None:
         self.settings = settings
         self.x_search = x_search
+        self._http_client: httpx.AsyncClient | None = None
+
+    async def aclose(self) -> None:
+        if self._http_client is None:
+            return
+        await self._http_client.aclose()
+        self._http_client = None
 
     async def collect(
         self,
@@ -148,13 +155,16 @@ class TrendSourceService:
         ]
 
     async def _fetch_text(self, url: str) -> str:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            response = await client.get(
-                url,
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                timeout=15,
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
                 headers={"User-Agent": "x-telegram-content-bot/0.1"},
             )
-            response.raise_for_status()
-            return response.text
+        response = await self._http_client.get(url)
+        response.raise_for_status()
+        return response.text
 
 
 def normalize_trend_category(category: str) -> str:
@@ -188,7 +198,8 @@ def niche_search_query(niche: str) -> str:
         return " ".join(niche.split())
     if len(lanes) == 1:
         return f'"{lanes[0]}" when:2d'
-    return f"({' OR '.join(f'\"{lane}\"' for lane in lanes)}) when:2d"
+    quoted_lanes = " OR ".join(f'"{lane}"' for lane in lanes)
+    return f"({quoted_lanes}) when:2d"
 
 
 def parse_rss_trend_signals(

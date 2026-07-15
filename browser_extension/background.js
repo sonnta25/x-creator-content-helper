@@ -54,7 +54,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === AUTO_ALARM) {
-    runJobs({ force: false, maxJobs: 3 });
+    runJobs({ force: false, maxJobs: 1 });
   }
   if (alarm.name === AUTOMATION_ALARM) {
     automationTick()
@@ -109,7 +109,7 @@ async function ensureAutoAlarm() {
   chrome.alarms.create(AUTO_ALARM, {
     periodInMinutes: Math.max(0.5, config.pollSeconds / 60)
   });
-  runJobs({ force: false, maxJobs: 3 });
+  runJobs({ force: false, maxJobs: 1 });
 }
 
 async function ensureAutomationAlarm() {
@@ -323,9 +323,8 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
       throw new Error(`Missing ${FINAL_PROVIDER_NAME} prompt for job ${job.id}.`);
     }
     await setStatus(
-      `Job ${job.id}\nOpening clean ${FINAL_PROVIDER_NAME} tab...`
+      `Job ${job.id}\nUsing existing ${FINAL_PROVIDER_NAME} tab...`
     );
-    await closeProviderTabs(FINAL_PROVIDER_ORIGIN);
     const finalOutput = await runProviderPrompt(
       FINAL_PROVIDER_URL,
       finalPrompt,
@@ -337,8 +336,7 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
       method: "POST",
       body: { output: finalOutput }
     });
-    await closeProviderTabs(FINAL_PROVIDER_ORIGIN);
-    await setStatus(`Done.\n\n${finalOutput.slice(0, 600)}`);
+    await setStatus(`Done. Gemini tab remains open for the next job.\n\n${finalOutput.slice(0, 600)}`);
   } catch (error) {
     if (reportError) {
       await reportJobError(config, job.id, error);
@@ -348,10 +346,8 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
 }
 
 async function runImageJob(config, job) {
-  await setStatus(`Image job ${job.id}\nClosing old ${FINAL_PROVIDER_NAME} tabs...`);
   try {
-    await closeProviderTabs(FINAL_PROVIDER_ORIGIN);
-    await setStatus(`Image job ${job.id}\nOpening clean ${FINAL_PROVIDER_NAME} tab...`);
+    await setStatus(`Image job ${job.id}\nUsing existing ${FINAL_PROVIDER_NAME} tab...`);
     const dataUrl = await runProviderImage(
       FINAL_PROVIDER_URL,
       job.final_prompt || job.grok_prompt,
@@ -364,8 +360,7 @@ async function runImageJob(config, job) {
       method: "POST",
       body: { image_data_url: dataUrl }
     });
-    await closeProviderTabs(FINAL_PROVIDER_ORIGIN);
-    await setStatus("Image returned to bot.");
+    await setStatus("Image returned to bot. Gemini tab remains open for the next job.");
   } catch (error) {
     await reportJobError(config, job.id, error);
     throw error;
@@ -491,7 +486,7 @@ async function diagnoseProviderDom(url) {
 }
 
 async function runProviderImage(url, prompt, timeoutSeconds) {
-  const tab = await getFreshTab(url);
+  const tab = await getOrCreateTab(url);
   await chromeTabsUpdate(tab.id, { active: true });
   await waitForTabComplete(tab.id);
   const [result] = await chrome.scripting.executeScript({
@@ -588,20 +583,6 @@ async function getOrCreateTab(url) {
   return await chromeTabsCreate({ url, active: true });
 }
 
-async function getFreshTab(url) {
-  return await chromeTabsCreate({ url, active: true });
-}
-
-async function closeProviderTabs(url) {
-  const origin = new URL(url).origin;
-  const tabs = await chromeTabsQuery({ url: `${origin}/*` });
-  for (const tab of tabs) {
-    if (tab.id) {
-      await chromeTabsRemove(tab.id);
-    }
-  }
-}
-
 async function waitForTabComplete(tabId) {
   const tab = await chromeTabsGet(tabId);
   if (tab.status === "complete") {
@@ -645,6 +626,20 @@ async function bridgeFetch(config, path, options = {}) {
 
 async function injectedSubmitPrompt(prompt) {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const splitInputChunks = (value, maxLength = 1200) => {
+    const text = String(value || "");
+    const chunks = [];
+    for (let start = 0; start < text.length;) {
+      let end = Math.min(text.length, start + maxLength);
+      if (end < text.length) {
+        const boundary = Math.max(text.lastIndexOf("\n", end), text.lastIndexOf(" ", end));
+        if (boundary > start + Math.floor(maxLength / 2)) end = boundary + 1;
+      }
+      chunks.push(text.slice(start, end));
+      start = end;
+    }
+    return chunks.length ? chunks : [""];
+  };
   const compactText = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const asciiLower = (value) => String(value || "")
     .normalize("NFD")
@@ -703,33 +698,32 @@ async function injectedSubmitPrompt(prompt) {
     return candidates.length ? candidates[candidates.length - 1] : "";
   };
 
-  const setInput = (el, value) => {
+  const setInput = async (el, value) => {
     el.focus();
     el.click();
+    const chunks = splitInputChunks(value);
+    if ("value" in el) {
+      el.value = "";
+      for (const chunk of chunks) {
+        el.value += chunk;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        await sleep(25);
+      }
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
     const selection = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(el);
     selection.removeAllRanges();
     selection.addRange(range);
     document.execCommand("delete", false, null);
-    let inserted = document.execCommand("insertText", false, value);
-    if (!inserted && typeof DataTransfer !== "undefined" && typeof ClipboardEvent !== "undefined") {
-      const data = new DataTransfer();
-      data.setData("text/plain", value);
-      inserted = el.dispatchEvent(new ClipboardEvent("paste", {
-        bubbles: true,
-        cancelable: true,
-        clipboardData: data
-      }));
+    for (const chunk of chunks) {
+      const inserted = document.execCommand("insertText", false, chunk);
+      if (!inserted) el.textContent = `${el.textContent || ""}${chunk}`;
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: chunk }));
+      await sleep(25);
     }
-    if (!compactText(el.innerText || el.textContent || el.value || "")) {
-      if ("value" in el) {
-        el.value = value;
-      } else {
-        el.textContent = value;
-      }
-    }
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
   };
 
@@ -799,7 +793,7 @@ async function injectedSubmitPrompt(prompt) {
   }
 
   const expectedText = compactText(prompt);
-  setInput(input, prompt);
+  await setInput(input, prompt);
   await sleep(750);
   let inputText = compactText(input.innerText || input.textContent || input.value || "");
   if (expectedText.length > 0 && inputText.length < Math.max(20, Math.floor(expectedText.length * 0.8))) {
@@ -1039,6 +1033,20 @@ function injectedReadProviderResponse(prompt, before) {
 
 function injectedSubmitAndRead(prompt, timeoutMs) {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const splitInputChunks = (value, maxLength = 1200) => {
+    const text = String(value || "");
+    const chunks = [];
+    for (let start = 0; start < text.length;) {
+      let end = Math.min(text.length, start + maxLength);
+      if (end < text.length) {
+        const boundary = Math.max(text.lastIndexOf("\n", end), text.lastIndexOf(" ", end));
+        if (boundary > start + Math.floor(maxLength / 2)) end = boundary + 1;
+      }
+      chunks.push(text.slice(start, end));
+      start = end;
+    }
+    return chunks.length ? chunks : [""];
+  };
   const normalizeText = (value) => String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
   const asciiLower = (value) => String(value || "")
     .normalize("NFD")
@@ -1078,11 +1086,16 @@ function injectedSubmitAndRead(prompt, timeoutMs) {
     return null;
   };
 
-  const setInput = (el, value) => {
+  const setInput = async (el, value) => {
     el.focus();
     if ("value" in el) {
-      el.value = value;
-      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.value = "";
+      for (const chunk of splitInputChunks(value)) {
+        el.value += chunk;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        await sleep(25);
+      }
+      el.dispatchEvent(new Event("change", { bubbles: true }));
       return;
     }
     const selection = window.getSelection();
@@ -1091,11 +1104,14 @@ function injectedSubmitAndRead(prompt, timeoutMs) {
     selection.removeAllRanges();
     selection.addRange(range);
     document.execCommand("delete", false, null);
-    if (!document.execCommand("insertText", false, value)) {
-      el.textContent = value;
+    for (const chunk of splitInputChunks(value)) {
+      if (!document.execCommand("insertText", false, chunk)) {
+        el.textContent = `${el.textContent || ""}${chunk}`;
+      }
+      el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: chunk }));
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: chunk }));
+      await sleep(25);
     }
-    el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: value }));
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
   };
 
@@ -1273,7 +1289,7 @@ function injectedSubmitAndRead(prompt, timeoutMs) {
     }
 
     const before = responseText();
-    setInput(input, prompt);
+    await setInput(input, prompt);
     await sleep(1000);
     let submitted = false;
     for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -1421,6 +1437,20 @@ function injectedDiagnoseDom() {
 
 function injectedSubmitAndFindImage(prompt, timeoutMs) {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const splitInputChunks = (value, maxLength = 1200) => {
+    const text = String(value || "");
+    const chunks = [];
+    for (let start = 0; start < text.length;) {
+      let end = Math.min(text.length, start + maxLength);
+      if (end < text.length) {
+        const boundary = Math.max(text.lastIndexOf("\n", end), text.lastIndexOf(" ", end));
+        if (boundary > start + Math.floor(maxLength / 2)) end = boundary + 1;
+      }
+      chunks.push(text.slice(start, end));
+      start = end;
+    }
+    return chunks.length ? chunks : [""];
+  };
 
   const isVisible = (el) => {
     if (!el) return false;
@@ -1445,16 +1475,25 @@ function injectedSubmitAndFindImage(prompt, timeoutMs) {
     return null;
   };
 
-  const setInput = (el, value) => {
+  const setInput = async (el, value) => {
     el.focus();
     if ("value" in el) {
-      el.value = value;
-      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.value = "";
+      for (const chunk of splitInputChunks(value)) {
+        el.value += chunk;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        await sleep(25);
+      }
       return;
     }
     document.execCommand("selectAll", false, null);
-    document.execCommand("insertText", false, value);
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    for (const chunk of splitInputChunks(value)) {
+      if (!document.execCommand("insertText", false, chunk)) {
+        el.textContent = `${el.textContent || ""}${chunk}`;
+      }
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: chunk }));
+      await sleep(25);
+    }
   };
 
   const clickSend = () => {
@@ -1559,7 +1598,7 @@ function injectedSubmitAndFindImage(prompt, timeoutMs) {
     if (!input) throw new Error("Could not find the Gemini chat input. Are you logged in?");
 
     const before = new Set(imageSrcs().map(imageKey));
-    setInput(input, prompt);
+    await setInput(input, prompt);
     await sleep(500);
     if (!clickSend()) pressEnter(input);
 

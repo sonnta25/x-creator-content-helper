@@ -8,7 +8,7 @@ The current AI flow is:
 Telegram bot -> local extension bridge -> Gemini draft -> Gemini final -> Telegram bot
 ```
 
-Gemini creates a first-pass draft using the existing analysis prompt, then Gemini humanizes/finalizes the output in a clean tab. Gemini also generates images through the Chrome extension. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
+Gemini creates and finalizes drafts, then generates images through the Chrome extension. The extension reuses one logged-in Gemini tab for every job to avoid repeated cold starts. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
 
 ## Commands
 
@@ -116,6 +116,8 @@ Use this when you have Gemini web access but no API keys.
 
 When Auto Run is OFF, click **Run next job** after sending a Telegram command. When Auto Run is ON, Chrome checks for pending jobs about every 30 seconds while Chrome is open.
 
+Long Gemini prompts are entered into the same composer in small 1,200-character chunks with a short pause between chunks, then submitted once. This reduces peak Chrome disk/CPU activity without changing the prompt or splitting it into separate Gemini messages.
+
 ### 2 GB RAM VPS mode
 
 For a 2-core / 2 GB Windows VPS, run Chrome with the included low-memory profile instead of your normal Chrome profile:
@@ -124,7 +126,7 @@ For a 2-core / 2 GB Windows VPS, run Chrome with the included low-memory profile
 .\scripts\windows\start-chrome-lite.ps1
 ```
 
-It uses a separate profile, loads only this extension, disables GPU/background services, limits Chrome to two renderer processes, caps disk cache at 100 MB, and closes the Gemini tab after each successful job. On a 2-core VPS it also pins Chrome to one logical CPU at BelowNormal priority, so Chrome cannot saturate both cores. It starts a background watchdog that checks every 30 seconds, reapplies the CPU limit to Chrome child processes, and relaunches this Chrome profile if Windows kills it. Gemini jobs will be slower, but the bot and Windows remain responsive. Sign in to Gemini once in that profile. Do not use headless mode: this bridge needs the visible Gemini web UI. Stop only this Chrome instance and its watchdog with:
+It uses a separate profile, loads only this extension, disables GPU/background services and nonessential background telemetry, limits Chrome to one renderer process, and caps disk cache at 16 MB (media cache 1 MB). Gemini stays open after every job, including image generation, so the next job can reuse the logged-in, warm tab instead of triggering another cold start. On a 2-core VPS it also pins Chrome to one logical CPU at BelowNormal priority, so Chrome cannot saturate both cores. It starts a background watchdog that checks every 30 seconds, reapplies the CPU limit to Chrome child processes, and relaunches this Chrome profile if Windows kills it. Gemini jobs will be slower, but the bot and Windows remain responsive. Sign in to Gemini once in that profile. Do not use headless mode: this bridge needs the visible Gemini web UI. Stop only this Chrome instance and its watchdog with:
 
 ```powershell
 .\scripts\windows\stop-chrome-lite.ps1
@@ -172,7 +174,7 @@ Once a reply target is pending or approved, the bot skips the same target to avo
 
 Review or edit the filled draft in X, then submit it yourself. A pending approval expires after 30 minutes. `Auto Run` still controls whether Gemini jobs from manually entered Telegram commands run automatically; when it is OFF, use **Run next job** before approving the returned draft.
 
-The first scheduled run may wait for the configured interval. Scheduled automation processes one Gemini job at a time and waits for the next 30-second check before starting another, which keeps CPU use steadier on small VPS plans. Fixed `/tweettrend3` times are considered due for ten minutes, which allows for Chrome alarm delays or a briefly sleeping computer. Missed runs are not replayed in bulk.
+The first scheduled run may wait for the configured interval. Scheduled automation processes one Gemini job per 30-second check, which keeps CPU use steadier on small VPS plans. Fixed `/tweettrend3` times are considered due for ten minutes, which allows for Chrome alarm delays or a briefly sleeping computer. Missed runs are not replayed in bulk.
 
 If Gemini asks for human verification, solve it manually in Chrome and run the job again. This bridge depends on the web UI, so reload the extension after changing files in `browser_extension/`.
 

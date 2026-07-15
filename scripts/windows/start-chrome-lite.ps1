@@ -76,9 +76,21 @@ $arguments = @(
     "--disable-sync",
     "--disable-breakpad",
     "--mute-audio",
-    "--renderer-process-limit=2",
+    # A Gemini page is the only renderer this profile needs. Keeping a single
+    # renderer prevents the initial Gemini load from briefly competing for both
+    # CPU and disk with a second renderer on a 2-core VPS.
+    "--renderer-process-limit=1",
     "--process-per-site",
-    "--disk-cache-size=104857600",
+    # Do not let a short-lived Gemini session build a large on-disk cache.
+    "--disk-cache-size=16777216",
+    "--media-cache-size=1048576",
+    "--disable-client-side-phishing-detection",
+    "--disable-domain-reliability",
+    "--disable-default-apps",
+    "--disable-logging",
+    "--log-level=3",
+    "--no-pings",
+    "--disable-features=OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,PreloadMediaEngagementData,AutofillServerCommunication",
     "https://gemini.google.com/app"
 )
 

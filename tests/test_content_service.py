@@ -111,6 +111,18 @@ def test_tweet_engine_prompt_is_shared_for_tweet_family() -> None:
     assert "Editorial Visual Strategist rules for image_prompt" in prompt
 
 
+def test_tweet_engine_prompt_stays_compact_for_browser_bridge() -> None:
+    prompt = _tweet_engine_prompt(
+        Settings(telegram_bot_token="123:ABC"),
+        topic="AI tools for creator growth",
+        brief="Create one English X tweet.",
+        context="Recent X context:\n" + ("A short grounded trend signal. " * 100),
+        output_contract=_single_tweet_output_contract(),
+    )
+
+    assert len(prompt) < 7500
+
+
 def test_tweet_engine_prompt_can_request_vietnamese_output() -> None:
     prompt = _tweet_engine_prompt(
         Settings(telegram_bot_token="123:ABC"),
@@ -177,6 +189,72 @@ def test_single_trend_post_is_grounded_in_one_topic() -> None:
 
     assert generated.topic == "Detroit Pistons"
     assert "about this specific trend" in service.last_prompt
+
+
+def test_single_trend_post_recovers_when_gemini_omits_image_prompt() -> None:
+    class CaptureTrendService(ContentService):
+        async def _generate_text(self, _prompt: str) -> str:
+            return '{"post":"AI tool launches are getting cheaper.","title":"AI tools"}'
+
+    generated = asyncio.run(
+        CaptureTrendService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
+            "AI tools",
+            "Recent launch discussion.",
+            "Vietnamese",
+        )
+    )
+
+    assert generated.text == "AI tool launches are getting cheaper"
+    assert generated.topic == "AI tools"
+    assert "AI tools" in generated.image_prompt
+
+
+def test_single_trend_post_accepts_reported_gemini_json() -> None:
+    class ReportedGeminiService(ContentService):
+        async def _generate_text(self, _prompt: str) -> str:
+            return r'''
+            {
+              "text": "Đọc danh sách mấy token presale kiểu như memecoin AI hay đống dự án crypto mới định hình ra mắt tháng này thấy cứ lặp đi lặp lại.",
+              "image_prompt": "An authentic smartphone photo inside a cramped co-working space, showing a messy desk with a laptop displaying a crypto token dashboard, natural afternoon light, documentary style, no text, no logos.",
+              "topic": "Best Crypto Presales to Buy Now"
+            }
+            '''
+
+    generated = asyncio.run(
+        ReportedGeminiService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
+            "Best Crypto Presales to Buy Now",
+            "Recent crypto launch context.",
+            "Vietnamese",
+        )
+    )
+
+    assert generated.text.startswith("Đọc danh sách mấy token presale")
+    assert generated.topic == "Best Crypto Presales to Buy Now"
+
+
+def test_single_trend_post_unwraps_provider_response_object() -> None:
+    class WrappedGeminiService(ContentService):
+        async def _generate_text(self, _prompt: str) -> str:
+            return '''
+            {
+              "response": {
+                "text": "Một góc nhìn ngắn về thị trường crypto.",
+                "image_prompt": "A candid photo of a crypto trader at a messy desk.",
+                "topic": "Crypto market"
+              }
+            }
+            '''
+
+    generated = asyncio.run(
+        WrappedGeminiService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
+            "Crypto market",
+            "Recent crypto context.",
+            "Vietnamese",
+        )
+    )
+
+    assert generated.text == "Một góc nhìn ngắn về thị trường crypto"
+    assert generated.topic == "Crypto market"
 
 
 def test_editorial_visual_strategist_prompt_targets_real_photos() -> None:

@@ -104,6 +104,15 @@ class AutomationApprovalStore:
             raise RuntimeError("This approval belongs to a different Telegram chat.")
         if approval.approver_user_id != int(user_id):
             raise RuntimeError("Only the user who requested this draft can approve it.")
+        # A Telegram message edit can fail after the mobile decision was saved
+        # (for example, because a pre-filled X URL is too long). Let the same
+        # authorized user press the original mobile button again to recover it.
+        if (
+            approval.status == "mobile_approved"
+            and approve
+            and destination == "mobile"
+        ):
+            return approval
         if approval.status != "pending":
             raise RuntimeError(f"Approval is already {approval.status}.")
         if approve:

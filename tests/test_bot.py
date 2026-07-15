@@ -16,7 +16,9 @@ from src.bot import (
     _no_reply_targets_message,
     _approval_message_text,
     _approval_keyboard,
+    _mobile_approval_note,
     _mobile_x_intent_url,
+    _mobile_x_open_url,
     _parse_importcookie_args,
     _parse_persona_args,
     _parse_retweet_args,
@@ -173,6 +175,19 @@ def test_approval_keyboard_adds_mobile_intent_and_short_copy_button() -> None:
         for button in approved_buttons
     )
     assert any(button.copy_text and button.copy_text.text == approval.text for button in buttons)
+
+
+def test_mobile_post_falls_back_to_a_short_composer_url_when_draft_is_long() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    approval = bot.approvals.create(
+        kind="post",
+        text="Nội dung dài " * 200,
+        chat_id=123,
+    )
+
+    assert len(_mobile_x_intent_url(approval)) > 1800
+    assert _mobile_x_open_url(approval) == "https://x.com/compose/post"
+    assert "copy it above" in _mobile_approval_note(approval)
 
 
 def test_reply_approval_message_contains_only_link_and_draft() -> None:
@@ -454,6 +469,41 @@ def test_tweettrend3_collects_three_distinct_topics() -> None:
         "Topic three",
     ]
     assert searched == ["Topic one", "Topic two", "Topic three"]
+
+
+def test_tweettrend3_auto_prefers_creator_niche_topics() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    class Trends:
+        async def collect_niche(self, niche):
+            assert niche == bot.settings.creator_niche
+            return [
+                TrendSignal(title="Creator tool launch", source="Niche", category="niche", score=5),
+                TrendSignal(title="AI workflow update", source="Niche", category="niche", score=4),
+                TrendSignal(title="Indie business funding", source="Niche", category="niche", score=3),
+            ], []
+
+        async def collect(self, _category):
+            raise AssertionError("General trends should not be needed when niche has three topics")
+
+    class XSearch:
+        async def search_recent(self, query, **_kwargs):
+            return query, []
+
+    bot.trend_sources = Trends()
+    bot.x_search = XSearch()
+
+    contexts = asyncio.run(bot._get_trend_contexts_for_tweettrend3("auto", Status()))
+
+    assert [context[0] for context in contexts] == [
+        "Creator tool launch",
+        "AI workflow update",
+        "Indie business funding",
+    ]
 
 
 def test_no_reply_targets_message_allows_auto_mode() -> None:

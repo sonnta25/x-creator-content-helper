@@ -54,6 +54,8 @@ AUTO_REPLY_TARGET_FALLBACK_QUERIES = (
 REPLY_TARGET_MAX_CANDIDATES = 8
 REPLY_TARGET_RESULT_LIMIT = 20
 REPLY_TARGET_CONTEXT_ITEMS = 3
+TREND_CONTEXT_SIGNAL_ITEMS = 3
+TREND_CONTEXT_X_ITEMS = 4
 TWEETTREND_LANGUAGE_ALIASES = {
     "en": "English",
     "eng": "English",
@@ -263,6 +265,7 @@ class ContentBot:
         if decision not in {"approve", "mobile", "reject"}:
             await query.answer("Unknown approval action.", show_alert=True)
             return
+        answered = False
         try:
             approval = self.approvals.decide(
                 approval_id,
@@ -272,10 +275,12 @@ class ContentBot:
                 destination="mobile",
             )
             await query.answer()
+            answered = True
             original = str(query.message.text or "").strip()
+            mobile_note = _mobile_approval_note(approval)
             await query.edit_message_text(
                 (
-                    original
+                    f"{original}\n\n{mobile_note}".strip()
                     if approval.status == "mobile_approved"
                     else f"{original}\n\nRejected."
                 ),
@@ -286,7 +291,14 @@ class ContentBot:
                 ),
             )
         except Exception as exc:
-            await query.answer(_friendly_error(exc), show_alert=True)
+            error = _friendly_error(exc)
+            if not answered:
+                await query.answer(error, show_alert=True)
+            else:
+                await query.message.reply_text(
+                    f"Approval was saved, but Telegram could not refresh this card: {error}\n"
+                    "Tap the approval button again to retry opening the mobile action."
+                )
 
     async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]:
         query = str(payload.get("query", "")).strip()
@@ -338,8 +350,14 @@ class ContentBot:
             raise RuntimeError("Telegram bot is not ready.")
         if self.approval_chat_id is None:
             raise RuntimeError("No approval chat configured. Send /automationhere in Telegram first.")
-        if kind in self._automation_running:
-            return {"ok": True, "status": "already-running", "kind": kind}
+        if self._automation_running:
+            active = next(iter(self._automation_running))
+            return {
+                "ok": True,
+                "status": "already-running",
+                "kind": kind,
+                "active_kind": active,
+            }
 
         self._automation_running.add(kind)
 
@@ -465,7 +483,7 @@ class ContentBot:
 
         await message.chat.send_action(ChatAction.TYPING)
         status_text = (
-            "Finding the best hot X trend automatically..."
+            "Finding current trends around your creator niche..."
             if category in {"auto", "best"}
             else f"Finding hot X trends in {category}..."
         )
@@ -617,7 +635,7 @@ class ContentBot:
             await status.edit_text("Writing a tweet from the X context...")
             generated = await self.ai.generate_topic_post_from_x_context(
                 topic,
-                summarize_x_context(results),
+                summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS),
             )
             await status.delete()
             await message.reply_text(f"Topic: {generated.topic}\n\nTweet:\n{generated.text}")
@@ -872,7 +890,7 @@ class ContentBot:
                 )
             return (
                 f"hot X discussion in {category}",
-                summarize_x_context(results),
+                summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS),
                 f"X hot search fallback ({fallback_query})",
                 results,
             )
@@ -887,16 +905,20 @@ class ContentBot:
             search_query, results = await self.x_search.search_recent(
                 lead.title,
                 since_minutes=24 * 60,
-                limit=self.settings.x_search_limit,
+                limit=min(self.settings.x_search_limit, TREND_CONTEXT_X_ITEMS),
                 product="Latest",
             )
         except Exception as exc:
             errors.append(f"X enrichment: {exc}")
 
-        context_parts = [f"Multi-source trend context:\n{summarize_trend_signals(signals)}"]
+        context_parts = [
+            "Multi-source trend context:\n"
+            + summarize_trend_signals(signals, max_items=TREND_CONTEXT_SIGNAL_ITEMS)
+        ]
         if results:
             context_parts.append(
-                f"Recent X context for {search_query}:\n{summarize_x_context(results)}"
+                f"Recent X context for {search_query}:\n"
+                f"{summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS)}"
             )
         if errors:
             context_parts.append("Source notes:\n" + "\n".join(f"- {error}" for error in errors[-4:]))
@@ -948,17 +970,35 @@ class ContentBot:
         categories = AUTO_TREND_CATEGORIES if category in {"auto", "best"} else (category,)
         candidates: list[tuple[Any, str, list[Any], list[str]]] = []
 
-        for selected_category in categories:
+        # Auto mode should find conversations in the configured content lane,
+        # not merely the largest general-interest trends of the day.
+        if category in {"auto", "best"}:
             await status.edit_text(
-                f"Scanning X, Google Trends, and RSS sources for {selected_category}..."
+                f"Finding current trends around your niche: {self.settings.creator_niche}..."
             )
-            signals, errors = await self.trend_sources.collect(selected_category)
-            for signal in signals:
-                candidates.append((signal, selected_category, signals, errors))
+            niche_signals, niche_errors = await self.trend_sources.collect_niche(
+                self.settings.creator_niche
+            )
+            for signal in niche_signals:
+                candidates.append((signal, "niche", niche_signals, niche_errors))
+
+        niche_topic_count = len({_trend_topic_key(item[0].title) for item in candidates})
+        if niche_topic_count < count:
+            for selected_category in categories:
+                await status.edit_text(
+                    f"Scanning X, Google Trends, and RSS sources for {selected_category}..."
+                )
+                signals, errors = await self.trend_sources.collect(selected_category)
+                for signal in signals:
+                    candidates.append((signal, selected_category, signals, errors))
 
         selected: list[tuple[Any, str, list[Any], list[str]]] = []
         seen_topics: set[str] = set()
-        for candidate in sorted(candidates, key=lambda item: item[0].score, reverse=True):
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (item[1] == "niche", item[0].score),
+            reverse=True,
+        ):
             topic_key = _trend_topic_key(candidate[0].title)
             if not topic_key or topic_key in seen_topics:
                 continue
@@ -979,19 +1019,24 @@ class ContentBot:
                 search_query, results = await self.x_search.search_recent(
                     signal.title,
                     since_minutes=24 * 60,
-                    limit=self.settings.x_search_limit,
+                    limit=min(self.settings.x_search_limit, TREND_CONTEXT_X_ITEMS),
                     product="Latest",
                 )
             except Exception as exc:
                 notes.append(f"X enrichment: {exc}")
 
+            related_signals = [signal] + [item for item in signals if item != signal]
             context_parts = [
                 "Multi-source trend context:\n"
-                + summarize_trend_signals(signals[:5])
+                + summarize_trend_signals(
+                    related_signals,
+                    max_items=TREND_CONTEXT_SIGNAL_ITEMS,
+                )
             ]
             if results:
                 context_parts.append(
-                    f"Recent X context for {search_query}:\n{summarize_x_context(results)}"
+                    f"Recent X context for {search_query}:\n"
+                    f"{summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS)}"
                 )
             if notes:
                 context_parts.append(
@@ -1287,6 +1332,29 @@ def _mobile_x_intent_url(approval: AutomationApproval) -> str:
     return f"https://x.com/intent/tweet?{urlencode(params)}"
 
 
+# Vietnamese text grows substantially after URL encoding. Leave headroom below
+# Telegram's practical button URL limit instead of sending an invalid keyboard.
+MOBILE_X_INTENT_SAFE_LENGTH = 1800
+
+
+def _mobile_x_open_url(approval: AutomationApproval) -> str:
+    intent_url = _mobile_x_intent_url(approval)
+    if len(intent_url) <= MOBILE_X_INTENT_SAFE_LENGTH:
+        return intent_url
+    if approval.kind == "reply" and approval.target_url:
+        return approval.target_url
+    return "https://x.com/compose/post"
+
+
+def _mobile_approval_note(approval: AutomationApproval) -> str:
+    if _mobile_x_open_url(approval) == _mobile_x_intent_url(approval):
+        return "Approved. Tap Open X on phone to open the pre-filled draft."
+    return (
+        "Approved. The draft is too long for a safe X pre-fill link; copy it above, "
+        "then tap Open X on phone and paste it."
+    )
+
+
 def _approval_message_text(
     approval: AutomationApproval,
     *,
@@ -1327,7 +1395,7 @@ def _approval_keyboard(
             [
                 InlineKeyboardButton(
                     "Open X on phone",
-                    url=_mobile_x_intent_url(approval),
+                    url=_mobile_x_open_url(approval),
                 )
             ]
         )

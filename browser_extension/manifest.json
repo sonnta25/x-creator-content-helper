@@ -1,15 +1,14 @@
 {
   "manifest_version": 3,
   "name": "X Content Bot Bridge",
-  "version": "0.2.7",
-  "description": "Runs Gemini bridge jobs and prepares approved X drafts from Telegram.",
+  "version": "0.3.2",
+  "description": "Runs scheduled Gemini bridge jobs for the Telegram approval workflow.",
   "permissions": ["storage", "tabs", "scripting", "alarms", "activeTab"],
   "host_permissions": [
     "http://127.0.0.1:8765/*",
     "http://localhost:8765/*",
     "https://gemini.google.com/*",
-    "https://*.googleusercontent.com/*",
-    "https://x.com/*"
+    "https://*.googleusercontent.com/*"
   ],
   "action": {
     "default_popup": "popup.html",

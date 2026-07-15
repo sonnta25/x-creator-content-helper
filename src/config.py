@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 class Settings:
     telegram_bot_token: str
     content_provider: str = "extension_bridge"
-    generate_images: bool = True
+    generate_images: bool = False
     image_provider: str = "extension_bridge"
     telegram_caption_limit: int = 1024
     x_cookie: str = ""
@@ -49,7 +49,7 @@ class Settings:
                 "extension_bridge",
                 {"extension_bridge"},
             ),
-            generate_images=_bool_env("GENERATE_IMAGES", True),
+            generate_images=_bool_env("GENERATE_IMAGES", False),
             image_provider=_choice_env(
                 "IMAGE_PROVIDER",
                 "extension_bridge",

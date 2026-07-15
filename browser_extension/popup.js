@@ -1,7 +1,7 @@
 const DEFAULTS = {
   bridgeUrl: "http://127.0.0.1:8765",
   token: "local-bridge-change-me",
-  timeoutSeconds: 300,
+  timeoutSeconds: 360,
   autoRun: false,
   pollSeconds: 30,
   automationEnabled: false,
@@ -94,7 +94,7 @@ els.diagnoseGemini.addEventListener("click", async () => {
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "local") return;
+  if (areaName !== "local" && areaName !== "session") return;
   if (changes.lastStatus) {
     setStatus(changes.lastStatus.newValue || "");
   }

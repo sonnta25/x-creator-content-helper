@@ -1,7 +1,7 @@
 const DEFAULTS = {
   bridgeUrl: "http://127.0.0.1:8765",
   token: "local-bridge-change-me",
-  timeoutSeconds: 300,
+  timeoutSeconds: 360,
   autoRun: false,
   pollSeconds: 30,
   automationEnabled: false,
@@ -19,9 +19,11 @@ const DEFAULTS = {
 const AUTO_ALARM = "x-content-bot-auto-run";
 const AUTOMATION_ALARM = "x-content-bot-scheduled-approvals";
 const FINAL_PROVIDER_URL = "https://gemini.google.com/app";
-const FINAL_PROVIDER_ORIGIN = "https://gemini.google.com";
 const FINAL_PROVIDER_NAME = "Gemini";
+const PROVIDER_RECYCLE_AFTER_JOBS = 10;
+const PROVIDER_JOB_COUNT_KEY = "providerSuccessfulJobs";
 let running = false;
+let lastStatusCache = "";
 
 chrome.runtime.onInstalled.addListener(() => {
   ensureAutoAlarm();
@@ -58,7 +60,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
   if (alarm.name === AUTOMATION_ALARM) {
     automationTick()
-      .then((result) => result && !result.opened && result.runJobs
+      .then((result) => result && result.runJobs
         ? runJobs({ force: true, maxJobs: 1 })
         : null)
       .catch((error) => setStatus(`Automation error: ${error.message || error}`));
@@ -115,28 +117,27 @@ async function ensureAutoAlarm() {
 async function ensureAutomationAlarm() {
   const config = await loadConfig();
   await chromeAlarmsClear(AUTOMATION_ALARM);
-  if (config.automationEnabled && !config.nextReplyTargetsAt) {
+  if (!config.automationEnabled) {
+    return;
+  }
+  if (!config.nextReplyTargetsAt) {
     await chromeStorageSet({
       nextReplyTargetsAt: Date.now() + config.replyTargetsMinutes * 60 * 1000
     });
   }
   chrome.alarms.create(AUTOMATION_ALARM, { periodInMinutes: 0.5 });
-  if (config.automationEnabled) {
-    automationTick()
-      .then((result) => result && !result.opened && result.runJobs
-        ? runJobs({ force: true, maxJobs: 1 })
-        : null)
-      .catch((error) => setStatus(`Automation error: ${error.message || error}`));
-  }
+  automationTick()
+    .then((result) => result && result.runJobs
+      ? runJobs({ force: true, maxJobs: 1 })
+      : null)
+    .catch((error) => setStatus(`Automation error: ${error.message || error}`));
 }
 
 async function automationTick() {
   let config = await loadConfig();
   config = await syncTelegramAutomationConfig(config);
-  const opened = await openNextApprovedAction(config);
-  if (opened) return { opened: true, runJobs: false };
   if (!config.automationEnabled || !isInsideActiveWindow(new Date(), config.activeStart, config.activeEnd)) {
-    return { opened: false, runJobs: false };
+    return { runJobs: false };
   }
 
   const now = new Date();
@@ -146,17 +147,20 @@ async function automationTick() {
       nextReplyTargetsAt: nowMs + config.replyTargetsMinutes * 60 * 1000
     });
   } else if (nowMs >= config.nextReplyTargetsAt) {
-    await chromeStorageSet({
-      nextReplyTargetsAt: nowMs + config.replyTargetsMinutes * 60 * 1000
-    });
     await setStatus("Starting scheduled /replytargets...");
-    await bridgeFetch(config, "/automation/triggers/replytargets", {
+    const trigger = await bridgeFetch(config, "/automation/triggers/replytargets", {
       method: "POST",
       body: {
         query: config.replyTargetsQuery,
         reply_targets_minutes: config.replyTargetsMinutes
       }
     });
+    if (trigger.status === "accepted") {
+      await chromeStorageSet({
+        nextReplyTargetsAt: nowMs + config.replyTargetsMinutes * 60 * 1000
+      });
+      return { runJobs: true };
+    }
   }
 
   const runKeys = new Set(config.trendRunKeys);
@@ -165,16 +169,19 @@ async function automationTick() {
     const ageMs = nowMs - scheduled.getTime();
     const key = `${localDateKey(now)}|${time}`;
     if (ageMs >= 0 && ageMs < 10 * 60 * 1000 && !runKeys.has(key)) {
-      runKeys.add(key);
-      await chromeStorageSet({ trendRunKeys: Array.from(runKeys).slice(-14) });
       await setStatus(`Starting scheduled /tweettrend3 ${config.trendCategory}...`);
-      await bridgeFetch(config, "/automation/triggers/tweettrend3", {
+      const trigger = await bridgeFetch(config, "/automation/triggers/tweettrend3", {
         method: "POST",
         body: { category: config.trendCategory }
       });
+      if (trigger.status === "accepted") {
+        runKeys.add(key);
+        await chromeStorageSet({ trendRunKeys: Array.from(runKeys).slice(-14) });
+        break;
+      }
     }
   }
-  return { opened: false, runJobs: true };
+  return { runJobs: true };
 }
 
 async function syncTelegramAutomationConfig(config) {
@@ -230,44 +237,6 @@ function localDateKey(date) {
   return `${year}-${month}-${day}`;
 }
 
-async function openNextApprovedAction(config) {
-  if (running) return false;
-  const payload = await bridgeFetch(config, "/automation/approvals/next");
-  if (!payload.action) return false;
-
-  const action = payload.action;
-  try {
-    const targetUrl = action.kind === "reply" ? String(action.target_url || "") : "https://x.com/compose/post";
-    if (!/^https:\/\/(?:www\.)?x\.com\//i.test(targetUrl)) {
-      throw new Error("Approved action has an invalid X URL.");
-    }
-    await setStatus(`Opening approved ${action.kind} in X...`);
-    const tab = await chromeTabsCreate({ url: targetUrl, active: true });
-    await waitForTabComplete(tab.id);
-    const [injection] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: injectedPrepareXDraft,
-      args: [action.kind, action.text, action.target_url]
-    });
-    const result = injection ? injection.result : null;
-    if (!result || !result.ok) {
-      throw new Error(result && result.error ? result.error : "Could not prepare the X draft.");
-    }
-    await bridgeFetch(config, `/automation/approvals/${action.id}/complete`, {
-      method: "POST",
-      body: {}
-    });
-    await setStatus(`Approved ${action.kind} is ready in X. Review it and click the final X button.`);
-    return true;
-  } catch (error) {
-    await bridgeFetch(config, `/automation/approvals/${action.id}/error`, {
-      method: "POST",
-      body: { error: error.message || String(error) }
-    });
-    throw error;
-  }
-}
-
 async function runJobs({ force, maxJobs }) {
   if (running) {
     await setStatus("Already running a job.");
@@ -317,6 +286,8 @@ async function runOneJob(config) {
 }
 
 async function runGeminiTextJob(config, job, { reportError = true } = {}) {
+  let providerStarted = false;
+  let providerCompleted = false;
   try {
     const finalPrompt = job.final_prompt || job.grok_prompt;
     if (!finalPrompt) {
@@ -325,19 +296,28 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
     await setStatus(
       `Job ${job.id}\nUsing existing ${FINAL_PROVIDER_NAME} tab...`
     );
+    providerStarted = true;
     const finalOutput = await runProviderPrompt(
       FINAL_PROVIDER_URL,
       finalPrompt,
       config.timeoutSeconds
     );
+    providerCompleted = true;
 
     await setStatus(`Job ${job.id}\nReturning final output...`);
     await bridgeFetch(config, `/jobs/${job.id}/result`, {
       method: "POST",
       body: { output: finalOutput }
     });
-    await setStatus(`Done. Gemini tab remains open for the next job.\n\n${finalOutput.slice(0, 600)}`);
+    const lifecycle = await recordProviderJobSuccess();
+    const lifecycleText = lifecycle.recycled
+      ? `Gemini tab recycled after ${PROVIDER_RECYCLE_AFTER_JOBS} successful jobs.`
+      : `Gemini tab remains open (${lifecycle.count}/${PROVIDER_RECYCLE_AFTER_JOBS} jobs before recycle).`;
+    await setStatus(`Done. ${lifecycleText}\n\n${finalOutput.slice(0, 600)}`);
   } catch (error) {
+    if (providerStarted && !providerCompleted) {
+      await recycleProviderAfterFailure();
+    }
     if (reportError) {
       await reportJobError(config, job.id, error);
     }
@@ -346,8 +326,11 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
 }
 
 async function runImageJob(config, job) {
+  let providerStarted = false;
+  let providerCompleted = false;
   try {
     await setStatus(`Image job ${job.id}\nUsing existing ${FINAL_PROVIDER_NAME} tab...`);
+    providerStarted = true;
     const dataUrl = await runProviderImage(
       FINAL_PROVIDER_URL,
       job.final_prompt || job.grok_prompt,
@@ -356,12 +339,21 @@ async function runImageJob(config, job) {
     if (!isUsableDataUrl(dataUrl)) {
       throw new Error(`${FINAL_PROVIDER_NAME} image was visible, but the extension could not extract usable image bytes.`);
     }
+    providerCompleted = true;
     await bridgeFetch(config, `/jobs/${job.id}/result`, {
       method: "POST",
       body: { image_data_url: dataUrl }
     });
-    await setStatus("Image returned to bot. Gemini tab remains open for the next job.");
+    const lifecycle = await recordProviderJobSuccess();
+    await setStatus(
+      lifecycle.recycled
+        ? `Image returned to bot. Gemini tab recycled after ${PROVIDER_RECYCLE_AFTER_JOBS} successful jobs.`
+        : `Image returned to bot. Gemini tab remains open (${lifecycle.count}/${PROVIDER_RECYCLE_AFTER_JOBS} jobs before recycle).`
+    );
   } catch (error) {
+    if (providerStarted && !providerCompleted) {
+      await recycleProviderAfterFailure();
+    }
     await reportJobError(config, job.id, error);
     throw error;
   }
@@ -379,9 +371,7 @@ async function reportJobError(config, jobId, error) {
 }
 
 async function runProviderPrompt(url, prompt, timeoutSeconds) {
-  const tab = await getOrCreateTab(url);
-  await chromeTabsUpdate(tab.id, { active: true });
-  await waitForTabComplete(tab.id);
+  const tab = await prepareProviderTab(url);
   const provider = providerNameFromUrl(url);
   const submittedPrompt = provider === "Gemini" ? compactPromptForSingleInput(prompt) : prompt;
   await setStatus(`Submitting prompt to ${provider}...`);
@@ -426,20 +416,20 @@ async function runProviderPrompt(url, prompt, timeoutSeconds) {
         last = current;
         stableSince = Date.now();
       }
-      if (best.length > 20 && Date.now() - stableSince > 3500) {
+      if (best.length > 20 && Date.now() - stableSince > 4500) {
         return best;
       }
     }
     if (value && value.debug) {
       lastDebug = value.debug;
     }
-    if (Date.now() - lastStatusAt > 5000) {
+    if (Date.now() - lastStatusAt > 10000) {
       await setStatus(
         `Waiting for ${provider} response...\n${lastDebug || "No readable candidate yet."}`
       );
       lastStatusAt = Date.now();
     }
-    await delay(1000);
+    await delay(2500);
   }
 
   if (best) {
@@ -459,8 +449,7 @@ function compactPromptForSingleInput(prompt) {
     .replace(/\r\n/g, "\n")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n[ \t]+/g, "\n")
-    .replace(/\n{2,}/g, " || ")
-    .replace(/\n/g, " | ")
+    .replace(/\n{3,}/g, "\n\n")
     .replace(/[ \t]{2,}/g, " ")
     .trim();
 }
@@ -486,9 +475,7 @@ async function diagnoseProviderDom(url) {
 }
 
 async function runProviderImage(url, prompt, timeoutSeconds) {
-  const tab = await getOrCreateTab(url);
-  await chromeTabsUpdate(tab.id, { active: true });
-  await waitForTabComplete(tab.id);
+  const tab = await prepareProviderTab(url);
   const [result] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: injectedSubmitAndFindImage,
@@ -578,9 +565,114 @@ async function getOrCreateTab(url) {
   const origin = new URL(url).origin;
   const tabs = await chromeTabsQuery({ url: `${origin}/*` });
   if (tabs.length > 0) {
+    if (tabs.length > 1) {
+      await chromeTabsRemove(tabs.slice(1).map((tab) => tab.id));
+    }
     return tabs[0];
   }
   return await chromeTabsCreate({ url, active: true });
+}
+
+async function prepareProviderTab(url) {
+  const tab = await getOrCreateTab(url);
+  await chromeTabsUpdate(tab.id, { active: true });
+  await waitForTabComplete(tab.id);
+
+  const [resetResult] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: injectedStartFreshChat
+  });
+  if (resetResult && resetResult.result) {
+    await delay(800);
+    return await chromeTabsGet(tab.id);
+  }
+
+  await chromeTabsUpdate(tab.id, { url, active: true });
+  await waitForTabComplete(tab.id);
+  return await chromeTabsGet(tab.id);
+}
+
+async function recordProviderJobSuccess() {
+  const session = await chromeStorageSessionGet({ [PROVIDER_JOB_COUNT_KEY]: 0 });
+  const count = Math.max(0, Number(session[PROVIDER_JOB_COUNT_KEY] || 0)) + 1;
+  if (count < PROVIDER_RECYCLE_AFTER_JOBS) {
+    await chromeStorageSessionSet({ [PROVIDER_JOB_COUNT_KEY]: count });
+    return { count, recycled: false };
+  }
+
+  const recycled = await recycleProviderTab();
+  const nextCount = recycled ? 0 : PROVIDER_RECYCLE_AFTER_JOBS - 1;
+  await chromeStorageSessionSet({ [PROVIDER_JOB_COUNT_KEY]: nextCount });
+  return { count: nextCount, recycled };
+}
+
+async function recycleProviderTab() {
+  let primaryId = null;
+  try {
+    const origin = new URL(FINAL_PROVIDER_URL).origin;
+    const tabs = await chromeTabsQuery({ url: `${origin}/*` });
+    if (!tabs.length) {
+      const replacement = await chromeTabsCreate({ url: FINAL_PROVIDER_URL, active: true });
+      await waitForTabComplete(replacement.id);
+      return true;
+    }
+
+    const [primary, ...duplicates] = tabs;
+    primaryId = primary.id;
+    if (duplicates.length) {
+      await chromeTabsRemove(duplicates.map((tab) => tab.id));
+    }
+
+    // Cross-origin blank navigation destroys the old Gemini document and its JS
+    // heap without closing the only Chrome window on a small VPS.
+    await chromeTabsUpdate(primary.id, { url: "about:blank", active: true });
+    await waitForTabComplete(primary.id);
+    await delay(300);
+    await chromeTabsUpdate(primary.id, { url: FINAL_PROVIDER_URL, active: true });
+    await waitForTabComplete(primary.id);
+    return true;
+  } catch (_error) {
+    try {
+      if (primaryId !== null) {
+        await chromeTabsUpdate(primaryId, { url: FINAL_PROVIDER_URL, active: true });
+        await waitForTabComplete(primaryId);
+        return true;
+      }
+      const replacement = await chromeTabsCreate({ url: FINAL_PROVIDER_URL, active: true });
+      await waitForTabComplete(replacement.id);
+      return true;
+    } catch (_recoveryError) {
+      return false;
+    }
+  }
+}
+
+async function recycleProviderAfterFailure() {
+  const recycled = await recycleProviderTab();
+  await chromeStorageSessionSet({
+    [PROVIDER_JOB_COUNT_KEY]: recycled ? 0 : PROVIDER_RECYCLE_AFTER_JOBS - 1
+  });
+  return recycled;
+}
+
+function injectedStartFreshChat() {
+  if (location.pathname === "/app" || location.pathname === "/app/") {
+    return true;
+  }
+  const normalize = (value) => String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const candidates = Array.from(document.querySelectorAll("a[href='/app'], button, [role='button']"));
+  const button = candidates.find((item) => {
+    const href = item.getAttribute("href") || "";
+    if (href === "/app") return true;
+    const label = normalize(`${item.getAttribute("aria-label") || ""} ${item.title || ""} ${item.textContent || ""}`);
+    return label.includes("new chat") || label.includes("doan chat moi") || label.includes("cuoc tro chuyen moi");
+  });
+  if (!button) return false;
+  button.click();
+  return true;
 }
 
 async function waitForTabComplete(tabId) {
@@ -588,14 +680,30 @@ async function waitForTabComplete(tabId) {
   if (tab.status === "complete") {
     return;
   }
-  await new Promise((resolve) => {
-    const listener = (updatedTabId, info) => {
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(updatedListener);
+      chrome.tabs.onRemoved.removeListener(removedListener);
+    };
+    const updatedListener = (updatedTabId, info) => {
       if (updatedTabId === tabId && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
+        cleanup();
         resolve();
       }
     };
-    chrome.tabs.onUpdated.addListener(listener);
+    const removedListener = (removedTabId) => {
+      if (removedTabId === tabId) {
+        cleanup();
+        reject(new Error("Provider tab closed while it was loading."));
+      }
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Provider tab did not finish loading within 30 seconds."));
+    }, 30000);
+    chrome.tabs.onUpdated.addListener(updatedListener);
+    chrome.tabs.onRemoved.addListener(removedListener);
   });
 }
 
@@ -840,6 +948,9 @@ function injectedReadProviderResponse(prompt, before) {
   const promptStart = normalizedPrompt.slice(0, 120);
   const expectsJson = /return\s+(?:only\s+)?(?:valid\s+)?json/i.test(prompt)
     || /"targets"|"variants"|"image_prompt"|"topic"/i.test(prompt);
+  const expectsSinglePostJson = expectsJson
+    && !/"targets"|"variants"|thread_posts/i.test(prompt)
+    && /(?:keys?\s*:\s*text\s*,\s*image_prompt\s*,\s*topic|"text"\s+field)/i.test(prompt);
 
   const isVisible = (el) => {
     if (!el) return false;
@@ -930,6 +1041,33 @@ function injectedReadProviderResponse(prompt, before) {
     return clean;
   };
 
+  const hasSinglePostText = (text) => {
+    if (!expectsSinglePostJson) return true;
+    try {
+      let payload = JSON.parse(text);
+      for (let depth = 0; depth < 4 && payload; depth += 1) {
+        if (typeof payload === "string") {
+          payload = JSON.parse(payload);
+        }
+        if (!payload || typeof payload !== "object") break;
+        const postText = ["text", "tweet", "post", "content"]
+          .map((key) => payload[key])
+          .find((value) => typeof value === "string" && value.trim());
+        if (postText) return true;
+        payload = ["response", "result", "output", "data", "message"]
+          .map((key) => payload[key])
+          .find((value) => value && (
+            typeof value === "object"
+            || (typeof value === "string" && value.includes("{"))
+          ));
+      }
+    } catch (_error) {
+      // Keep support for otherwise recoverable JSON containing an unescaped quote.
+      return /"(?:text|tweet|post|content)"\s*:\s*"[^"\s][\s\S]*/i.test(text);
+    }
+    return false;
+  };
+
   const selectors = ["[data-message-author-role='assistant']", "[dir='auto']", "pre"];
   const candidates = [];
   const seen = new Set();
@@ -938,6 +1076,7 @@ function injectedReadProviderResponse(prompt, before) {
     seen.add(el);
     const text = normalizeCandidateText(el.innerText || el.textContent || "");
     if (text.length < 8 || text.length > 30000) return;
+    if (!hasSinglePostText(text)) return;
     if (looksLikeSubmittedPrompt(text)) return;
     if (looksLikePromptLeak(text)) return;
     const normalized = normalizeText(text);
@@ -1641,79 +1780,11 @@ function injectedSubmitAndFindImage(prompt, timeoutMs) {
   })();
 }
 
-function injectedPrepareXDraft(kind, text, targetUrl) {
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const isVisible = (element) => {
-    if (!element) return false;
-    const style = window.getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
-    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-  };
-  const findEditor = () => Array.from(document.querySelectorAll(
-    "[data-testid='tweetTextarea_0'], div[role='textbox'][contenteditable='true']"
-  )).find(isVisible);
-  const setEditorText = (editor, value) => {
-    editor.focus();
-    document.execCommand("selectAll", false, null);
-    const inserted = document.execCommand("insertText", false, value);
-    if (!inserted) {
-      editor.textContent = value;
-    }
-    editor.dispatchEvent(new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertText",
-      data: value
-    }));
-  };
-
-  return (async () => {
-    const cleanText = String(text || "").trim();
-    if (!cleanText) return { ok: false, error: "The approved draft is empty." };
-
-    if (kind === "reply") {
-      const match = /\/status\/(\d+)/i.exec(String(targetUrl || ""));
-      const statusId = match ? match[1] : "";
-      let replyButton = null;
-      const replyDeadline = Date.now() + 30000;
-      while (Date.now() < replyDeadline && !replyButton) {
-        const articles = Array.from(document.querySelectorAll("article")).filter(isVisible);
-        const targetArticle = statusId
-          ? articles.find((article) => article.querySelector(`a[href*='/status/${statusId}']`))
-          : articles[0];
-        replyButton = targetArticle && targetArticle.querySelector("[data-testid='reply']");
-        if (!replyButton) await sleep(500);
-      }
-      if (!replyButton) {
-        return { ok: false, error: "Could not find the Reply button for the target post. Check X login and page state." };
-      }
-      replyButton.click();
-    }
-
-    const editorDeadline = Date.now() + 30000;
-    let editor = null;
-    while (Date.now() < editorDeadline && !editor) {
-      editor = findEditor();
-      if (!editor) await sleep(500);
-    }
-    if (!editor) {
-      return { ok: false, error: "Could not find the X composer. Check that you are logged in." };
-    }
-    if (String(editor.innerText || editor.textContent || "").trim()) {
-      return { ok: false, error: "The X composer already contains text, so it was not overwritten." };
-    }
-    setEditorText(editor, cleanText);
-    await sleep(500);
-    const finalText = String(editor.innerText || editor.textContent || "").trim();
-    if (!finalText) {
-      return { ok: false, error: "X did not accept the draft text." };
-    }
-    editor.focus();
-    return { ok: true, characters: finalText.length };
-  })();
-}
-
 async function loadConfig() {
-  const saved = await chromeStorageGet(DEFAULTS);
+  const [saved, session] = await Promise.all([
+    chromeStorageGet(DEFAULTS),
+    chromeStorageSessionGet({ lastStatus: DEFAULTS.lastStatus })
+  ]);
   return {
     bridgeUrl: String(saved.bridgeUrl || DEFAULTS.bridgeUrl).replace(/\/$/, ""),
     token: String(saved.token || DEFAULTS.token),
@@ -1729,7 +1800,7 @@ async function loadConfig() {
     trendCategory: String(saved.trendCategory || DEFAULTS.trendCategory),
     nextReplyTargetsAt: Number(saved.nextReplyTargetsAt || 0),
     trendRunKeys: Array.isArray(saved.trendRunKeys) ? saved.trendRunKeys : [],
-    lastStatus: String(saved.lastStatus || DEFAULTS.lastStatus)
+    lastStatus: String(session.lastStatus || saved.lastStatus || DEFAULTS.lastStatus)
   };
 }
 
@@ -1753,7 +1824,10 @@ async function saveConfig(config) {
 }
 
 async function setStatus(text) {
-  await chromeStorageSet({ lastStatus: text });
+  const value = String(text || "");
+  if (value === lastStatusCache) return;
+  lastStatusCache = value;
+  await chromeStorageSessionSet({ lastStatus: value });
 }
 
 function chromeStorageGet(defaults) {
@@ -1762,6 +1836,14 @@ function chromeStorageGet(defaults) {
 
 function chromeStorageSet(values) {
   return new Promise((resolve) => chrome.storage.local.set(values, resolve));
+}
+
+function chromeStorageSessionGet(defaults) {
+  return new Promise((resolve) => chrome.storage.session.get(defaults, resolve));
+}
+
+function chromeStorageSessionSet(values) {
+  return new Promise((resolve) => chrome.storage.session.set(values, resolve));
 }
 
 function chromeTabsQuery(query) {
@@ -1780,8 +1862,8 @@ function chromeTabsGet(tabId) {
   return new Promise((resolve) => chrome.tabs.get(tabId, resolve));
 }
 
-function chromeTabsRemove(tabId) {
-  return new Promise((resolve) => chrome.tabs.remove(tabId, resolve));
+function chromeTabsRemove(tabIds) {
+  return new Promise((resolve) => chrome.tabs.remove(tabIds, resolve));
 }
 
 function chromeAlarmsClear(name) {

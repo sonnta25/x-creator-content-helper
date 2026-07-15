@@ -101,3 +101,26 @@ def test_mobile_approval_and_target_dedupe_survive_restart(tmp_path) -> None:
 
     assert restored.get(approval.id).status == "mobile_approved"
     assert restored.has_active_target("https://x.com/user/status/42") is True
+
+
+def test_mobile_approval_can_be_retried_after_a_failed_telegram_edit(tmp_path) -> None:
+    store = AutomationApprovalStore(tmp_path / "approvals.json")
+    approval = store.create(kind="post", text="Draft", chat_id=10, approver_user_id=20)
+
+    first = store.decide(
+        approval.id,
+        approve=True,
+        chat_id=10,
+        user_id=20,
+        destination="mobile",
+    )
+    retried = store.decide(
+        approval.id,
+        approve=True,
+        chat_id=10,
+        user_id=20,
+        destination="mobile",
+    )
+
+    assert first.status == "mobile_approved"
+    assert retried.status == "mobile_approved"

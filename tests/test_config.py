@@ -7,7 +7,7 @@ def test_settings_defaults() -> None:
     settings = Settings(telegram_bot_token="123:ABC")
 
     assert settings.content_provider == "extension_bridge"
-    assert settings.generate_images is True
+    assert settings.generate_images is False
     assert settings.image_provider == "extension_bridge"
     assert settings.x_cookie == ""
     assert settings.x_account_name == "telegram_bot"

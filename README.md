@@ -5,16 +5,16 @@ Telegram bot for creating X/Twitter posts, replies, reply targets, multi-source 
 The current AI flow is:
 
 ```text
-Telegram bot -> local extension bridge -> Gemini draft -> Gemini final -> Telegram bot
+Telegram bot -> local extension bridge -> one Gemini job -> Telegram bot
 ```
 
-Gemini creates and finalizes drafts, then generates images through the Chrome extension. The extension reuses one logged-in Gemini tab for every job to avoid repeated cold starts. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
+Gemini produces each final draft in one browser job. The extension reuses one logged-in tab but starts a clean Gemini conversation for every job, preventing context from one command leaking into the next. It hard-recycles that tab after 10 successful jobs, or immediately after a provider/DOM failure, so a long-running VPS does not retain Gemini's old page heap indefinitely. Optional images use one additional Gemini job. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
 
 ## Commands
 
-- `/tweet <topic>`: create one Vietnamese long-form X post and image from a topic.
+- `/tweet <topic>`: create one Vietnamese long-form X post, with an optional image.
 - `/tweetx <topic/search>`: search X first, then create one long-form X post from live context.
-- `/tweettrend3 [auto|trending|news|sport|entertainment]`: scan X, Google Trends, and RSS, then create three Vietnamese posts from three different hot topics, with images and approval buttons.
+- `/tweettrend3 [auto|trending|news|sport|entertainment]`: in `auto` mode, find current topics around `CREATOR_NICHE` first, then create three Vietnamese posts with approval buttons.
 - `/dailybrief [trending|news|sport|entertainment]`: create daily-ready long-form post options from multi-source trend context.
 - `/retweet <X post link> | <visual description>`: remix a source X post into a fresh original tweet and image.
 - `/reply <tweet text or X post link>`: create one copy-ready text reply only.
@@ -38,7 +38,7 @@ The bot registers these commands with Telegram on startup.
 
 X search commands add `lang:en` automatically unless your query already includes a `lang:` filter.
 
-`/tweettrend3` uses English/US trend context by default, but final post text is always written in natural Vietnamese. Image prompts remain English so Gemini image generation is more reliable.
+`/tweettrend3` auto mode searches current Google News topics using `CREATOR_NICHE` first, then falls back to broader X/Google/RSS trends only if fewer than three niche topics are available. It uses English/US trend context by default, but final post text is always written in natural Vietnamese. Image prompts remain English so Gemini image generation is more reliable.
 
 `/tweettrend3` selects three distinct trend topics, then sends one copy-ready post and generated image for each topic. It does not include option labels or score metadata in the copy-ready post message.
 
@@ -77,7 +77,7 @@ EXTENSION_BRIDGE_PORT=8765
 EXTENSION_BRIDGE_TOKEN=choose-a-private-token
 EXTENSION_BRIDGE_TIMEOUT_SECONDS=360
 
-GENERATE_IMAGES=true
+GENERATE_IMAGES=false
 IMAGE_PROVIDER=extension_bridge
 GEMINI_IMAGE_PROMPT_PREFIX=Create one square realistic image for this social post. Return the image only, with no extra text.
 
@@ -116,7 +116,7 @@ Use this when you have Gemini web access but no API keys.
 
 When Auto Run is OFF, click **Run next job** after sending a Telegram command. When Auto Run is ON, Chrome checks for pending jobs about every 30 seconds while Chrome is open.
 
-Long Gemini prompts are entered into the same composer in small 1,200-character chunks with a short pause between chunks, then submitted once. This reduces peak Chrome disk/CPU activity without changing the prompt or splitting it into separate Gemini messages.
+Gemini prompts are compacted at the bot layer, then entered into one composer in 1,200-character chunks and submitted once. Each job starts a clean conversation in the same warm tab. After 10 completed Gemini jobs, the extension navigates the tab through a blank page and reloads Gemini, releasing the old page DOM/JavaScript heap without closing the only Chrome window. Provider timeouts and DOM failures trigger the same recycle immediately. Response DOM checks run every 2.5 seconds, and volatile status plus the recycle counter are kept in memory-backed session storage instead of being written repeatedly to the Chrome profile.
 
 ### 2 GB RAM VPS mode
 
@@ -126,7 +126,7 @@ For a 2-core / 2 GB Windows VPS, run Chrome with the included low-memory profile
 .\scripts\windows\start-chrome-lite.ps1
 ```
 
-It uses a separate profile, loads only this extension, disables GPU/background services and nonessential background telemetry, limits Chrome to one renderer process, and caps disk cache at 16 MB (media cache 1 MB). Gemini stays open after every job, including image generation, so the next job can reuse the logged-in, warm tab instead of triggering another cold start. On a 2-core VPS it also pins Chrome to one logical CPU at BelowNormal priority, so Chrome cannot saturate both cores. It starts a background watchdog that checks every 30 seconds, reapplies the CPU limit to Chrome child processes, and relaunches this Chrome profile if Windows kills it. Gemini jobs will be slower, but the bot and Windows remain responsive. Sign in to Gemini once in that profile. Do not use headless mode: this bridge needs the visible Gemini web UI. Stop only this Chrome instance and its watchdog with:
+It uses a separate profile, loads only this extension, disables GPU/background services, limits Chrome to two renderer processes, and caps disk cache at 16 MB (media cache 1 MB). Gemini stays open after every job, while each job starts a clean conversation in that warm tab. On a 2-core VPS it also pins Chrome to one logical CPU at BelowNormal priority, so Chrome cannot saturate both cores. The bot runner no longer starts Ollama or any unused model service. A background watchdog checks every 30 seconds, reapplies the CPU limit, and relaunches this profile if Chrome exits. Sign in to Gemini once in that profile. Do not use headless mode: this bridge needs the visible Gemini web UI. Stop only this Chrome instance and its watchdog with:
 
 ```powershell
 .\scripts\windows\stop-chrome-lite.ps1
@@ -165,12 +165,12 @@ For both manual `/replytargets` and `/tweettrend3` commands and their scheduled 
 Mobile approval is deliberately two-step because one Telegram button cannot both record a callback and open another app:
 
 1. Tap **Approve on mobile**. The bot records the approval and removes the decision buttons.
-2. Tap **Open X on phone**. The official mobile-friendly X Web Intent opens the matching reply or post composer and pre-populates the draft, so no manual paste is normally needed.
+2. Tap **Open X on phone**. The official mobile-friendly X Web Intent opens the matching reply or post composer and pre-populates the draft when the URL is short enough. For a long post, Telegram rejects a URL containing the full encoded draft; the bot instead opens the X composer safely and keeps the draft above for you to copy and paste.
 
 Once a reply target is pending or approved, the bot skips the same target to avoid duplicate approval cards. This history is persisted in `data/automation_approvals.json`, so deduplication survives bot restarts.
 
 - **Open X on phone** uses the official mobile-friendly X Web Intent.
-- **Copy draft** uses Telegram's native clipboard button for drafts up to 256 characters. Telegram limits native copy buttons to 256 characters; longer post drafts still use the pre-filled X mobile intent.
+- **Copy draft** uses Telegram's native clipboard button for drafts up to 256 characters. For longer drafts that cannot safely fit in an encoded X URL, copy the message text and paste it into the composer opened by **Open X on phone**.
 
 Review or edit the filled draft in X, then submit it yourself. A pending approval expires after 30 minutes. `Auto Run` still controls whether Gemini jobs from manually entered Telegram commands run automatically; when it is OFF, use **Run next job** before approving the returned draft.
 

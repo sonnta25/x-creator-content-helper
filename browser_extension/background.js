@@ -31,17 +31,17 @@ let running = false;
 let lastStatusCache = "";
 
 chrome.runtime.onInstalled.addListener(() => {
-  bootstrapRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
+  initializeRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  bootstrapRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
+  initializeRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
 });
 
 // Chrome recommends checking critical alarms whenever an extension service
 // worker starts because alarm persistence can be unpredictable across browser
 // restarts and extension reloads. Top-level bootstrap runs on every worker wake.
-bootstrapRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
+initializeRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
@@ -103,8 +103,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.action === "get-state") {
-    loadConfig()
+    bootstrapRuntime()
+      .then(() => loadConfig())
       .then((config) => sendResponse({ ok: true, config }))
+      .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
+    return true;
+  }
+
+  if (message.action === "runtime-heartbeat") {
+    chromeStorageSessionSet({ lastRuntimeHeartbeatAt: Date.now() })
+      .then(() => bootstrapRuntime())
+      .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
     return true;
   }
@@ -122,6 +131,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 async function bootstrapRuntime() {
   await ensureWatchdogAlarm();
   await Promise.all([ensureAutoAlarm(), ensureAutomationAlarm()]);
+}
+
+async function initializeRuntime() {
+  await ensureGeminiHeartbeatInjected();
+  await bootstrapRuntime();
+}
+
+async function ensureGeminiHeartbeatInjected() {
+  const tabs = await chromeTabsQuery({ url: "https://gemini.google.com/*" });
+  for (const tab of tabs) {
+    if (!tab.id) continue;
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["gemini_heartbeat.js"]
+      });
+    } catch (_error) {
+      // A tab can navigate or close between query and injection. The manifest
+      // content script or the next worker startup will retry automatically.
+    }
+  }
 }
 
 async function ensureWatchdogAlarm() {
@@ -142,7 +172,8 @@ async function ensureAutoAlarm() {
   if (!existing || Number(existing.periodInMinutes || 0) !== periodInMinutes) {
     chrome.alarms.create(AUTO_ALARM, { periodInMinutes });
   }
-  await runJobs({ force: false, maxJobs: 1 });
+  runJobs({ force: false, maxJobs: 1 })
+    .catch((error) => setStatus(`Auto Run error: ${error.message || error}`));
 }
 
 async function ensureAutomationAlarm() {
@@ -162,7 +193,8 @@ async function ensureAutomationAlarm() {
   }
   const result = await automationTick();
   if (result && result.runJobs) {
-    await runJobs({ force: true, maxJobs: 1 });
+    runJobs({ force: true, maxJobs: 1 })
+      .catch((error) => setStatus(`Automation error: ${error.message || error}`));
   }
 }
 

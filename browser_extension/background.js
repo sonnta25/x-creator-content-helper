@@ -739,44 +739,49 @@ async function recordProviderJobSuccess() {
 }
 
 async function recycleProviderTab() {
-  let primaryId = null;
+  const origin = new URL(FINAL_PROVIDER_URL).origin;
+  const oldTabs = await chromeTabsQuery({ url: `${origin}/*` });
+  let replacement = null;
   try {
-    const origin = new URL(FINAL_PROVIDER_URL).origin;
-    const tabs = await chromeTabsQuery({ url: `${origin}/*` });
-    if (!tabs.length) {
-      const replacement = await chromeTabsCreate({ url: FINAL_PROVIDER_URL, active: true });
-      await waitForTabComplete(replacement.id);
-      return true;
+    // Keep the current Gemini tab alive until the replacement is fully loaded
+    // and its composer is usable. This prevents a failed navigation or a slow
+    // VPS from leaving automation without a working provider tab.
+    replacement = await chromeTabsCreate({ url: FINAL_PROVIDER_URL, active: true });
+    if (!replacement || !replacement.id) {
+      throw new Error("Chrome did not return a replacement Gemini tab.");
     }
+    await waitForTabComplete(replacement.id);
+    await waitForProviderReady(replacement.id);
 
-    const [primary, ...duplicates] = tabs;
-    primaryId = primary.id;
-    if (duplicates.length) {
-      await chromeTabsRemove(duplicates.map((tab) => tab.id));
+    const staleIds = oldTabs
+      .map((tab) => tab.id)
+      .filter((tabId) => tabId && tabId !== replacement.id);
+    if (staleIds.length) {
+      try {
+        await chromeTabsRemove(staleIds);
+      } catch (_cleanupError) {
+        // The replacement is ready. A tab may have been closed manually while
+        // it was loading, so cleanup failure must not discard the new tab.
+      }
     }
-
-    // Navigating directly to /app replaces the conversation document and frees
-    // its DOM without leaving the only Chrome tab stranded on about:blank if
-    // the extension worker or a small VPS is interrupted between navigations.
-    await chromeTabsUpdate(primary.id, { url: FINAL_PROVIDER_URL, active: true });
-    await waitForTabComplete(primary.id);
-    await waitForProviderReady(primary.id);
     return true;
   } catch (_error) {
-    try {
-      if (primaryId !== null) {
-        await chromeTabsUpdate(primaryId, { url: FINAL_PROVIDER_URL, active: true });
-        await waitForTabComplete(primaryId);
-        await waitForProviderReady(primaryId);
-        return true;
+    if (replacement && replacement.id) {
+      try {
+        await chromeTabsRemove([replacement.id]);
+      } catch (_cleanupError) {
+        // The failed replacement may already have been closed by Chrome.
       }
-      const replacement = await chromeTabsCreate({ url: FINAL_PROVIDER_URL, active: true });
-      await waitForTabComplete(replacement.id);
-      await waitForProviderReady(replacement.id);
-      return true;
-    } catch (_recoveryError) {
-      return false;
     }
+    const fallback = oldTabs.find((tab) => tab.id);
+    if (fallback) {
+      try {
+        await chromeTabsUpdate(fallback.id, { active: true });
+      } catch (_activationError) {
+        // Preserve the old tab whenever it still exists; the next job retries.
+      }
+    }
+    return false;
   }
 }
 

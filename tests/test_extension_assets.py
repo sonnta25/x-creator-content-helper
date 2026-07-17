@@ -32,6 +32,21 @@ def test_gemini_recovery_does_not_leave_the_only_tab_on_about_blank() -> None:
     assert "function injectedProviderReady()" in background_js
 
 
+def test_gemini_recycle_opens_ready_replacement_before_closing_old_tabs() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+    recycle = background_js.split("async function recycleProviderTab()", 1)[1].split(
+        "async function recycleProviderAfterFailure()", 1
+    )[0]
+
+    create_at = recycle.index("replacement = await chromeTabsCreate")
+    ready_at = recycle.index("await waitForProviderReady(replacement.id)")
+    remove_old_at = recycle.index("await chromeTabsRemove(staleIds)")
+    assert create_at < ready_at < remove_old_at
+    assert "const fallback = oldTabs.find" in recycle
+
+
 def test_gemini_job_error_is_reported_before_tab_recovery() -> None:
     background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
         encoding="utf-8"

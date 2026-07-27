@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 class Settings:
     telegram_bot_token: str
     content_provider: str = "extension_bridge"
-    generate_images: bool = True
+    generate_images: bool = False
     image_provider: str = "extension_bridge"
     telegram_caption_limit: int = 1024
     x_cookie: str = ""
@@ -20,17 +20,23 @@ class Settings:
     x_search_limit: int = 8
     x_search_product: str = "Top"
     x_post_char_limit: int = 2000
+    reply_target_min_author_followers: int = 50_000
+    reply_target_min_views: int = 500
     trend_sources: str = "x,google_trends,rss"
     google_trends_geo: str = "US"
     trend_rss_urls: str = ""
     hashtag_mode: str = "auto"
-    creator_niche: str = "AI tools, creator growth, and online business"
+    creator_niche: str = "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products"
     creator_voice: str = "witty, practical, dry, slightly contrarian, with a sharp creator POV"
-    target_audience: str = "Vietnamese X users, creators, founders, and indie hackers"
+    target_audience: str = "Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools"
     extension_bridge_host: str = "127.0.0.1"
     extension_bridge_port: int = 8765
     extension_bridge_token: str = "local-bridge-change-me"
-    extension_bridge_timeout_seconds: int = 300
+    extension_bridge_timeout_seconds: int = 360
+    telegram_approval_chat_id: int | None = None
+    telegram_reply_targets_minutes: int | None = None
+    telegram_reply_targets_updated_at: int | None = None
+    automation_approvals_path: str = ""
     gemini_image_prompt_prefix: str = (
         "Create one square realistic image for this social post. Return the image only, "
         "with no extra text."
@@ -46,7 +52,7 @@ class Settings:
                 "extension_bridge",
                 {"extension_bridge"},
             ),
-            generate_images=_bool_env("GENERATE_IMAGES", True),
+            generate_images=_bool_env("GENERATE_IMAGES", False),
             image_provider=_choice_env(
                 "IMAGE_PROVIDER",
                 "extension_bridge",
@@ -62,6 +68,10 @@ class Settings:
             x_search_limit=_int_env("X_SEARCH_LIMIT", 8),
             x_search_product=os.getenv("X_SEARCH_PRODUCT", "Top").strip() or "Top",
             x_post_char_limit=_int_env("X_POST_CHAR_LIMIT", 2000),
+            reply_target_min_author_followers=max(
+                0, _int_env("REPLY_TARGET_MIN_AUTHOR_FOLLOWERS", 50_000)
+            ),
+            reply_target_min_views=max(0, _int_env("REPLY_TARGET_MIN_VIEWS", 500)),
             trend_sources=os.getenv("TREND_SOURCES", "x,google_trends,rss").strip()
             or "x,google_trends,rss",
             google_trends_geo=os.getenv("GOOGLE_TRENDS_GEO", "US").strip() or "US",
@@ -69,9 +79,9 @@ class Settings:
             hashtag_mode=_choice_env("HASHTAG_MODE", "auto", {"none", "auto", "one"}),
             creator_niche=os.getenv(
                 "CREATOR_NICHE",
-                "AI tools, creator growth, and online business",
+                "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products",
             ).strip()
-            or "AI tools, creator growth, and online business",
+            or "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products",
             creator_voice=os.getenv(
                 "CREATOR_VOICE",
                 "witty, practical, dry, slightly contrarian, with a sharp creator POV",
@@ -79,9 +89,9 @@ class Settings:
             or "witty, practical, dry, slightly contrarian, with a sharp creator POV",
             target_audience=os.getenv(
                 "TARGET_AUDIENCE",
-                "Vietnamese X users, creators, founders, and indie hackers",
+                "Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools",
             ).strip()
-            or "Vietnamese X users, creators, founders, and indie hackers",
+            or "Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools",
             extension_bridge_host=os.getenv(
                 "EXTENSION_BRIDGE_HOST",
                 "127.0.0.1",
@@ -93,7 +103,19 @@ class Settings:
                 "local-bridge-change-me",
             ).strip()
             or "local-bridge-change-me",
-            extension_bridge_timeout_seconds=_int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 300),
+            extension_bridge_timeout_seconds=_int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 360),
+            telegram_approval_chat_id=_optional_int_env("TELEGRAM_APPROVAL_CHAT_ID"),
+            telegram_reply_targets_minutes=_optional_int_env(
+                "TELEGRAM_REPLY_TARGETS_MINUTES"
+            ),
+            telegram_reply_targets_updated_at=_optional_int_env(
+                "TELEGRAM_REPLY_TARGETS_UPDATED_AT"
+            ),
+            automation_approvals_path=os.getenv(
+                "AUTOMATION_APPROVALS_PATH",
+                "data/automation_approvals.json",
+            ).strip()
+            or "data/automation_approvals.json",
             gemini_image_prompt_prefix=(
                 os.getenv("GEMINI_IMAGE_PROMPT_PREFIX")
                 or os.getenv(
@@ -142,6 +164,16 @@ def _int_env(name: str, default: int) -> int:
     if value <= 0:
         raise RuntimeError(f"{name} must be positive, got {raw!r}")
     return value
+
+
+def _optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
 
 
 def _choice_env(name: str, default: str, choices: set[str]) -> str:

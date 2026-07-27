@@ -4,7 +4,9 @@ from src.config import Settings
 from src.models import XTrend
 from src.trend_source_service import (
     TrendSourceService,
+    google_news_search_rss_url,
     google_trends_rss_url,
+    niche_search_query,
     parse_rss_trend_signals,
     rank_trend_signals,
     summarize_trend_signals,
@@ -31,6 +33,40 @@ def test_google_trends_rss_url_sanitizes_geo() -> None:
     assert google_trends_rss_url("US<script>") == (
         "https://trends.google.com/trending/rss?geo=USscript"
     )
+
+
+def test_google_news_search_rss_url_uses_the_creator_niche() -> None:
+    url = google_news_search_rss_url("AI tools, creator growth", "US")
+
+    assert "q=AI+tools%2C+creator+growth" in url
+    assert "gl=US" in url
+
+
+def test_niche_search_query_splits_creator_niche_into_search_lanes() -> None:
+    query = niche_search_query("AI tools, creator growth and online business")
+
+    assert '"AI tools"' in query
+    assert '"creator growth"' in query
+    assert '"online business"' in query
+    assert " OR " in query
+    assert query.endswith("when:2d")
+
+
+def test_trend_source_service_collects_niche_news() -> None:
+    class TestService(TrendSourceService):
+        async def _fetch_text(self, url: str) -> str:
+            assert "rss/search" in url
+            assert "creator+growth" in url
+            return RSS_SAMPLE
+
+    settings = Settings(telegram_bot_token="123:ABC")
+    service = TestService(settings, XSearchService(settings))
+
+    signals, errors = asyncio.run(service.collect_niche("creator growth"))
+
+    assert errors == []
+    assert signals[0].source == "Niche Google News RSS"
+    assert signals[0].category == "niche"
 
 
 def test_parse_rss_trend_signals() -> None:
@@ -114,3 +150,39 @@ def test_trend_source_service_collects_x_and_rss() -> None:
         "Creator Feed",
         "X Trends",
     ]
+
+
+def test_trend_source_service_reuses_and_closes_http_client() -> None:
+    class FakeResponse:
+        text = RSS_SAMPLE
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+            self.closed = False
+
+        async def get(self, url: str):
+            self.urls.append(url)
+            return FakeResponse()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    async def exercise() -> None:
+        settings = Settings(telegram_bot_token="123:ABC")
+        service = TrendSourceService(settings, XSearchService(settings))
+        client = FakeClient()
+        service._http_client = client
+
+        await service._fetch_text("https://example.com/one")
+        await service._fetch_text("https://example.com/two")
+        await service.aclose()
+
+        assert client.urls == ["https://example.com/one", "https://example.com/two"]
+        assert client.closed is True
+        assert service._http_client is None
+
+    asyncio.run(exercise())

@@ -7,7 +7,7 @@ def test_settings_defaults() -> None:
     settings = Settings(telegram_bot_token="123:ABC")
 
     assert settings.content_provider == "extension_bridge"
-    assert settings.generate_images is True
+    assert settings.generate_images is False
     assert settings.image_provider == "extension_bridge"
     assert settings.x_cookie == ""
     assert settings.x_account_name == "telegram_bot"
@@ -15,19 +15,26 @@ def test_settings_defaults() -> None:
     assert settings.x_search_limit == 8
     assert settings.x_search_product == "Top"
     assert settings.x_post_char_limit == 2000
+    assert settings.reply_target_min_author_followers == 50_000
+    assert settings.reply_target_min_views == 500
     assert settings.trend_sources == "x,google_trends,rss"
     assert settings.google_trends_geo == "US"
     assert settings.trend_rss_urls == ""
     assert settings.hashtag_mode == "auto"
-    assert settings.creator_niche == "AI tools, creator growth, and online business"
+    assert "gold markets" in settings.creator_niche
+    assert "ChatGPT" in settings.creator_niche
     assert settings.creator_voice == (
         "witty, practical, dry, slightly contrarian, with a sharp creator POV"
     )
-    assert settings.target_audience == "Vietnamese X users, creators, founders, and indie hackers"
+    assert "Vietnamese retail investors" in settings.target_audience
     assert settings.extension_bridge_host == "127.0.0.1"
     assert settings.extension_bridge_port == 8765
     assert settings.extension_bridge_token == "local-bridge-change-me"
-    assert settings.extension_bridge_timeout_seconds == 300
+    assert settings.extension_bridge_timeout_seconds == 360
+    assert settings.telegram_approval_chat_id is None
+    assert settings.telegram_reply_targets_minutes is None
+    assert settings.telegram_reply_targets_updated_at is None
+    assert settings.automation_approvals_path == ""
     assert "square realistic image" in settings.gemini_image_prompt_prefix
     assert settings.grok_image_prompt_prefix == settings.gemini_image_prompt_prefix
 
@@ -35,7 +42,9 @@ def test_settings_defaults() -> None:
 def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_path) -> None:
     env_path = tmp_path / ".env"
     env_path.write_text(
-        "TELEGRAM_BOT_TOKEN=123:ABC\nGENERATE_IMAGES=true\nX_POST_CHAR_LIMIT=1800\n",
+        "TELEGRAM_BOT_TOKEN=123:ABC\nGENERATE_IMAGES=true\n"
+        "X_POST_CHAR_LIMIT=1800\nTELEGRAM_REPLY_TARGETS_MINUTES=45\n"
+        "TELEGRAM_REPLY_TARGETS_UPDATED_AT=123456789\n",
         encoding="utf-8-sig",
     )
     monkeypatch.chdir(tmp_path)
@@ -48,3 +57,5 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
     assert settings.telegram_bot_token == "123:ABC"
     assert settings.generate_images is True
     assert settings.x_post_char_limit == 1800
+    assert settings.telegram_reply_targets_minutes == 45
+    assert settings.telegram_reply_targets_updated_at == 123456789

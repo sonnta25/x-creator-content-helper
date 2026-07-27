@@ -4,9 +4,10 @@ import asyncio
 import base64
 import json
 import secrets
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
 
 from src.config import Settings
@@ -14,6 +15,25 @@ from src.extension_prompts import gemini_single_pass_prompt
 
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
+JOB_LEASE_SECONDS = 75
+
+
+class AutomationBridgeHandler(Protocol):
+    async def get_automation_config(self) -> dict[str, Any]: ...
+
+    async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def next_approved_action(self) -> dict[str, Any] | None: ...
+
+    async def finish_approved_action(
+        self,
+        approval_id: str,
+        *,
+        success: bool,
+        error: str = "",
+    ) -> None: ...
 
 
 @dataclass
@@ -24,6 +44,8 @@ class ExtensionBridgeJob:
     phase: str = "draft_pending"
     draft_prompt: str = ""
     final_prompt: str = ""
+    last_heartbeat_at: float = 0.0
+    claim_attempts: int = 0
     future: asyncio.Future[str | bytes] = field(default_factory=asyncio.Future)
 
 
@@ -33,6 +55,10 @@ class ExtensionBridgeServer:
         self._jobs: OrderedDict[str, ExtensionBridgeJob] = OrderedDict()
         self._server: asyncio.AbstractServer | None = None
         self._lock = asyncio.Lock()
+        self._automation_handler: AutomationBridgeHandler | None = None
+
+    def set_automation_handler(self, handler: AutomationBridgeHandler) -> None:
+        self._automation_handler = handler
 
     async def start(self) -> None:
         if self._server is not None:
@@ -155,6 +181,25 @@ class ExtensionBridgeServer:
         if path == "/jobs/next" and method == "GET":
             return await self._next_job()
 
+        if path == "/automation/config" and method == "GET":
+            handler = self._require_automation_handler()
+            return _json_response(200, await handler.get_automation_config())
+
+        if path == "/automation/triggers/replytargets" and method == "POST":
+            handler = self._require_automation_handler()
+            result = await handler.trigger_replytargets(_json_body(request["body"]))
+            return _json_response(202, result)
+
+        if path == "/automation/triggers/tweettrend3" and method == "POST":
+            handler = self._require_automation_handler()
+            result = await handler.trigger_tweettrend3(_json_body(request["body"]))
+            return _json_response(202, result)
+
+        if path == "/automation/approvals/next" and method == "GET":
+            handler = self._require_automation_handler()
+            action = await handler.next_approved_action()
+            return _json_response(200, {"action": action})
+
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[0] == "jobs":
             job_id = parts[1]
@@ -164,8 +209,31 @@ class ExtensionBridgeServer:
                 return await self._accept_result(job_id, payload)
             if action == "error" and method == "POST":
                 return await self._accept_error(job_id, payload)
+            if action == "heartbeat" and method == "POST":
+                return await self._accept_heartbeat(job_id)
+
+        if len(parts) == 4 and parts[:2] == ["automation", "approvals"]:
+            handler = self._require_automation_handler()
+            approval_id = parts[2]
+            action = parts[3]
+            payload = _json_body(request["body"])
+            if action == "complete" and method == "POST":
+                await handler.finish_approved_action(approval_id, success=True)
+                return _json_response(200, {"ok": True})
+            if action == "error" and method == "POST":
+                await handler.finish_approved_action(
+                    approval_id,
+                    success=False,
+                    error=str(payload.get("error", "")),
+                )
+                return _json_response(200, {"ok": True})
 
         return _json_response(404, {"error": "Not found."})
+
+    def _require_automation_handler(self) -> AutomationBridgeHandler:
+        if self._automation_handler is None:
+            raise RuntimeError("Automation is not ready. Start the Telegram bot first.")
+        return self._automation_handler
 
     def _authorized(self, query: dict[str, list[str]], headers: dict[str, str]) -> bool:
         expected = self.settings.extension_bridge_token
@@ -174,6 +242,20 @@ class ExtensionBridgeServer:
 
     async def _next_job(self) -> bytes:
         async with self._lock:
+            now = time.monotonic()
+            for candidate in self._jobs.values():
+                if (
+                    candidate.phase in {"draft_running", "final_running"}
+                    and candidate.last_heartbeat_at > 0
+                    and now - candidate.last_heartbeat_at > JOB_LEASE_SECONDS
+                    and not candidate.future.done()
+                ):
+                    candidate.phase = (
+                        "draft_pending"
+                        if candidate.phase == "draft_running"
+                        else "final_pending"
+                    )
+                    candidate.last_heartbeat_at = 0.0
             job = next(
                 (
                     candidate
@@ -188,6 +270,8 @@ class ExtensionBridgeServer:
                     if job.phase == "draft_pending"
                     else "final_running"
                 )
+                job.last_heartbeat_at = now
+                job.claim_attempts += 1
         if job is None:
             return _json_response(200, {"job": None})
         if job.kind == "image" or job.phase == "final_running":
@@ -244,6 +328,21 @@ class ExtensionBridgeServer:
             job.future.set_exception(RuntimeError(message))
         job.phase = "failed"
         return _json_response(200, {"ok": True})
+
+    async def _accept_heartbeat(self, job_id: str) -> bytes:
+        job = await self._job(job_id)
+        if job.future.done():
+            return _json_response(200, {"ok": True, "phase": job.phase})
+        if job.phase not in {"draft_running", "final_running"}:
+            return _json_response(
+                409,
+                {"error": f"Job is not running. Current phase: {job.phase}."},
+            )
+        job.last_heartbeat_at = time.monotonic()
+        return _json_response(
+            200,
+            {"ok": True, "phase": job.phase, "claim_attempts": job.claim_attempts},
+        )
 
     async def _job(self, job_id: str) -> ExtensionBridgeJob:
         async with self._lock:
@@ -349,10 +448,12 @@ def _empty_response(status: int) -> bytes:
 def _response_headers(status: int, content_type: str, length: int) -> bytes:
     reason = {
         200: "OK",
+        202: "Accepted",
         204: "No Content",
         400: "Bad Request",
         401: "Unauthorized",
         404: "Not Found",
+        409: "Conflict",
         500: "Internal Server Error",
     }.get(status, "OK")
     lines = [

@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import replace
+from datetime import UTC, datetime
 from io import BytesIO
+from typing import Any
+from urllib.parse import urlencode
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from src.ai_service import create_ai_service
+from src.automation import AutomationApproval, AutomationApprovalStore
 from src.config import Settings
 from src.env_store import update_env_value
 from src.models import GeneratedContent, ReplyTargetDraft, TrendPostVariant, XSearchResult
@@ -16,8 +27,6 @@ from src.trend_source_service import TrendSourceService, summarize_trend_signals
 from src.x_search_service import (
     MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
     MIN_REPLY_TARGET_VELOCITY_SCORE,
-    MIN_REPLY_TARGET_VIEW_COUNT,
-    REPLY_TARGET_SEARCH_LIMIT,
     TREND_FALLBACK_QUERIES,
     XSearchService,
     default_english_query,
@@ -33,15 +42,23 @@ LOGGER = logging.getLogger(__name__)
 
 AUTO_TREND_CATEGORIES = ("trending", "news", "entertainment", "sport")
 AUTO_REPLY_TARGET_FALLBACK_QUERIES = (
-    "AI",
-    "OpenAI",
-    "crypto",
+    "breaking news",
+    "politics",
     "business",
-    "technology",
     "sports",
     "entertainment",
+    "technology",
     "internet culture",
+    "crypto",
+    "AI",
 )
+REPLY_TARGET_MAX_CANDIDATES = 6
+REPLY_TARGET_RESULT_LIMIT = 12
+REPLY_TARGET_CONTEXT_ITEMS = 3
+REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
+REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
+TREND_CONTEXT_SIGNAL_ITEMS = 3
+TREND_CONTEXT_X_ITEMS = 4
 TWEETTREND_LANGUAGE_ALIASES = {
     "en": "English",
     "eng": "English",
@@ -54,20 +71,27 @@ TWEETTREND_LANGUAGE_ALIASES = {
     "tieng_viet": "Vietnamese",
 }
 
+
+class _SilentStatus:
+    async def edit_text(self, _text: str) -> None:
+        return None
+
 BOT_COMMANDS = [
     BotCommand("start", "Show help and available commands"),
     BotCommand("help", "Show help and available commands"),
-    BotCommand("tweet", "Generate a Vietnamese X post and image from a topic"),
+    BotCommand("tweet", "Generate a Vietnamese X post with an optional image"),
     BotCommand("tweetx", "Generate an English X post using live X search context"),
     BotCommand("tweettrend3", "Auto-pick or choose a trend and generate 3 Vietnamese posts"),
-    BotCommand("dailybrief", "Generate daily tweet options with images"),
-    BotCommand("retweet", "Remix an X post into an original tweet and image"),
+    BotCommand("dailybrief", "Generate daily tweet options with optional images"),
+    BotCommand("retweet", "Remix an X post with an optional image"),
     BotCommand("replytargets", "Auto-pick or search X posts to reply to"),
     BotCommand("persona", "Show or set creator niche, voice, and audience"),
     BotCommand("importcookie", "Save X auth_token and ct0 cookie for X search"),
     BotCommand("xaccounts", "Show imported X cookie accounts"),
     BotCommand("xremove", "Remove an imported X cookie account"),
     BotCommand("reply", "Generate a witty reply from tweet text or an X post link"),
+    BotCommand("automationhere", "Send scheduled approval requests to this chat"),
+    BotCommand("replyevery", "Set scheduled replytargets interval in minutes"),
 ]
 
 
@@ -78,19 +102,32 @@ class ContentBot:
         self.x_search = XSearchService(settings)
         self.trend_sources = TrendSourceService(settings, self.x_search)
         self._x_account_error_notices: dict[str, str] = {}
+        self.approvals = AutomationApprovalStore(settings.automation_approvals_path)
+        self.approval_chat_id = settings.telegram_approval_chat_id
+        self._application: Application | None = None
+        self._automation_running: set[str] = set()
+        self._automation_tasks: set[asyncio.Task[None]] = set()
 
     def build_application(self) -> Application:
         async def post_init(app: Application) -> None:
+            self._application = app
             await _set_bot_commands(app)
             bridge = getattr(self.ai, "bridge", None)
             if bridge is not None:
+                bridge.set_automation_handler(self)
                 await bridge.start()
 
         async def post_shutdown(app: Application) -> None:
             del app
+            for task in tuple(self._automation_tasks):
+                task.cancel()
+            if self._automation_tasks:
+                await asyncio.gather(*self._automation_tasks, return_exceptions=True)
             bridge = getattr(self.ai, "bridge", None)
             if bridge is not None:
                 await bridge.stop()
+            await self.trend_sources.aclose()
+            self._application = None
 
         app = (
             Application.builder()
@@ -112,26 +149,345 @@ class ContentBot:
         app.add_handler(CommandHandler("xaccounts", self.xaccounts))
         app.add_handler(CommandHandler("xremove", self.xremove))
         app.add_handler(CommandHandler("reply", self.reply))
+        app.add_handler(CommandHandler("automationhere", self.automationhere))
+        app.add_handler(CommandHandler("replyevery", self.replyevery))
+        app.add_handler(
+            CallbackQueryHandler(self.automation_approval, pattern=r"^automation:")
+        )
         return app
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
         await update.effective_message.reply_text(
             "Commands:\n"
-            "/tweet <topic> - generate a Vietnamese X post and image\n"
+            "/tweet <topic> - generate a Vietnamese X post with an optional image\n"
             "/tweetx <topic/search> - generate an English X post using live X context\n"
             "/tweettrend3 [auto|trending|news|sport|entertainment] - generate 3 Vietnamese trend angles\n"
-            "/dailybrief [trending|news|sport|entertainment] - generate daily tweets with images\n"
-            "/retweet <X post link> - remix an X post into an original tweet and image\n"
+            "/dailybrief [trending|news|sport|entertainment] - generate daily tweets with optional images\n"
+            "/retweet <X post link> - remix an X post with an optional image\n"
             "/replytargets [query] - auto-pick or search posts to reply to\n"
             "/persona - show or set niche, voice, and target audience\n"
             "/importcookie <auth_token=...; ct0=...> - save X cookie for search\n"
             "/xaccounts - show imported X cookie accounts\n"
             "/xremove <account_name> - remove an imported X cookie account\n"
             "/reply <tweet text or X post link> - generate a copy-ready reply\n"
+            "/automationhere - send scheduled approval requests to this chat\n"
+            "/replyevery <minutes> - set the scheduled /replytargets interval\n"
             "\n"
             "AI provider: Chrome extension bridge runs Gemini for all "
             "content commands."
+        )
+
+    async def automationhere(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text(
+                "For approval security, use /automationhere in a private chat with this bot."
+            )
+            return
+        self.approval_chat_id = int(chat.id)
+        self.settings = replace(
+            self.settings,
+            telegram_approval_chat_id=self.approval_chat_id,
+        )
+        update_env_value("TELEGRAM_APPROVAL_CHAT_ID", str(self.approval_chat_id))
+        await message.reply_text(
+            "Automation approvals will be sent to this chat.\n"
+            "Use /replyevery <minutes> to configure /replytargets from Telegram."
+        )
+
+    async def replyevery(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text("Use /replyevery in a private chat with this bot.")
+            return
+        if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
+            await message.reply_text(
+                "Only the chat configured with /automationhere can change this schedule."
+            )
+            return
+        if not context.args:
+            current = self.settings.telegram_reply_targets_minutes
+            value = f"{current} minutes" if current is not None else "Chrome extension setting"
+            await message.reply_text(
+                f"Current /replytargets interval: {value}.\n"
+                "Set it with /replyevery 30 (minimum 5 minutes)."
+            )
+            return
+        try:
+            minutes = int(context.args[0])
+        except (TypeError, ValueError):
+            await message.reply_text("Use a whole number, for example: /replyevery 30")
+            return
+        if minutes < 5 or minutes > 1440:
+            await message.reply_text("Interval must be between 5 and 1440 minutes.")
+            return
+        self.settings = replace(
+            self.settings,
+            telegram_reply_targets_minutes=minutes,
+            telegram_reply_targets_updated_at=int(datetime.now(UTC).timestamp() * 1000),
+        )
+        update_env_value("TELEGRAM_REPLY_TARGETS_MINUTES", str(minutes))
+        update_env_value(
+            "TELEGRAM_REPLY_TARGETS_UPDATED_AT",
+            str(self.settings.telegram_reply_targets_updated_at),
+        )
+        await message.reply_text(
+            f"Scheduled /replytargets interval set to {minutes} minutes. "
+            "Chrome will sync it within about 30 seconds."
+        )
+
+    async def get_automation_config(self) -> dict[str, Any]:
+        return {
+            "reply_targets_minutes": self.settings.telegram_reply_targets_minutes,
+            "reply_targets_updated_at": self.settings.telegram_reply_targets_updated_at,
+            "automation_running": bool(self._automation_running),
+        }
+
+    async def automation_approval(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        query = update.callback_query
+        if query is None or query.message is None:
+            return
+        parts = str(query.data or "").split(":", 2)
+        if len(parts) != 3 or parts[0] != "automation":
+            await query.answer("Invalid approval request.", show_alert=True)
+            return
+        decision, approval_id = parts[1], parts[2]
+        if decision not in {"approve", "mobile", "reject"}:
+            await query.answer("Unknown approval action.", show_alert=True)
+            return
+        answered = False
+        try:
+            approval = self.approvals.decide(
+                approval_id,
+                approve=decision in {"approve", "mobile"},
+                chat_id=query.message.chat.id,
+                user_id=query.from_user.id,
+                destination="mobile",
+            )
+            await query.answer()
+            answered = True
+            original = str(query.message.text or "").strip()
+            mobile_note = _mobile_approval_note(approval)
+            await query.edit_message_text(
+                (
+                    f"{original}\n\n{mobile_note}".strip()
+                    if approval.status == "mobile_approved"
+                    else f"{original}\n\nRejected."
+                ),
+                reply_markup=(
+                    _approval_keyboard(approval, include_decisions=False)
+                    if approval.status == "mobile_approved"
+                    else None
+                ),
+            )
+        except Exception as exc:
+            error = _friendly_error(exc)
+            if not answered:
+                await query.answer(error, show_alert=True)
+            else:
+                await query.message.reply_text(
+                    f"Approval was saved, but Telegram could not refresh this card: {error}\n"
+                    "Tap the approval button again to retry opening the mobile action."
+                )
+
+    async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]:
+        query = str(payload.get("query", "")).strip()
+        interval_minutes = _reply_target_interval_minutes(
+            payload.get("reply_targets_minutes"),
+            default=self.settings.telegram_reply_targets_minutes or 30,
+        )
+        return self._spawn_automation(
+            "replytargets",
+            lambda: self._run_scheduled_replytargets(query, interval_minutes),
+        )
+
+    async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]:
+        category = str(payload.get("category", "auto")).strip().lower() or "auto"
+        if category not in {"auto", "best", *AUTO_TREND_CATEGORIES}:
+            raise RuntimeError("tweettrend3 category must be auto, trending, news, sport, or entertainment.")
+        return self._spawn_automation(
+            "tweettrend3",
+            lambda: self._run_scheduled_tweettrend3(category),
+        )
+
+    async def next_approved_action(self) -> dict[str, Any] | None:
+        approval = self.approvals.claim_next()
+        return approval.as_extension_payload() if approval is not None else None
+
+    async def finish_approved_action(
+        self,
+        approval_id: str,
+        *,
+        success: bool,
+        error: str = "",
+    ) -> None:
+        approval = self.approvals.finish(
+            approval_id,
+            success=success,
+            error=error,
+        )
+        if self._application is None:
+            return
+        if success:
+            detail = "Reply draft" if approval.kind == "reply" else "Post draft"
+            text = f"{detail} opened and filled in X. Review it, then click the final X button."
+        else:
+            text = f"Could not fill the approved {approval.kind} in X: {error or 'unknown error'}"
+        await self._application.bot.send_message(chat_id=approval.chat_id, text=text)
+
+    def _spawn_automation(self, kind: str, factory) -> dict[str, Any]:
+        if self._application is None:
+            raise RuntimeError("Telegram bot is not ready.")
+        if self.approval_chat_id is None:
+            raise RuntimeError("No approval chat configured. Send /automationhere in Telegram first.")
+        if self._automation_running:
+            active = next(iter(self._automation_running))
+            return {
+                "ok": True,
+                "status": "already-running",
+                "kind": kind,
+                "active_kind": active,
+            }
+
+        self._automation_running.add(kind)
+
+        async def runner() -> None:
+            try:
+                await factory()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.exception("Scheduled %s failed", kind)
+                if self._application is not None and self.approval_chat_id is not None:
+                    await self._application.bot.send_message(
+                        chat_id=self.approval_chat_id,
+                        text=f"Scheduled /{kind} failed: {_friendly_error(exc)}",
+                    )
+            finally:
+                self._automation_running.discard(kind)
+
+        task = asyncio.create_task(runner(), name=f"automation-{kind}")
+        self._automation_tasks.add(task)
+        task.add_done_callback(self._automation_tasks.discard)
+        return {"ok": True, "status": "accepted", "kind": kind}
+
+    async def _run_scheduled_replytargets(
+        self,
+        query: str,
+        interval_minutes: int,
+    ) -> None:
+        if self._application is None or self.approval_chat_id is None:
+            raise RuntimeError("Automation chat is not ready.")
+        status = await self._application.bot.send_message(
+            chat_id=self.approval_chat_id,
+            text=(
+                "Scheduled /replytargets started.\n"
+                f"Freshness limit: {interval_minutes} minutes."
+            ),
+        )
+        try:
+            search_query, results, _auto_note = await self._get_reply_target_context(
+                query,
+                status,
+                interval_minutes=interval_minutes,
+            )
+            if not results:
+                await status.edit_text(_no_reply_targets_message(
+                    search_query,
+                    auto=not query,
+                    interval_minutes=interval_minutes,
+                ))
+                return
+            await status.edit_text(
+                f"Found {len(results)} fresh candidate(s). Generating reply drafts..."
+            )
+            drafts = await self.ai.generate_reply_targets(
+                search_query,
+                summarize_reply_target_context(results, max_items=REPLY_TARGET_CONTEXT_ITEMS),
+            )
+            sent = 0
+            for draft in drafts:
+                target_url = _format_reply_target_link(draft)
+                if self.approvals.has_active_target(target_url):
+                    continue
+                approval = self.approvals.create(
+                    kind="reply",
+                    text=_format_reply_target_reply(draft),
+                    chat_id=self.approval_chat_id,
+                    approver_user_id=self.approval_chat_id,
+                    target_url=target_url,
+                    target_label=draft.target,
+                )
+                await self._send_approval(approval, reason=draft.reason)
+                sent += 1
+            if sent:
+                await _delete_message_safely(status)
+            else:
+                await status.edit_text(
+                    "Scheduled /replytargets finished, but every returned target already "
+                    "has an active approval card."
+                )
+        except Exception:
+            await _delete_message_safely(status)
+            raise
+
+    async def _run_scheduled_tweettrend3(self, category: str) -> None:
+        if self._application is None or self.approval_chat_id is None:
+            raise RuntimeError("Automation chat is not ready.")
+        status = _SilentStatus()
+        contexts = await self._get_trend_contexts_for_tweettrend3(category, status)
+        for topic, x_context, source, selected_category in contexts:
+            generated = await self.ai.generate_trend_post(
+                topic,
+                x_context,
+                output_language="Vietnamese",
+            )
+            approval = self.approvals.create(
+                kind="post",
+                text=generated.text,
+                chat_id=self.approval_chat_id,
+                approver_user_id=self.approval_chat_id,
+                target_label=topic,
+            )
+            await self._send_approval(
+                approval,
+                reason=f"{source} - {selected_category} - {topic}",
+            )
+
+    async def _send_approval(
+        self,
+        approval: AutomationApproval,
+        *,
+        reason: str = "",
+    ) -> None:
+        if self._application is None:
+            raise RuntimeError("Telegram bot is not ready.")
+        body = _approval_message_text(approval, reason=reason)
+        await self._application.bot.send_message(
+            chat_id=approval.chat_id,
+            text=body[:4096],
+            reply_markup=_approval_keyboard(approval),
         )
 
     async def tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -157,46 +513,63 @@ class ContentBot:
 
         await message.chat.send_action(ChatAction.TYPING)
         status_text = (
-            "Finding the best hot X trend automatically..."
+            "Finding current trends around your creator niche..."
             if category in {"auto", "best"}
             else f"Finding hot X trends in {category}..."
         )
         status_text = f"{status_text}\nOutput language: Vietnamese"
         status = await message.reply_text(status_text)
         try:
-            if category in {"auto", "best"}:
-                topic, x_context, source, _results, category = await self._get_auto_trend_context(
-                    status
+            contexts = await self._get_trend_contexts_for_tweettrend3(category, status)
+            total = len(contexts)
+            approver_user_id = (
+                update.effective_user.id if update.effective_user is not None else message.chat.id
+            )
+            for index, (topic, x_context, source, selected_category) in enumerate(
+                contexts,
+                start=1,
+            ):
+                await status.edit_text(
+                    f"Generating topic {index}/{total} with Gemini...\n"
+                    f"Topic: {topic}\n"
+                    f"Language: {output_language}\n\n"
+                    "If extension Auto Run is OFF, open its popup and click Run next job."
                 )
-            else:
-                topic, x_context, source, _results = await self._get_trend_context(
-                    category,
-                    status,
+                generated = await self.ai.generate_trend_post(
+                    topic,
+                    x_context,
+                    output_language=output_language,
                 )
+                variant = TrendPostVariant(
+                    angle=topic,
+                    text=generated.text,
+                    hashtags=[],
+                    image_prompt=generated.image_prompt,
+                    score="",
+                )
+                approval = self.approvals.create(
+                    kind="post",
+                    text=_format_trend_variant_copy(variant),
+                    chat_id=message.chat.id,
+                    approver_user_id=approver_user_id,
+                    target_label=topic,
+                )
+                await self._send_trend_variant(
+                    message,
+                    variant,
+                    index,
+                    approval=approval,
+                    approval_reason=(
+                        f"{source} | {selected_category} | {variant.angle}"
+                    ),
+                )
+                if index < total:
+                    await status.edit_text(
+                        f"Sent topic {index}/{total}. Preparing Gemini job {index + 1}/{total}..."
+                    )
             await status.edit_text(
-                f"Writing 3 Vietnamese post options from: {topic}"
-            )
-            variants = await self.ai.generate_trend_post_variants(
-                topic,
-                x_context,
-                output_language=output_language,
-            )
-
-            await status.edit_text(
-                f"Source: {source}\n"
-                f"Category: {category}\n"
                 f"Language: {output_language}\n"
-                f"Topic: {topic}\n\n"
-                "Sending tweet options with images..."
-            )
-            for index, variant in enumerate(variants, start=1):
-                await self._send_trend_variant(message, variant, index)
-            await status.edit_text(
-                f"Source: {source}\n"
-                f"Category: {category}\n"
-                f"Language: {output_language}\n"
-                f"Topic: {topic}\n\n"
-                "Tweet options sent."
+                f"All {total} topic-based tweet drafts sent."
             )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
@@ -258,7 +631,7 @@ class ContentBot:
                 f"Source: {source}\n"
                 f"Category: {category}\n"
                 f"Topic: {topic}\n\n"
-                "Sending daily tweet options with images..."
+                "Sending daily tweet options with optional images..."
             )
             for index, variant in enumerate(variants, start=1):
                 await self._send_trend_variant(
@@ -295,7 +668,7 @@ class ContentBot:
             await status.edit_text("Writing a tweet from the X context...")
             generated = await self.ai.generate_topic_post_from_x_context(
                 topic,
-                summarize_x_context(results),
+                summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS),
             )
             await status.delete()
             await message.reply_text(f"Topic: {generated.topic}\n\nTweet:\n{generated.text}")
@@ -330,33 +703,57 @@ class ContentBot:
         query = " ".join(context.args).strip()
 
         await message.chat.send_action(ChatAction.TYPING)
+        interval_minutes = self.settings.telegram_reply_targets_minutes or 30
         status = await message.reply_text(
-            "Finding fast-moving reply targets from the last 30 minutes..."
+            f"Finding fast-moving reply targets from the last {interval_minutes} minutes..."
             if query
-            else "Auto-picking a hot topic, then finding reply targets from the last 30 minutes..."
+            else (
+                "Auto-picking a hot topic, then finding reply targets from the last "
+                f"{interval_minutes} minutes..."
+            )
         )
         try:
             search_query, results, auto_note = await self._get_reply_target_context(
                 query,
                 status,
+                interval_minutes=interval_minutes,
             )
             if not results:
-                await status.edit_text(_no_reply_targets_message(search_query, auto=not query))
+                await status.edit_text(
+                    _no_reply_targets_message(
+                        search_query,
+                        auto=not query,
+                        interval_minutes=interval_minutes,
+                    )
+                )
                 return
 
             await status.edit_text("Drafting high-signal replies...")
             drafts = await self.ai.generate_reply_targets(
                 search_query,
-                summarize_reply_target_context(results, max_items=5),
+                summarize_reply_target_context(
+                    results,
+                    max_items=REPLY_TARGET_CONTEXT_ITEMS,
+                ),
             )
-            await status.edit_text(
-                f"Reply targets for: {search_query}\n"
-                f"{auto_note}"
-                "Sending each reply and post link as separate messages..."
+            del auto_note
+            await status.delete()
+            approver_user_id = (
+                update.effective_user.id if update.effective_user is not None else message.chat.id
             )
             for draft in drafts:
-                await message.reply_text(_format_reply_target_reply(draft))
-                await message.reply_text(_format_reply_target_link(draft))
+                target_url = _format_reply_target_link(draft)
+                if self.approvals.has_active_target(target_url):
+                    continue
+                approval = self.approvals.create(
+                    kind="reply",
+                    text=_format_reply_target_reply(draft),
+                    chat_id=message.chat.id,
+                    approver_user_id=approver_user_id,
+                    target_url=target_url,
+                    target_label=draft.target,
+                )
+                await self._send_approval(approval, reason=draft.reason)
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -380,6 +777,7 @@ class ContentBot:
                 creator_voice=updates.get("voice", self.settings.creator_voice),
                 target_audience=updates.get("audience", self.settings.target_audience),
             )
+            await self.trend_sources.aclose()
             self.ai = create_ai_service(self.settings)
             self.x_search = XSearchService(self.settings)
             self.trend_sources = TrendSourceService(self.settings, self.x_search)
@@ -419,6 +817,7 @@ class ContentBot:
             if saved_name == self.settings.x_account_name:
                 update_env_value("X_COOKIE", cookie)
                 self.settings = replace(self.settings, x_cookie=cookie)
+                await self.trend_sources.aclose()
                 self.x_search = XSearchService(self.settings)
                 self.trend_sources = TrendSourceService(self.settings, self.x_search)
             await status.edit_text(
@@ -456,6 +855,7 @@ class ContentBot:
             if removed_name == self.settings.x_account_name:
                 update_env_value("X_COOKIE", "")
                 self.settings = replace(self.settings, x_cookie="")
+                await self.trend_sources.aclose()
                 self.x_search = XSearchService(self.settings)
                 self.trend_sources = TrendSourceService(self.settings, self.x_search)
             await status.edit_text(
@@ -526,7 +926,7 @@ class ContentBot:
                 )
             return (
                 f"hot X discussion in {category}",
-                summarize_x_context(results),
+                summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS),
                 f"X hot search fallback ({fallback_query})",
                 results,
             )
@@ -541,16 +941,20 @@ class ContentBot:
             search_query, results = await self.x_search.search_recent(
                 lead.title,
                 since_minutes=24 * 60,
-                limit=self.settings.x_search_limit,
+                limit=min(self.settings.x_search_limit, TREND_CONTEXT_X_ITEMS),
                 product="Latest",
             )
         except Exception as exc:
             errors.append(f"X enrichment: {exc}")
 
-        context_parts = [f"Multi-source trend context:\n{summarize_trend_signals(signals)}"]
+        context_parts = [
+            "Multi-source trend context:\n"
+            + summarize_trend_signals(signals, max_items=TREND_CONTEXT_SIGNAL_ITEMS)
+        ]
         if results:
             context_parts.append(
-                f"Recent X context for {search_query}:\n{summarize_x_context(results)}"
+                f"Recent X context for {search_query}:\n"
+                f"{summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS)}"
             )
         if errors:
             context_parts.append("Source notes:\n" + "\n".join(f"- {error}" for error in errors[-4:]))
@@ -593,68 +997,228 @@ class ContentBot:
             f"Details: {detail}"
         )
 
+    async def _get_trend_contexts_for_tweettrend3(
+        self,
+        category: str,
+        status,
+        count: int = 3,
+    ) -> list[tuple[str, str, str, str]]:
+        categories = AUTO_TREND_CATEGORIES if category in {"auto", "best"} else (category,)
+        candidates: list[tuple[Any, str, list[Any], list[str]]] = []
+
+        # Auto mode should find conversations in the configured content lane,
+        # not merely the largest general-interest trends of the day.
+        if category in {"auto", "best"}:
+            await status.edit_text(
+                f"Finding current trends around your niche: {self.settings.creator_niche}..."
+            )
+            niche_signals, niche_errors = await self.trend_sources.collect_niche(
+                self.settings.creator_niche
+            )
+            for signal in niche_signals:
+                candidates.append((signal, "niche", niche_signals, niche_errors))
+
+        niche_topic_count = len({_trend_topic_key(item[0].title) for item in candidates})
+        if niche_topic_count < count:
+            for selected_category in categories:
+                await status.edit_text(
+                    f"Scanning X, Google Trends, and RSS sources for {selected_category}..."
+                )
+                signals, errors = await self.trend_sources.collect(selected_category)
+                for signal in signals:
+                    candidates.append((signal, selected_category, signals, errors))
+
+        selected: list[tuple[Any, str, list[Any], list[str]]] = []
+        seen_topics: set[str] = set()
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (item[1] == "niche", item[0].score),
+            reverse=True,
+        ):
+            topic_key = _trend_topic_key(candidate[0].title)
+            if not topic_key or topic_key in seen_topics:
+                continue
+            seen_topics.add(topic_key)
+            selected.append(candidate)
+            if len(selected) == count:
+                break
+
+        contexts: list[tuple[str, str, str, str]] = []
+        for signal, selected_category, signals, errors in selected:
+            await status.edit_text(
+                f"Enriching trend {len(contexts) + 1}/{len(selected)}: {signal.title}"
+            )
+            search_query = ""
+            results: list[XSearchResult] = []
+            notes = list(errors)
+            try:
+                search_query, results = await self.x_search.search_recent(
+                    signal.title,
+                    since_minutes=24 * 60,
+                    limit=min(self.settings.x_search_limit, TREND_CONTEXT_X_ITEMS),
+                    product="Latest",
+                )
+            except Exception as exc:
+                notes.append(f"X enrichment: {exc}")
+
+            related_signals = [signal] + [item for item in signals if item != signal]
+            context_parts = [
+                "Multi-source trend context:\n"
+                + summarize_trend_signals(
+                    related_signals,
+                    max_items=TREND_CONTEXT_SIGNAL_ITEMS,
+                )
+            ]
+            if results:
+                context_parts.append(
+                    f"Recent X context for {search_query}:\n"
+                    f"{summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS)}"
+                )
+            if notes:
+                context_parts.append(
+                    "Source notes:\n" + "\n".join(f"- {note}" for note in notes[-4:])
+                )
+            contexts.append(
+                (
+                    signal.title,
+                    "\n\n".join(context_parts),
+                    f"multi-source trend scan ({signal.source})",
+                    selected_category,
+                )
+            )
+
+        if contexts:
+            return contexts
+
+        # A source outage may leave only the existing hot-X fallback. Keep that
+        # one useful topic rather than fabricating three copies of the same topic.
+        if category in {"auto", "best"}:
+            topic, x_context, source, _results, selected_category = await self._get_auto_trend_context(status)
+        else:
+            topic, x_context, source, _results = await self._get_trend_context(category, status)
+            selected_category = category
+        return [(topic, x_context, source, selected_category)]
+
     async def _get_reply_target_context(
         self,
         query: str,
         status,
+        *,
+        interval_minutes: int = 30,
     ) -> tuple[str, list[XSearchResult], str]:
-        if query:
-            search_query, results = await self._search_rank_reply_targets(query)
-            return search_query, results, ""
+        candidates = _dedupe_queries(
+            ([query] if query else []) + await self._auto_reply_target_queries()
+        )[:REPLY_TARGET_MAX_CANDIDATES]
+        last_search_query = query or "auto hot topics"
 
-        best_query = ""
-        best_results: list[XSearchResult] = []
-        tried: list[str] = []
-        for candidate in await self._auto_reply_target_queries():
-            if candidate in tried:
-                continue
-            tried.append(candidate)
+        searched: list[tuple[str, str, list[XSearchResult]]] = []
+        for candidate in candidates:
             await status.edit_text(
-                "Auto-picking reply targets...\n"
-                f"Trying: {candidate}"
+                "Finding a high-reach post from a large account...\n"
+                f"Trying: {candidate}\n"
+                f"Freshness limit: {interval_minutes} minutes"
             )
             try:
-                search_query, results = await self._search_rank_reply_targets(candidate)
+                search_query, recent_results = await asyncio.wait_for(
+                    self._search_reply_target_pool(
+                        candidate,
+                        interval_minutes=interval_minutes,
+                    ),
+                    timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
+                )
             except Exception:
                 continue
-            if not best_query:
-                best_query = search_query
-            if _reply_target_batch_score(results) > _reply_target_batch_score(best_results):
-                best_query = search_query
-                best_results = results
-            if len(best_results) >= 3 and _reply_target_batch_score(best_results) >= 20:
-                break
+            last_search_query = search_query
+            searched.append((candidate, search_query, recent_results))
+            results = self._rank_reply_target_pool(
+                recent_results,
+                interval_minutes=interval_minutes,
+                relaxed=False,
+            )
+            if results:
+                note = (
+                    "Auto-selected a different fresh topic.\n"
+                    if query and candidate != query
+                    else "Auto-selected topic.\n"
+                )
+                return search_query, results, note
 
-        auto_note = "Auto-selected topic.\n"
-        return best_query or "auto hot topics", best_results, auto_note
+        # Re-rank the same fetched posts with relaxed quality thresholds instead
+        # of repeating every X request. The configured interval remains a hard
+        # freshness ceiling even when engagement metadata is sparse.
+        for candidate, search_query, recent_results in searched:
+            results = self._rank_reply_target_pool(
+                recent_results,
+                interval_minutes=interval_minutes,
+                relaxed=True,
+            )
+            if results:
+                return search_query, results, "Auto-selected a fresh fallback topic.\n"
 
-    async def _search_rank_reply_targets(self, query: str) -> tuple[str, list[XSearchResult]]:
-        search_query, recent_results = await self.x_search.search_recent(
+        return last_search_query, [], ""
+
+    async def _search_reply_target_pool(
+        self,
+        query: str,
+        *,
+        interval_minutes: int,
+    ) -> tuple[str, list[XSearchResult]]:
+        freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
+        return await self.x_search.search_recent(
             query,
-            since_minutes=30,
-            limit=max(REPLY_TARGET_SEARCH_LIMIT, self.settings.x_search_limit),
-            product="Latest",
+            since_minutes=freshness_minutes,
+            limit=min(
+                REPLY_TARGET_RESULT_LIMIT,
+                max(self.settings.x_search_limit, 8),
+            ),
+            # Top + since_time lets X surface the strongest fresh distribution
+            # instead of returning a purely chronological stream of small posts.
+            product="Top",
         )
-        return search_query, rank_fast_growing_posts(
+
+    def _rank_reply_target_pool(
+        self,
+        recent_results: list[XSearchResult],
+        *,
+        relaxed: bool = False,
+        interval_minutes: int = 30,
+    ) -> list[XSearchResult]:
+        freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
+        ranked = rank_fast_growing_posts(
             recent_results,
             max_items=5,
-            max_age_minutes=30,
+            max_age_minutes=freshness_minutes,
+            min_engagement_score=0 if relaxed else MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
+            min_velocity_score=0 if relaxed else MIN_REPLY_TARGET_VELOCITY_SCORE,
+            # View count is a hard quality floor whenever X exposes it. Topic
+            # rotation may relax engagement and velocity, but must not promote
+            # a nearly unseen post merely because it is very new.
+            min_view_count=self.settings.reply_target_min_views,
+            min_author_followers=self.settings.reply_target_min_author_followers,
         )
+        unseen = [
+            result
+            for result in ranked
+            if not self.approvals.has_active_target(result.url)
+        ]
+        return unseen
 
     async def _auto_reply_target_queries(self) -> list[str]:
+        # /replytargets is deliberately independent from CREATOR_NICHE. Its job
+        # is reach discovery across today's largest conversations; niche-led
+        # discovery remains the responsibility of /tweettrend3.
         queries: list[str] = []
-        for category in AUTO_TREND_CATEGORIES:
-            try:
-                trends = await self.x_search.trends(category, limit=4)
-            except Exception:
-                trends = []
-            queries.extend(trend.name for trend in trends if trend.name)
+        try:
+            trends = await asyncio.wait_for(
+                self.x_search.trends("trending", limit=4),
+                timeout=REPLY_TARGET_TREND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            trends = []
+        queries.extend(trend.name for trend in trends if trend.name)
 
-        for category in AUTO_TREND_CATEGORIES:
-            queries.extend(TREND_FALLBACK_QUERIES.get(category, []))
         queries.extend(AUTO_REPLY_TARGET_FALLBACK_QUERIES)
-        queries.append(self.settings.creator_niche)
-        return _dedupe_queries(queries)[:16]
+        return _dedupe_queries(queries)[:12]
 
     async def _notify_x_account_errors(
         self,
@@ -706,9 +1270,14 @@ class ContentBot:
         variant: TrendPostVariant,
         index: int,
         label: str = "Option",
+        approval: AutomationApproval | None = None,
+        approval_reason: str = "",
     ) -> None:
         copy_text = _format_trend_variant_copy(variant)
-        await message.reply_text(copy_text)
+        if approval is None:
+            await message.reply_text(copy_text)
+        else:
+            await self._send_approval(approval, reason=approval_reason)
 
         if not self.settings.generate_images:
             return
@@ -763,17 +1332,107 @@ def _format_reply_target_link(draft: ReplyTargetDraft) -> str:
     return draft.url.strip()
 
 
+def _mobile_x_intent_url(approval: AutomationApproval) -> str:
+    params = {"text": approval.text}
+    if approval.kind == "reply":
+        tweet_id = extract_tweet_id(approval.target_url)
+        if tweet_id is not None:
+            params["in_reply_to"] = str(tweet_id)
+    return f"https://x.com/intent/tweet?{urlencode(params)}"
+
+
+# Vietnamese text grows substantially after URL encoding. Leave headroom below
+# Telegram's practical button URL limit instead of sending an invalid keyboard.
+MOBILE_X_INTENT_SAFE_LENGTH = 1800
+
+
+def _mobile_x_open_url(approval: AutomationApproval) -> str:
+    intent_url = _mobile_x_intent_url(approval)
+    if len(intent_url) <= MOBILE_X_INTENT_SAFE_LENGTH:
+        return intent_url
+    if approval.kind == "reply" and approval.target_url:
+        return approval.target_url
+    return "https://x.com/compose/post"
+
+
+def _mobile_approval_note(approval: AutomationApproval) -> str:
+    if _mobile_x_open_url(approval) == _mobile_x_intent_url(approval):
+        return "Approved. Tap Open X on phone to open the pre-filled draft."
+    return (
+        "Approved. The draft is too long for a safe X pre-fill link; copy it above, "
+        "then tap Open X on phone and paste it."
+    )
+
+
+def _approval_message_text(
+    approval: AutomationApproval,
+    *,
+    reason: str = "",
+) -> str:
+    if approval.kind == "reply":
+        return f"{approval.target_url}\n\n{approval.text}".strip()
+
+    context_lines = []
+    if approval.target_label:
+        context_lines.append(f"Topic: {approval.target_label}")
+    if reason:
+        context_lines.append(f"Source: {reason}")
+    context_text = "\n".join(context_lines)
+    return (
+        f"{context_text}\n\n{approval.text}\n\n"
+        "Approve on mobile to continue."
+    ).strip()
+
+
+def _approval_keyboard(
+    approval: AutomationApproval,
+    *,
+    include_decisions: bool = True,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if include_decisions:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Approve on mobile",
+                    callback_data=f"automation:mobile:{approval.id}",
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Open X on phone",
+                    url=_mobile_x_open_url(approval),
+                )
+            ]
+        )
+    final_row: list[InlineKeyboardButton] = []
+    if len(approval.text) <= 256:
+        final_row.append(
+            InlineKeyboardButton(
+                "Copy draft",
+                copy_text=CopyTextButton(approval.text),
+            )
+        )
+    if include_decisions:
+        final_row.append(
+            InlineKeyboardButton(
+                "Reject",
+                callback_data=f"automation:reject:{approval.id}",
+            )
+        )
+    if final_row:
+        rows.append(final_row)
+    return InlineKeyboardMarkup(rows)
+
+
 def _trend_context_score(
     candidate: tuple[str, str, str, list[XSearchResult], str],
 ) -> tuple[int, int]:
     _topic, x_context, _source, results, _category = candidate
     return len(results), len(x_context)
-
-
-def _reply_target_batch_score(results: list[XSearchResult]) -> float:
-    if not results:
-        return 0.0
-    return sum(result.velocity_score for result in results) + len(results)
 
 
 def _dedupe_queries(queries: list[str]) -> list[str]:
@@ -791,19 +1450,42 @@ def _dedupe_queries(queries: list[str]) -> list[str]:
     return deduped
 
 
-def _no_reply_targets_message(search_query: str, auto: bool) -> str:
+def _trend_topic_key(topic: str) -> str:
+    return " ".join(
+        part for part in "".join(char.lower() if char.isalnum() else " " for char in topic).split()
+        if len(part) > 2
+    )
+
+
+def _reply_target_interval_minutes(value: Any, *, default: int) -> int:
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        minutes = default
+    return min(1440, max(5, minutes))
+
+
+def _no_reply_targets_message(
+    search_query: str,
+    auto: bool,
+    interval_minutes: int = 30,
+) -> str:
+    freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
     intro = (
-        "No strong reply targets found while auto-scanning hot topics."
+        "No reply-ready posts found in the last "
+        f"{freshness_minutes} minutes after trying several topics."
         if auto
-        else f"No strong reply targets found in the last 30 minutes for: {search_query}"
+        else (
+            "No strong reply targets found in the last "
+            f"{freshness_minutes} minutes "
+            f"for: {search_query}"
+        )
     )
     return (
         f"{intro}\n\n"
-        f"Minimum quality: engagement score >= {MIN_REPLY_TARGET_ENGAGEMENT_SCORE:.0f}, "
-        f"velocity >= {MIN_REPLY_TARGET_VELOCITY_SCORE:.1f}/min, "
-        f"and views >= {MIN_REPLY_TARGET_VIEW_COUNT} when X exposes view count.\n\n"
-        "Try a specific topic if you want to loosen the search direction, for example "
-        "`/replytargets crypto` or `/replytargets entertainment`."
+        "The bot already changed topics and relaxed engagement thresholds without "
+        "accepting older posts. Check X cookies/account limits, then try again later "
+        "or use a specific topic such as `/replytargets crypto`."
     )
 
 

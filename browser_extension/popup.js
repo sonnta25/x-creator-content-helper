@@ -1,18 +1,37 @@
 const DEFAULTS = {
   bridgeUrl: "http://127.0.0.1:8765",
   token: "local-bridge-change-me",
-  timeoutSeconds: 300,
+  timeoutSeconds: 360,
   autoRun: false,
   pollSeconds: 30,
+  automationEnabled: false,
+  activeStart: "08:00",
+  activeEnd: "22:00",
+  replyTargetsMinutes: 30,
+  replyTargetsQuery: "",
+  trendTimes: "09:00,18:00",
+  trendCategory: "auto",
+  nextReplyTargetsAt: 0,
+  lastReplyTargetsTriggeredAt: 0,
+  replyTargetsConfigUpdatedAt: 0,
   lastStatus: "Ready."
 };
 
 const els = {
+  version: document.getElementById("version"),
   bridgeUrl: document.getElementById("bridgeUrl"),
   token: document.getElementById("token"),
   timeoutSeconds: document.getElementById("timeoutSeconds"),
   pollSeconds: document.getElementById("pollSeconds"),
   autoRun: document.getElementById("autoRun"),
+  automationEnabled: document.getElementById("automationEnabled"),
+  activeStart: document.getElementById("activeStart"),
+  activeEnd: document.getElementById("activeEnd"),
+  replyTargetsMinutes: document.getElementById("replyTargetsMinutes"),
+  replyTargetsQuery: document.getElementById("replyTargetsQuery"),
+  replyScheduleStatus: document.getElementById("replyScheduleStatus"),
+  trendTimes: document.getElementById("trendTimes"),
+  trendCategory: document.getElementById("trendCategory"),
   save: document.getElementById("save"),
   run: document.getElementById("run"),
   diagnoseGemini: document.getElementById("diagnoseGemini"),
@@ -22,6 +41,7 @@ const els = {
 let currentConfig = { ...DEFAULTS };
 
 document.addEventListener("DOMContentLoaded", async () => {
+  els.version.textContent = `v${chrome.runtime.getManifest().version}`;
   await refreshState();
 });
 
@@ -36,6 +56,14 @@ els.autoRun.addEventListener("click", async () => {
   await saveConfig(currentConfig);
   renderConfig(currentConfig);
   setStatus(currentConfig.autoRun ? "Auto Run is ON." : "Auto Run is OFF.");
+});
+
+els.automationEnabled.addEventListener("click", async () => {
+  currentConfig = readConfigFromForm();
+  currentConfig.automationEnabled = !currentConfig.automationEnabled;
+  await saveConfig(currentConfig);
+  renderConfig(currentConfig);
+  setStatus(currentConfig.automationEnabled ? "Scheduled approvals are ON." : "Scheduled approvals are OFF.");
 });
 
 els.run.addEventListener("click", async () => {
@@ -72,9 +100,18 @@ els.diagnoseGemini.addEventListener("click", async () => {
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "local") return;
+  if (areaName !== "local" && areaName !== "session") return;
   if (changes.lastStatus) {
     setStatus(changes.lastStatus.newValue || "");
+  }
+  if (areaName === "local" && (changes.nextReplyTargetsAt || changes.lastReplyTargetsTriggeredAt)) {
+    if (changes.nextReplyTargetsAt) {
+      currentConfig.nextReplyTargetsAt = Number(changes.nextReplyTargetsAt.newValue || 0);
+    }
+    if (changes.lastReplyTargetsTriggeredAt) {
+      currentConfig.lastReplyTargetsTriggeredAt = Number(changes.lastReplyTargetsTriggeredAt.newValue || 0);
+    }
+    renderReplyScheduleStatus(currentConfig);
   }
 });
 
@@ -109,9 +146,28 @@ function renderConfig(config) {
   els.token.value = config.token;
   els.timeoutSeconds.value = String(config.timeoutSeconds);
   els.pollSeconds.value = String(config.pollSeconds);
+  els.activeStart.value = config.activeStart;
+  els.activeEnd.value = config.activeEnd;
+  els.replyTargetsMinutes.value = String(config.replyTargetsMinutes);
+  els.replyTargetsQuery.value = config.replyTargetsQuery;
+  els.trendTimes.value = config.trendTimes;
+  els.trendCategory.value = config.trendCategory;
   els.autoRun.textContent = config.autoRun ? "ON" : "OFF";
   els.autoRun.classList.toggle("is-on", config.autoRun);
   els.autoRun.setAttribute("aria-pressed", config.autoRun ? "true" : "false");
+  els.automationEnabled.textContent = config.automationEnabled ? "ON" : "OFF";
+  els.automationEnabled.classList.toggle("is-on", config.automationEnabled);
+  els.automationEnabled.setAttribute("aria-pressed", config.automationEnabled ? "true" : "false");
+  renderReplyScheduleStatus(config);
+}
+
+function renderReplyScheduleStatus(config) {
+  const format = (timestamp) => timestamp
+    ? new Date(timestamp).toLocaleString()
+    : "not yet";
+  els.replyScheduleStatus.textContent = config.automationEnabled
+    ? `Last trigger: ${format(config.lastReplyTargetsTriggeredAt)} · Next run: ${format(config.nextReplyTargetsAt)}`
+    : "Automation is OFF; /replytargets will not run on a schedule.";
 }
 
 function readConfigFromForm() {
@@ -120,7 +176,18 @@ function readConfigFromForm() {
     token: els.token.value.trim() || DEFAULTS.token,
     timeoutSeconds: Math.max(30, Number(els.timeoutSeconds.value || DEFAULTS.timeoutSeconds)),
     pollSeconds: Math.max(30, Number(els.pollSeconds.value || DEFAULTS.pollSeconds)),
-    autoRun: Boolean(currentConfig.autoRun)
+    autoRun: Boolean(currentConfig.autoRun),
+    automationEnabled: Boolean(currentConfig.automationEnabled),
+    activeStart: els.activeStart.value || DEFAULTS.activeStart,
+    activeEnd: els.activeEnd.value || DEFAULTS.activeEnd,
+    replyTargetsMinutes: Math.max(5, Number(els.replyTargetsMinutes.value || DEFAULTS.replyTargetsMinutes)),
+    replyTargetsQuery: els.replyTargetsQuery.value.trim(),
+    trendTimes: els.trendTimes.value.trim() || DEFAULTS.trendTimes,
+    trendCategory: els.trendCategory.value || DEFAULTS.trendCategory,
+    nextReplyTargetsAt: Number(currentConfig.nextReplyTargetsAt || 0),
+    lastReplyTargetsTriggeredAt: Number(currentConfig.lastReplyTargetsTriggeredAt || 0),
+    replyTargetsConfigUpdatedAt: Number(currentConfig.replyTargetsConfigUpdatedAt || 0),
+    trendRunKeys: Array.isArray(currentConfig.trendRunKeys) ? currentConfig.trendRunKeys : []
   };
 }
 

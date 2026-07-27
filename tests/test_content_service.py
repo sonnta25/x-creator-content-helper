@@ -111,6 +111,18 @@ def test_tweet_engine_prompt_is_shared_for_tweet_family() -> None:
     assert "Editorial Visual Strategist rules for image_prompt" in prompt
 
 
+def test_tweet_engine_prompt_stays_compact_for_browser_bridge() -> None:
+    prompt = _tweet_engine_prompt(
+        Settings(telegram_bot_token="123:ABC"),
+        topic="AI tools for creator growth",
+        brief="Create one English X tweet.",
+        context="Recent X context:\n" + ("A short grounded trend signal. " * 100),
+        output_contract=_single_tweet_output_contract(),
+    )
+
+    assert len(prompt) < 7500
+
+
 def test_tweet_engine_prompt_can_request_vietnamese_output() -> None:
     prompt = _tweet_engine_prompt(
         Settings(telegram_bot_token="123:ABC"),
@@ -151,6 +163,98 @@ def test_trend_variants_stay_grounded_in_the_supplied_context() -> None:
     assert "Do not force a sports" in service.last_prompt
     assert "Treat the live X context as the factual boundary" in service.last_prompt
     assert "creator/founder lesson" not in service.last_prompt
+
+
+def test_single_trend_post_is_grounded_in_one_topic() -> None:
+    class CaptureTrendService(ContentService):
+        def __init__(self) -> None:
+            super().__init__(Settings(telegram_bot_token="123:ABC"))
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"text":"Pistons are trending.","topic":"Detroit Pistons",'
+                '"image_prompt":"realistic basketball arena"}'
+            )
+
+    service = CaptureTrendService()
+    generated = asyncio.run(
+        service.generate_trend_post(
+            "Detroit Pistons",
+            "Pistons won a Summer League game.",
+            "Vietnamese",
+        )
+    )
+
+    assert generated.topic == "Detroit Pistons"
+    assert "about this specific trend" in service.last_prompt
+
+
+def test_single_trend_post_recovers_when_gemini_omits_image_prompt() -> None:
+    class CaptureTrendService(ContentService):
+        async def _generate_text(self, _prompt: str) -> str:
+            return '{"post":"AI tool launches are getting cheaper.","title":"AI tools"}'
+
+    generated = asyncio.run(
+        CaptureTrendService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
+            "AI tools",
+            "Recent launch discussion.",
+            "Vietnamese",
+        )
+    )
+
+    assert generated.text == "AI tool launches are getting cheaper"
+    assert generated.topic == "AI tools"
+    assert "AI tools" in generated.image_prompt
+
+
+def test_single_trend_post_accepts_reported_gemini_json() -> None:
+    class ReportedGeminiService(ContentService):
+        async def _generate_text(self, _prompt: str) -> str:
+            return r'''
+            {
+              "text": "Đọc danh sách mấy token presale kiểu như memecoin AI hay đống dự án crypto mới định hình ra mắt tháng này thấy cứ lặp đi lặp lại.",
+              "image_prompt": "An authentic smartphone photo inside a cramped co-working space, showing a messy desk with a laptop displaying a crypto token dashboard, natural afternoon light, documentary style, no text, no logos.",
+              "topic": "Best Crypto Presales to Buy Now"
+            }
+            '''
+
+    generated = asyncio.run(
+        ReportedGeminiService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
+            "Best Crypto Presales to Buy Now",
+            "Recent crypto launch context.",
+            "Vietnamese",
+        )
+    )
+
+    assert generated.text.startswith("Đọc danh sách mấy token presale")
+    assert generated.topic == "Best Crypto Presales to Buy Now"
+
+
+def test_single_trend_post_unwraps_provider_response_object() -> None:
+    class WrappedGeminiService(ContentService):
+        async def _generate_text(self, _prompt: str) -> str:
+            return '''
+            {
+              "response": {
+                "text": "Một góc nhìn ngắn về thị trường crypto.",
+                "image_prompt": "A candid photo of a crypto trader at a messy desk.",
+                "topic": "Crypto market"
+              }
+            }
+            '''
+
+    generated = asyncio.run(
+        WrappedGeminiService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
+            "Crypto market",
+            "Recent crypto context.",
+            "Vietnamese",
+        )
+    )
+
+    assert generated.text == "Một góc nhìn ngắn về thị trường crypto"
+    assert generated.topic == "Crypto market"
 
 
 def test_editorial_visual_strategist_prompt_targets_real_photos() -> None:
@@ -257,6 +361,41 @@ def test_reply_prompt_requires_source_matched_natural_voice() -> None:
     assert "match the source post's language" in prompt
     assert "Do not force a clever jab" in prompt
     assert "one narrow reaction" in prompt
+
+
+def test_replytargets_prompt_does_not_force_creator_niche() -> None:
+    class ReplyTargetService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/large/status/1",'
+                '"target":"@large current event","reason":"High reach",'
+                '"reply":"That second-order effect is the part people are missing."}]}'
+            )
+
+    service = ReplyTargetService(
+        Settings(
+            telegram_bot_token="123:ABC",
+            creator_niche="gold and crypto only",
+            target_audience="gold investors only",
+        )
+    )
+    asyncio.run(
+        service.generate_reply_targets(
+            "NBA Finals",
+            "Candidate post about a basketball game",
+        )
+    )
+
+    assert "large accounts" in service.last_prompt
+    assert "Do not force the creator's content niche" in service.last_prompt
+    assert "gold and crypto only" not in service.last_prompt
+    assert "gold investors only" not in service.last_prompt
+    assert "readers already participating in the source post's conversation" in service.last_prompt
 
 
 def test_looks_like_prompt_leak_detects_user_reported_output() -> None:
@@ -434,6 +573,89 @@ def test_parse_reply_targets_accepts_common_browser_model_key_variants() -> None
 
     assert len(targets) == 1
     assert targets[0].url == "https://x.com/user/status/456"
+
+
+def test_parse_reply_targets_accepts_url_and_reply_field_variants() -> None:
+    targets = _parse_reply_targets(
+        """
+        {
+          "targets": [
+            {
+              "tweet_url": "https://x.com/large/status/789",
+              "target": "@large - current event",
+              "reason": "Large account with fast distribution.",
+              "draft_reply": "That timing changes the whole read."
+            }
+          ]
+        }
+        """,
+        allowed_urls=["https://x.com/large/status/789"],
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url == "https://x.com/large/status/789"
+    assert targets[0].reply == "That timing changes the whole read"
+
+
+def test_generate_reply_targets_repairs_an_empty_first_response() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return '{"targets":[]}'
+            return (
+                '{"targets":[{"url":"https://x.com/large/status/999",'
+                '"target":"@large - news","reason":"Fast distribution",'
+                '"reply":"That detail is doing more work than the headline."}]}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "breaking news",
+            "1. URL: https://x.com/large/status/999\nPost: Current event update",
+        )
+    )
+
+    assert len(service.prompts) == 2
+    assert "repairing an unusable reply-target response" in service.prompts[1]
+    assert targets[0].url == "https://x.com/large/status/999"
+
+
+def test_parse_reply_targets_recovers_all_items_from_unescaped_reply_quotes() -> None:
+    targets = _parse_reply_targets(
+        r'''
+        {
+          "targets": [
+            {
+              "url": "[https://x.com/NetflixKR/status/2076592469999792472](https://x.com/NetflixKR/status/2076592469999792472)",
+              "target": "@NetflixKR - Park Jihoon new movie release",
+              "target_audience": "Korean drama viewers",
+              "reason": "High velocity official Netflix account post.",
+              "reply": "준비물: 눈물 닦을 휴지 한 박스"
+            },
+            {
+              "url": "[https://x.com/Footballtweet/status/2076598196529180893](https://x.com/Footballtweet/status/2076598196529180893)",
+              "target": "@Footballtweet - Jose Mourinho Netflix documentary",
+              "target_audience": "Football fans",
+              "reason": "Mourinho content drives engagement.",
+              "reply": "If he doesnt say "I am a special one" in the first 5 minutes I am turning it off"
+            }
+          ]
+        }
+        '''
+    )
+
+    assert len(targets) == 2
+    assert targets[0].url == "https://x.com/NetflixKR/status/2076592469999792472"
+    assert targets[1].url == "https://x.com/Footballtweet/status/2076598196529180893"
+    assert targets[1].reply == (
+        'If he doesnt say "I am a special one" in the first 5 minutes I am turning it off'
+    )
 
 
 def test_parse_json_handles_multiple_objects_from_browser_output() -> None:

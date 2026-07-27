@@ -8,7 +8,7 @@
   </head>
   <body>
     <main>
-      <h1>X Content Bot Bridge v0.1.8</h1>
+      <h1>X Content Bot Bridge <span id="version"></span></h1>
 
       <label>
         Bridge URL
@@ -34,6 +34,55 @@
         <span>Auto Run</span>
         <button id="autoRun" class="toggle" type="button" aria-pressed="false">OFF</button>
       </div>
+
+      <section>
+        <h2>Scheduled approvals</h2>
+
+        <div class="toggle-row">
+          <span>Automation</span>
+          <button id="automationEnabled" class="toggle" type="button" aria-pressed="false">OFF</button>
+        </div>
+
+        <div class="two-columns">
+          <label>
+            Active from
+            <input id="activeStart" type="time">
+          </label>
+          <label>
+            Active until
+            <input id="activeEnd" type="time">
+          </label>
+        </div>
+
+        <label>
+          /replytargets interval + max post age (minutes)
+          <input id="replyTargetsMinutes" type="number" min="5" step="1">
+        </label>
+        <p id="replyScheduleStatus" class="hint"></p>
+
+        <label>
+          /replytargets query (optional)
+          <input id="replyTargetsQuery" spellcheck="false" placeholder="blank = auto">
+        </label>
+
+        <label>
+          /tweettrend3 fixed times
+          <input id="trendTimes" spellcheck="false" placeholder="09:00, 18:30">
+        </label>
+
+        <label>
+          /tweettrend3 category
+          <select id="trendCategory">
+            <option value="auto">auto</option>
+            <option value="trending">trending</option>
+            <option value="news">news</option>
+            <option value="sport">sport</option>
+            <option value="entertainment">entertainment</option>
+          </select>
+        </label>
+
+        <p class="hint">Send <code>/automationhere</code> once in the Telegram chat that should receive approvals.</p>
+      </section>
 
       <div class="actions">
         <button id="save">Save</button>

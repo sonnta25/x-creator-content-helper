@@ -5,20 +5,22 @@ Telegram bot for creating X/Twitter posts, replies, reply targets, multi-source 
 The current AI flow is:
 
 ```text
-Telegram bot -> local extension bridge -> Gemini draft -> Gemini final -> Telegram bot
+Telegram bot -> local extension bridge -> one Gemini job -> Telegram bot
 ```
 
-Gemini creates a first-pass draft using the existing analysis prompt, then Gemini humanizes/finalizes the output in a clean tab. Gemini also generates images through the Chrome extension. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
+Gemini produces each final draft in one browser job. The extension reuses one logged-in tab but starts a clean Gemini conversation for every job, preventing context from one command leaking into the next. It hard-recycles that tab after 10 successful jobs, or immediately after a provider/DOM failure, so a long-running VPS does not retain Gemini's old page heap indefinitely. Optional images use one additional Gemini job. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
 
 ## Commands
 
-- `/tweet <topic>`: create one Vietnamese long-form X post and image from a topic.
+- `/tweet <topic>`: create one Vietnamese long-form X post, with an optional image.
 - `/tweetx <topic/search>`: search X first, then create one long-form X post from live context.
-- `/tweettrend3 [auto|trending|news|sport|entertainment]`: scan X, Google Trends, and RSS, then create three Vietnamese long-form post options with images and hashtags.
+- `/tweettrend3 [auto|trending|news|sport|entertainment]`: in `auto` mode, find current topics around `CREATOR_NICHE` first, then create three Vietnamese posts with approval buttons.
 - `/dailybrief [trending|news|sport|entertainment]`: create daily-ready long-form post options from multi-source trend context.
-- `/retweet <X post link> | <visual description>`: remix a source X post into a fresh original tweet and image.
+- `/retweet <X post link> | <visual description>`: remix a source X post into a fresh original tweet with an optional image.
 - `/reply <tweet text or X post link>`: create one copy-ready text reply only.
-- `/replytargets [query]`: auto-pick a hot topic, or use your query, then find fresh X posts worth replying to; sends reply text and post link as separate messages.
+- `/automationhere`: use the current Telegram chat for scheduled approval requests.
+- `/replyevery <minutes>`: configure the scheduled `/replytargets` interval from Telegram (5-1440 minutes).
+- `/replytargets [query]`: scan broad current conversations for fresh high-distribution posts from large accounts, independently of `CREATOR_NICHE`; each result includes approval buttons.
 - `/importcookie [account_name] <auth_token=...; ct0=...>`: import an X cookie for search.
 - `/xaccounts`: list imported X cookie accounts without exposing cookies.
 - `/xremove <account_name>`: remove an imported X cookie account from the twscrape pool.
@@ -32,15 +34,19 @@ The bot registers these commands with Telegram on startup.
 2. Pick the option with the strongest originality and follow potential.
 3. Run `/replytargets` for auto mode, or `/replytargets <topic>` when you want a specific conversation lane.
 4. Use `/tweetx <topic>` when you want a post grounded in current X chatter.
-5. Use `/dailybrief news` when you need several ready-to-post ideas with images.
+5. Use `/dailybrief news` when you need several ready-to-post ideas, with optional images when enabled.
 
 X search commands add `lang:en` automatically unless your query already includes a `lang:` filter.
 
-`/tweettrend3` uses English/US trend context by default, but final post text is always written in natural Vietnamese. Image prompts remain English so Gemini image generation is more reliable.
+`/tweettrend3` auto mode searches current Google News topics using `CREATOR_NICHE` first, then falls back to broader X/Google/RSS trends only if fewer than three niche topics are available. `CREATOR_NICHE` does not constrain `/replytargets`. `/tweettrend3` uses English/US trend context by default, but final post text is always written in natural Vietnamese. Image prompts remain English so Gemini image generation is more reliable.
 
-`/tweettrend3` sends each post as its own copy-ready message, then sends the generated image separately. It does not include option labels or score metadata in the copy-ready post message.
+`/tweettrend3` selects three distinct trend topics, then sends one copy-ready post for each topic plus an image only when `GENERATE_IMAGES=true`. It does not include option labels or score metadata in the copy-ready post message.
 
-Trend commands scan X trends, Google Trends RSS, built-in Google News RSS feeds, and any custom RSS feeds from `TREND_RSS_URLS`. When X search is configured, the selected lead topic is enriched with recent X context from the last 24 hours. `/replytargets` focuses on recent posts from roughly the last 30 minutes and filters for stronger engagement/velocity when X exposes those metrics.
+Manual `/tweettrend3` creates Gemini jobs one topic at a time. Its Telegram status shows the current topic number and explicitly says when the job is waiting for the Chrome extension. With extension **Auto Run** OFF, click **Run next job** once for each queued topic; with **Auto Run** ON, the extension picks them up automatically on its polling interval.
+
+Extension `0.3.9` waits for Gemini's composer to be visible before inserting a prompt. It inserts the full prompt atomically, verifies at least 98% of the normalized text is present, and automatically retries with a DOM-safe fallback if Gemini replaces its editor node. If a Gemini job fails, it reports the failure to the bot before recycling the provider tab. Recycling opens a new Gemini tab, waits until its composer is ready, and only then closes the old Gemini tabs; if the replacement fails, the old tab is preserved. Auto Run alarms are verified whenever the service worker starts and by a one-minute watchdog. The open Gemini tab also wakes the worker every 25 seconds, so Auto Run keeps polling even if Chrome loses all extension alarms. Claimed jobs send a heartbeat; if Chrome or the worker dies, the bridge returns the abandoned job to the queue after 75 seconds.
+
+Trend commands scan X trends, Google Trends RSS, built-in Google News RSS feeds, and any custom RSS feeds from `TREND_RSS_URLS`. RSS requests reuse a small connection pool instead of opening a new TLS connection for every feed. When X search is configured, each selected topic is enriched with recent X context from the last 24 hours. `/replytargets` uses the configured schedule interval as a hard recent-post ceiling and filters for stronger engagement/velocity when X exposes those metrics.
 
 ## Setup
 
@@ -73,9 +79,9 @@ CONTENT_PROVIDER=extension_bridge
 EXTENSION_BRIDGE_HOST=127.0.0.1
 EXTENSION_BRIDGE_PORT=8765
 EXTENSION_BRIDGE_TOKEN=choose-a-private-token
-EXTENSION_BRIDGE_TIMEOUT_SECONDS=300
+EXTENSION_BRIDGE_TIMEOUT_SECONDS=360
 
-GENERATE_IMAGES=true
+GENERATE_IMAGES=false
 IMAGE_PROVIDER=extension_bridge
 GEMINI_IMAGE_PROMPT_PREFIX=Create one square realistic image for this social post. Return the image only, with no extra text.
 
@@ -84,6 +90,8 @@ X_ACCOUNT_NAME=telegram_bot
 X_ACCOUNTS_DB=data/twscrape_accounts.db
 X_SEARCH_LIMIT=8
 X_SEARCH_PRODUCT=Top
+REPLY_TARGET_MIN_AUTHOR_FOLLOWERS=50000
+REPLY_TARGET_MIN_VIEWS=500
 X_POST_CHAR_LIMIT=2000
 
 TREND_SOURCES=x,google_trends,rss
@@ -92,9 +100,9 @@ TREND_RSS_URLS=
 
 HASHTAG_MODE=auto
 
-CREATOR_NICHE=AI tools, creator growth, and online business
+CREATOR_NICHE=gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products
 CREATOR_VOICE=witty, practical, dry, slightly contrarian, with a sharp creator POV
-TARGET_AUDIENCE=Vietnamese X users, creators, founders, and indie hackers
+TARGET_AUDIENCE=Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools
 ```
 
 ## Chrome Extension
@@ -112,7 +120,69 @@ Use this when you have Gemini web access but no API keys.
    - Token: same value as `EXTENSION_BRIDGE_TOKEN`
    - Auto Run: ON if you want jobs to run automatically
 
-When Auto Run is OFF, click **Run next job** after sending a Telegram command. When Auto Run is ON, Chrome checks for pending jobs about every 30 seconds while Chrome is open.
+When Auto Run is OFF, click **Run next job** after sending a Telegram command. When Auto Run is ON, Chrome checks for pending jobs about every 30 seconds while Chrome is open. A watchdog recreates a missing alarm and the open Gemini tab sends a lightweight runtime heartbeat every 25 seconds, so restarting Chrome Lite or its extension worker does not silently leave jobs queued.
+
+Gemini prompts are compacted at the bot layer, then entered into one composer in 1,200-character chunks and submitted once. Each job starts a clean conversation in the same warm tab. After 10 completed Gemini jobs, the extension opens a fresh Gemini tab, waits for its composer, and then closes the old Gemini tabs to release their DOM/JavaScript heap. Provider timeouts and DOM failures trigger the same recycle immediately. Response DOM checks run every 2.5 seconds, and volatile status plus the recycle counter are kept in memory-backed session storage instead of being written repeatedly to the Chrome profile.
+
+### 2 GB RAM VPS mode
+
+For a 2-core / 2 GB Windows VPS, run Chrome with the included low-memory profile instead of your normal Chrome profile:
+
+```powershell
+.\scripts\windows\start-chrome-lite.ps1
+```
+
+It uses a separate profile, loads only this extension, disables GPU/background services, limits Chrome to two renderer processes, and caps disk cache at 16 MB (media cache 1 MB). Gemini stays in one warm tab, starts a clean conversation for every job, and hard-recycles the page every 10 jobs. On a 2-core VPS it also pins Chrome to one logical CPU at BelowNormal priority, so Chrome cannot saturate both cores. The bot runner no longer starts Ollama or any unused model service. A background watchdog checks every 30 seconds, reapplies the CPU limit, and relaunches this profile if Chrome exits. Sign in to Gemini once in that profile. Do not use headless mode: this bridge needs the visible Gemini web UI. Stop only this Chrome instance and its watchdog with:
+
+```powershell
+.\scripts\windows\stop-chrome-lite.ps1
+```
+
+If the VPS still kills Chrome, 2 GB is below a comfortable operating margin for Gemini's web UI; increase the Windows page file or move to 4 GB RAM for reliable scheduled runs.
+
+If Chrome disappears without an obvious Task Manager spike, run this on the VPS after it happens:
+
+```powershell
+.\scripts\windows\diagnose-chrome-lite.ps1
+```
+
+It writes a timestamped report under `logs/` with watchdog restart times, current Chrome processes, Windows resource-exhaustion events, Chrome crash/hang reports, Defender events, and Chrome Crashpad files. Run it with `-Hours 48` to inspect a longer period. If the watchdog shows a restart but Windows has no crash, resource, or Defender event, the VPS host/provider or another external policy is the likely source.
+
+### Scheduled Telegram approvals
+
+The extension can schedule content generation while keeping the final X action manual:
+
+1. Start the bot and send `/automationhere` in the Telegram chat that should receive approvals.
+2. Reload `browser_extension/` from `chrome://extensions` after updating the project.
+3. Open the extension popup and configure **Scheduled approvals**:
+   - **Active from / Active until**: the daily activity window, using the computer's local time. Overnight windows such as `22:00` to `02:00` are supported.
+   - **/replytargets interval + max post age**: interval in minutes and the hard maximum age of accepted posts; the minimum is 5 and the default is 30.
+   - **/replytargets query**: optional; leave blank for automatic topic selection.
+   - **/tweettrend3 fixed times**: comma-separated local times, for example `09:00, 13:30, 18:00`.
+   - **/tweettrend3 category**: `auto`, `trending`, `news`, `sport`, or `entertainment`.
+4. Turn **Automation** ON and keep Chrome, the Telegram bot, and the Gemini/X login sessions running.
+
+You can also change **/replytargets every** from the private Telegram approval chat with `/replyevery 30`. Every command writes a schedule revision, even when the numeric value did not change. The extension picks it up within about 30 seconds and resets the next run from that moment. The popup shows both **Last trigger** and **Next run** using the VPS local clock.
+
+For both manual `/replytargets` and `/tweettrend3` commands and their scheduled runs, Telegram sends each draft with **Approve on mobile** and **Reject** buttons. Only the Telegram user who requested a manual draft can approve it.
+
+`/replytargets` approval messages contain only the target X link and the copy-ready reply. A scheduled run immediately sends a short started/progress message, so source discovery cannot look like a missed schedule. Auto mode starts from current X trends and broad news, politics, business, sports, entertainment, technology, and internet-culture lanes; it does not start from `CREATOR_NICHE`. To keep small VPS CPU and twscrape database I/O predictable, each run uses one bounded hot-trend lookup, checks up to 6 topics, and fetches at most 12 Top results per topic. Trend discovery has a 20-second timeout and each X topic search has a 30-second timeout. Every topic is fetched only once: if strict engagement filters find nothing, the bot re-ranks those same results locally with relaxed engagement and velocity thresholds instead of querying X again. By default, candidates must come from accounts with at least 50,000 followers, and the 500-view minimum remains a hard floor whenever X exposes view count. Ranking prioritizes view velocity, follower reach, and engagement velocity. It keeps changing topics, but never accepts a post older than the configured `/replytargets every` interval.
+
+If Gemini returns an empty target array or changes common JSON field names, `/replytargets` normalizes the response and automatically queues one repair job using the same candidate URLs. Scheduled automation remains active while that repair job is pending, so the extension picks it up on the next automation check. If both attempts fail, the Telegram error includes short response previews for diagnosis.
+
+Mobile approval is deliberately two-step because one Telegram button cannot both record a callback and open another app:
+
+1. Tap **Approve on mobile**. The bot records the approval and removes the decision buttons.
+2. Tap **Open X on phone**. The official mobile-friendly X Web Intent opens the matching reply or post composer and pre-populates the draft when the URL is short enough. For a long post, Telegram rejects a URL containing the full encoded draft; the bot instead opens the X composer safely and keeps the draft above for you to copy and paste.
+
+Once a reply target is pending or approved, the bot skips the same target to avoid duplicate approval cards. This history is persisted in `data/automation_approvals.json`, so deduplication survives bot restarts.
+
+- **Open X on phone** uses the official mobile-friendly X Web Intent.
+- **Copy draft** uses Telegram's native clipboard button for drafts up to 256 characters. For longer drafts that cannot safely fit in an encoded X URL, copy the message text and paste it into the composer opened by **Open X on phone**.
+
+Review or edit the filled draft in X, then submit it yourself. A pending approval expires after 30 minutes. `Auto Run` still controls whether Gemini jobs from manually entered Telegram commands run automatically; when it is OFF, use **Run next job** before approving the returned draft.
+
+The first scheduled run may wait for the configured interval. While a scheduled workflow is active, automation processes one Gemini job per 30-second check, which keeps CPU use steadier on small VPS plans. When no scheduled workflow is active, it does not poll `/jobs/next`; manual commands still obey the separate `Auto Run` switch. Fixed `/tweettrend3` times are considered due for ten minutes, which allows for Chrome alarm delays or a briefly sleeping computer. Missed runs are not replayed in bulk.
 
 If Gemini asks for human verification, solve it manually in Chrome and run the job again. This bridge depends on the web UI, so reload the extension after changing files in `browser_extension/`.
 
@@ -237,6 +307,6 @@ sudo journalctl -u x-content-bot -n 100 --no-pager
 
 - `Missing required environment variable: TELEGRAM_BOT_TOKEN`: edit `.env` in the project root.
 - `Could not connect to the local Chrome extension bridge`: start the bot, open Chrome, confirm the extension Bridge URL/token match `.env`.
-- `Extension bridge timed out`: open the extension popup, click **Run next job**, or turn Auto Run ON.
+- `Extension bridge timed out`: verify extension `0.3.9` or newer is loaded and Auto Run is ON. The Gemini-tab heartbeat should wake Auto Run within 25 seconds, while the runtime watchdog recreates missing alarms; **Run next job** remains available for an immediate check.
 - `Missing image data`: reload the extension, keep the Gemini tab visible, and confirm Gemini generated an image in an `<img>` tag.
 - `No Google/RSS/X trend context found`: check internet access, RSS feed URLs, X cookies, or try a specific category like `/tweettrend3 news`.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from src.config import Settings
 from src.media_download_service import (
     MediaDownloadError,
     MediaDownloadService,
+    _rename_for_delivery,
     validate_media_url,
 )
 
@@ -88,15 +90,36 @@ def test_download_returns_file_and_applies_bounded_options() -> None:
     result = service.download("https://www.douyin.com/video/123")
 
     assert result.path.read_bytes() == b"video bytes"
+    assert result.path.name.startswith("creator-video-")
+    assert result.path.suffix == ".mp4"
     assert result.title == "Sample video"
     assert result.extractor == "Douyin"
+    assert captured["outtmpl"] == {"default": "download.%(ext)s"}
     assert captured["noplaylist"] is True
     assert captured["concurrent_fragment_downloads"] == 1
     assert str(12 * 1024 * 1024) in captured["format"]
+    assert captured["writeinfojson"] is False
+    assert captured["writethumbnail"] is False
+    assert captured["writesubtitles"] is False
 
     parent = result.path.parent
     result.cleanup()
     assert not parent.exists()
+
+
+def test_rename_for_delivery_removes_original_title_and_source_id(tmp_path) -> None:
+    original = tmp_path / "Original viral title-998877.mp4"
+    original.write_bytes(b"video")
+
+    renamed = _rename_for_delivery(
+        original,
+        now=datetime(2026, 7, 27, 10, 11, 12, tzinfo=UTC),
+        token="a1b2c3",
+    )
+
+    assert renamed.name == "creator-video-20260727-101112-a1b2c3.mp4"
+    assert renamed.read_bytes() == b"video"
+    assert not original.exists()
 
 
 def test_download_aborts_when_progress_exceeds_size_limit() -> None:

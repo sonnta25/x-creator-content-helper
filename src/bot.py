@@ -371,7 +371,9 @@ class ContentBot:
             )
             await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
             caption = _truncate_text(
-                f"{media.title}\n\nSource: {media.source_url}",
+                "Prepared video file\n\n"
+                f"Source reference: {media.source_url}\n"
+                "Only republish content you own or have permission to use.",
                 self.settings.telegram_caption_limit,
             )
             with media.path.open("rb") as document:

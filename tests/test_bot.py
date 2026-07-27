@@ -227,7 +227,7 @@ def test_format_file_size_is_human_readable() -> None:
 
 
 def test_download_command_sends_document_and_cleans_temp_file(tmp_path) -> None:
-    media_path = tmp_path / "sample.mp4"
+    media_path = tmp_path / "creator-video-20260727-101112-a1b2c3.mp4"
     media_path.write_bytes(b"downloaded video")
     downloaded = DownloadedMedia(
         path=media_path,
@@ -270,8 +270,10 @@ def test_download_command_sends_document_and_cleans_temp_file(tmp_path) -> None:
 
         async def reply_document(self, document, **kwargs):
             self.document_bytes = document.read()
-            assert kwargs["filename"] == "sample.mp4"
-            assert "Source:" in kwargs["caption"]
+            assert kwargs["filename"] == media_path.name
+            assert "Prepared video file" in kwargs["caption"]
+            assert "Source reference:" in kwargs["caption"]
+            assert "Sample" not in kwargs["caption"]
 
     bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     bot.media_downloader = FakeDownloader()

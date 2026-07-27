@@ -59,6 +59,14 @@ short-lived platform CDN link. The downloader supports sites handled by `yt-dlp`
 including common TikTok, Douyin, Xiaohongshu, Facebook, and X public-video URLs.
 Playlists are disabled.
 
+Delivered files use a neutral name such as
+`creator-video-20260727-101112-a1b2c3.mp4`; the source title and platform video ID
+are not used in the filename or Telegram caption. The downloader also disables
+description, info JSON, thumbnail, comment, and subtitle sidecar files. Telegram
+keeps the source URL in the message caption for permission and provenance checks,
+but it is not embedded in the delivered filename. These cleanup steps do not make
+copied content original or bypass copyright/reused-content checks.
+
 Downloads are processed one at a time, use a 180-second deadline, and default to a
 45 MB cap to stay below the public Telegram Bot API upload limit. Configure these in
 `.env`:

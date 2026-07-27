@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ipaddress
+import secrets
 import shutil
 import socket
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -73,7 +75,7 @@ class MediaDownloadService:
 
         options: dict[str, Any] = {
             "paths": {"home": str(workdir)},
-            "outtmpl": {"default": "%(title).70s-%(id)s.%(ext)s"},
+            "outtmpl": {"default": "download.%(ext)s"},
             "format": _format_selector(max_bytes),
             "noplaylist": True,
             "playlistend": 1,
@@ -85,6 +87,12 @@ class MediaDownloadService:
             "windowsfilenames": True,
             "overwrites": False,
             "continuedl": False,
+            "writedescription": False,
+            "writeinfojson": False,
+            "writethumbnail": False,
+            "writecomments": False,
+            "writesubtitles": False,
+            "writeautomaticsub": False,
             "socket_timeout": min(30, self.settings.download_timeout_seconds),
             "retries": 2,
             "fragment_retries": 2,
@@ -111,6 +119,7 @@ class MediaDownloadService:
             with factory(options) as downloader:
                 info = downloader.extract_info(normalized_url, download=True)
             path = _downloaded_file(workdir)
+            path = _rename_for_delivery(path)
             if path.stat().st_size > max_bytes:
                 raise MediaDownloadError(
                     f"Video is larger than the {self.settings.download_max_file_mb} MB limit."
@@ -232,6 +241,25 @@ def _downloaded_file(workdir: Path) -> Path:
     if not candidates:
         raise MediaDownloadError("The website returned no downloadable video file.")
     return max(candidates, key=lambda path: path.stat().st_size)
+
+
+def _rename_for_delivery(
+    path: Path,
+    *,
+    now: datetime | None = None,
+    token: str | None = None,
+) -> Path:
+    timestamp = (now or datetime.now(UTC)).astimezone(UTC).strftime("%Y%m%d-%H%M%S")
+    random_token = (token or secrets.token_hex(3)).lower()
+    clean_token = "".join(character for character in random_token if character.isalnum())[:12]
+    if not clean_token:
+        clean_token = secrets.token_hex(3)
+    suffix = path.suffix.lower()
+    if not suffix.startswith(".") or not suffix[1:].isalnum():
+        suffix = ".mp4"
+    target = path.with_name(f"creator-video-{timestamp}-{clean_token}{suffix}")
+    path.replace(target)
+    return target
 
 
 def _single_video_info(info: Any) -> dict[str, Any]:

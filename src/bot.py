@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import replace
 from datetime import UTC, datetime
 from io import BytesIO
@@ -22,6 +23,11 @@ from src.ai_service import create_ai_service
 from src.automation import AutomationApproval, AutomationApprovalStore
 from src.config import Settings
 from src.env_store import update_env_value
+from src.media_download_service import (
+    DownloadedMedia,
+    MediaDownloadError,
+    MediaDownloadService,
+)
 from src.models import GeneratedContent, ReplyTargetDraft, TrendPostVariant, XSearchResult
 from src.trend_source_service import TrendSourceService, summarize_trend_signals
 from src.x_search_service import (
@@ -79,6 +85,7 @@ class _SilentStatus:
 BOT_COMMANDS = [
     BotCommand("start", "Show help and available commands"),
     BotCommand("help", "Show help and available commands"),
+    BotCommand("download", "Download a public social video to Telegram"),
     BotCommand("tweet", "Generate a Vietnamese X post with an optional image"),
     BotCommand("tweetx", "Generate an English X post using live X search context"),
     BotCommand("tweettrend3", "Auto-pick or choose a trend and generate 3 Vietnamese posts"),
@@ -101,6 +108,8 @@ class ContentBot:
         self.ai = create_ai_service(settings)
         self.x_search = XSearchService(settings)
         self.trend_sources = TrendSourceService(settings, self.x_search)
+        self.media_downloader = MediaDownloadService(settings)
+        self._download_semaphore = asyncio.Semaphore(1)
         self._x_account_error_notices: dict[str, str] = {}
         self.approvals = AutomationApprovalStore(settings.automation_approvals_path)
         self.approval_chat_id = settings.telegram_approval_chat_id
@@ -138,6 +147,7 @@ class ContentBot:
         )
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("help", self.start))
+        app.add_handler(CommandHandler("download", self.download))
         app.add_handler(CommandHandler("tweet", self.tweet))
         app.add_handler(CommandHandler("tweetx", self.tweetx))
         app.add_handler(CommandHandler("tweettrend3", self.tweettrend3))
@@ -160,6 +170,7 @@ class ContentBot:
         del context
         await update.effective_message.reply_text(
             "Commands:\n"
+            "/download <video URL> - download a public social video to this chat\n"
             "/tweet <topic> - generate a Vietnamese X post with an optional image\n"
             "/tweetx <topic/search> - generate an English X post using live X context\n"
             "/tweettrend3 [auto|trending|news|sport|entertainment] - generate 3 Vietnamese trend angles\n"
@@ -177,6 +188,60 @@ class ContentBot:
             "AI provider: Chrome extension bridge runs Gemini for all "
             "content commands."
         )
+
+    async def download(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        source_url = _extract_media_url(_command_payload(message, context))
+        if not source_url:
+            await message.reply_text(
+                "Usage: /download <video URL>\n"
+                "Example: /download https://www.tiktok.com/@creator/video/123\n\n"
+                "Supported when yt-dlp can read the public URL, including TikTok, "
+                "Douyin, Xiaohongshu, Facebook, and X."
+            )
+            return
+
+        status = await message.reply_text("Downloading the video...")
+        media: DownloadedMedia | None = None
+        try:
+            async with self._download_semaphore:
+                media = await asyncio.to_thread(self.media_downloader.download, source_url)
+            await status.edit_text(
+                f"Downloaded {_format_file_size(media.size_bytes)}. Sending it to Telegram..."
+            )
+            await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            caption = _truncate_text(
+                f"{media.title}\n\nSource: {media.source_url}",
+                self.settings.telegram_caption_limit,
+            )
+            with media.path.open("rb") as document:
+                await message.reply_document(
+                    document=document,
+                    filename=media.path.name,
+                    caption=caption,
+                    read_timeout=60,
+                    write_timeout=300,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+            await status.delete()
+        except MediaDownloadError as exc:
+            await status.edit_text(f"Download failed: {exc}")
+        except Exception as exc:
+            if media is None:
+                await status.edit_text(_friendly_error(exc))
+            else:
+                await status.edit_text(
+                    "The video was downloaded, but Telegram could not send the file. "
+                    f"Details: {_exception_detail(exc)}"
+                )
+        finally:
+            if media is not None:
+                await asyncio.to_thread(media.cleanup)
 
     async def automationhere(
         self,
@@ -1510,6 +1575,28 @@ def _command_payload(message, context: ContextTypes.DEFAULT_TYPE) -> str:
         if len(parts) > 1:
             return parts[1].strip()
     return " ".join(context.args).strip()
+
+
+def _extract_media_url(raw_args: str) -> str:
+    match = re.search(r"https?://[^\s<>\"']+", raw_args, flags=re.IGNORECASE)
+    if match is None:
+        return ""
+    return match.group(0).rstrip(".,;:!?)]}")
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _format_file_size(size_bytes: int) -> str:
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb >= 1:
+        return f"{size_mb:.1f} MB"
+    return f"{max(1, round(size_bytes / 1024))} KB"
 
 
 def _parse_retweet_args(raw_args: str) -> tuple[str, str]:

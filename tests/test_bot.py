@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -9,6 +10,8 @@ from src.bot import (
     ContentBot,
     _dedupe_queries,
     _exception_detail,
+    _extract_media_url,
+    _format_file_size,
     _friendly_error,
     _format_reply_target_link,
     _format_reply_target_reply,
@@ -28,8 +31,15 @@ from src.bot import (
     _x_account_error_notifications,
 )
 from src.config import Settings
-from src.models import GeneratedContent
-from src.models import ReplyTargetDraft, TrendPostVariant, TrendSignal, XSearchResult, XTrend
+from src.media_download_service import DownloadedMedia
+from src.models import (
+    GeneratedContent,
+    ReplyTargetDraft,
+    TrendPostVariant,
+    TrendSignal,
+    XSearchResult,
+    XTrend,
+)
 
 
 def test_parse_importcookie_args_default_account() -> None:
@@ -97,6 +107,78 @@ def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
     assert {"vntweet", "angles", "xsearch"}.isdisjoint(commands)
     assert {"tweet", "tweettrend3", "tweetx", "dailybrief", "retweet", "reply"}.issubset(commands)
     assert "replyevery" in commands
+    assert "download" in commands
+
+
+def test_extract_media_url_accepts_share_text_and_trims_punctuation() -> None:
+    assert _extract_media_url(
+        "Check this video https://v.douyin.com/example/?share=1)."
+    ) == "https://v.douyin.com/example/?share=1"
+
+
+def test_format_file_size_is_human_readable() -> None:
+    assert _format_file_size(512) == "1 KB"
+    assert _format_file_size(3 * 1024 * 1024) == "3.0 MB"
+
+
+def test_download_command_sends_document_and_cleans_temp_file(tmp_path) -> None:
+    media_path = tmp_path / "sample.mp4"
+    media_path.write_bytes(b"downloaded video")
+    downloaded = DownloadedMedia(
+        path=media_path,
+        title="Sample",
+        source_url="https://www.tiktok.com/@creator/video/123",
+        extractor="TikTok",
+    )
+
+    class FakeDownloader:
+        def download(self, url):
+            assert url == downloaded.source_url
+            return downloaded
+
+    class FakeChat:
+        async def send_action(self, action):
+            assert action
+
+    class FakeStatus:
+        def __init__(self):
+            self.edits = []
+            self.deleted = False
+
+        async def edit_text(self, text):
+            self.edits.append(text)
+
+        async def delete(self):
+            self.deleted = True
+
+    class FakeDownloadMessage:
+        def __init__(self):
+            self.text = f"/download {downloaded.source_url}"
+            self.caption = None
+            self.chat = FakeChat()
+            self.status = FakeStatus()
+            self.document_bytes = b""
+
+        async def reply_text(self, text):
+            assert text == "Downloading the video..."
+            return self.status
+
+        async def reply_document(self, document, **kwargs):
+            self.document_bytes = document.read()
+            assert kwargs["filename"] == "sample.mp4"
+            assert "Source:" in kwargs["caption"]
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    bot.media_downloader = FakeDownloader()
+    message = FakeDownloadMessage()
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(args=[downloaded.source_url])
+
+    asyncio.run(bot.download(update, context))
+
+    assert message.document_bytes == b"downloaded video"
+    assert message.status.deleted is True
+    assert not media_path.exists()
 
 
 def test_automation_config_exposes_telegram_reply_interval() -> None:

@@ -12,6 +12,7 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 
 ## Commands
 
+- `/download <video URL>`: download one public video and send it back as a Telegram file.
 - `/tweet <topic>`: create one Vietnamese long-form X post, with an optional image.
 - `/tweetx <topic/search>`: search X first, then create one long-form X post from live context.
 - `/tweettrend3 [auto|trending|news|sport|entertainment]`: in `auto` mode, find current topics around `CREATOR_NICHE` first, then create three Vietnamese posts with approval buttons.
@@ -27,6 +28,35 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 - `/persona`: show or update creator niche, voice, and audience.
 
 The bot registers these commands with Telegram on startup.
+
+### Video downloads
+
+Send a public video link:
+
+```text
+/download https://www.tiktok.com/@creator/video/123
+```
+
+The bot downloads one video and uploads it to the same Telegram chat as a document,
+so the file can be saved directly to a phone or computer without relying on a
+short-lived platform CDN link. The downloader supports sites handled by `yt-dlp`,
+including common TikTok, Douyin, Xiaohongshu, Facebook, and X public-video URLs.
+Playlists are disabled.
+
+Downloads are processed one at a time, use a 180-second deadline, and default to a
+45 MB cap to stay below the public Telegram Bot API upload limit. Configure these in
+`.env`:
+
+```env
+DOWNLOAD_MAX_FILE_MB=45
+DOWNLOAD_TIMEOUT_SECONDS=180
+DOWNLOAD_COOKIES_FILE=
+```
+
+Some private, age-gated, regional, or anti-bot-protected videos require cookies.
+Export a Netscape-format cookie file on the bot machine and set
+`DOWNLOAD_COOKIES_FILE` to its path. Cookie freshness, CAPTCHA, and upstream site
+changes can still make a URL fail. Only download content you are authorized to save.
 
 ## Creator Flow
 
@@ -59,6 +89,15 @@ pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
+`start.ps1` compares `pyproject.toml` with the dependencies installed in `.venv`.
+After extracting an updated ZIP over an existing installation, starting the bot
+automatically installs newly added packages such as `yt-dlp` before checking or
+launching the polling process:
+
+```powershell
+.\scripts\windows\start.ps1
+```
+
 ### Ubuntu
 
 ```bash
@@ -74,6 +113,10 @@ Edit `.env`:
 
 ```env
 TELEGRAM_BOT_TOKEN=...
+
+DOWNLOAD_MAX_FILE_MB=45
+DOWNLOAD_TIMEOUT_SECONDS=180
+DOWNLOAD_COOKIES_FILE=
 
 CONTENT_PROVIDER=extension_bridge
 EXTENSION_BRIDGE_HOST=127.0.0.1

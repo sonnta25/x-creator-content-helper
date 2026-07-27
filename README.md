@@ -26,8 +26,24 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 - `/xaccounts`: list imported X cookie accounts without exposing cookies.
 - `/xremove <account_name>`: remove an imported X cookie account from the twscrape pool.
 - `/persona`: show or update creator niche, voice, and audience.
+- `/cancel`: cancel a command that is waiting for input.
 
 The bot registers these commands with Telegram on startup.
+
+### Two-step command input
+
+Commands that need input no longer run immediately when selected from Telegram's
+command menu. Select `/download`, `/tweet`, `/tweetx`, `/retweet`, `/replytargets`,
+`/reply`, `/persona`, `/importcookie`, `/xremove`, or `/replyevery`, and the bot
+opens a reply field with a short prompt. Send the requested value as the next
+message to run the command.
+
+The direct form still works, for example `/tweet AI agents` or
+`/download https://...`. Pending input is isolated per chat and Telegram user,
+expires after five minutes, and can be stopped with `/cancel`. Selecting a
+different command replaces the previous pending request. Use `auto` when the
+`/replytargets` prompt should choose its own topic, and `show` to inspect
+`/persona` or `/replyevery`.
 
 ### Video downloads
 

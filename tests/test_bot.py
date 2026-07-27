@@ -4,10 +4,12 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from telegram import ForceReply
 
 from src.bot import (
     BOT_COMMANDS,
     ContentBot,
+    _command_payload,
     _dedupe_queries,
     _exception_detail,
     _extract_media_url,
@@ -108,6 +110,109 @@ def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
     assert {"tweet", "tweettrend3", "tweetx", "dailybrief", "retweet", "reply"}.issubset(commands)
     assert "replyevery" in commands
     assert "download" in commands
+    assert "cancel" in commands
+
+
+def test_command_payload_preserves_plain_follow_up_text() -> None:
+    message = SimpleNamespace(
+        text="https://www.tiktok.com/@creator/video/123",
+        caption=None,
+    )
+
+    assert _command_payload(message, SimpleNamespace(args=[])) == message.text
+
+
+def test_download_without_url_waits_for_next_message() -> None:
+    class FakeMessage:
+        text = "/download"
+        caption = None
+
+        def __init__(self):
+            self.reply_markup = None
+
+        async def reply_text(self, text, **kwargs):
+            assert "Send /cancel to stop." in text
+            self.reply_markup = kwargs["reply_markup"]
+            return SimpleNamespace(message_id=91)
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_chat=SimpleNamespace(id=10, type="private"),
+        effective_user=SimpleNamespace(id=20),
+    )
+
+    asyncio.run(bot.download(update, SimpleNamespace(args=[])))
+
+    assert isinstance(message.reply_markup, ForceReply)
+    assert bot._pending_inputs[(10, 20)].command == "download"
+    assert bot._pending_inputs[(10, 20)].prompt_message_id == 91
+
+
+def test_pending_text_runs_the_selected_command_then_clears_state() -> None:
+    class FakePromptMessage:
+        text = "/download"
+        caption = None
+
+        async def reply_text(self, _text, **_kwargs):
+            return SimpleNamespace(message_id=92)
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    identity = {
+        "effective_chat": SimpleNamespace(id=11, type="private"),
+        "effective_user": SimpleNamespace(id=21),
+    }
+    prompt_update = SimpleNamespace(
+        effective_message=FakePromptMessage(),
+        **identity,
+    )
+    asyncio.run(bot.download(prompt_update, SimpleNamespace(args=[])))
+
+    captured = {}
+
+    async def fake_download(update, context):
+        captured["text"] = update.effective_message.text
+        captured["args"] = context.args
+
+    bot.download = fake_download
+    url = "https://www.tiktok.com/@creator/video/456"
+    follow_up = SimpleNamespace(
+        effective_message=SimpleNamespace(text=url, caption=None),
+        **identity,
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.pending_command_input(follow_up, context))
+
+    assert captured == {"text": url, "args": [url]}
+    assert (11, 21) not in bot._pending_inputs
+
+
+def test_cancel_clears_pending_command() -> None:
+    replies = []
+
+    class FakeMessage:
+        text = "/download"
+        caption = None
+
+        async def reply_text(self, text, **_kwargs):
+            replies.append(text)
+            return SimpleNamespace(message_id=93)
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    update = SimpleNamespace(
+        effective_message=FakeMessage(),
+        effective_chat=SimpleNamespace(id=12, type="private"),
+        effective_user=SimpleNamespace(id=22),
+    )
+    asyncio.run(bot.download(update, SimpleNamespace(args=[])))
+    update.effective_message.text = "/cancel"
+
+    asyncio.run(bot.cancel(update, SimpleNamespace(args=[])))
+
+    assert (12, 22) not in bot._pending_inputs
+    assert replies[-1] == "Cancelled the pending command."
 
 
 def test_extract_media_url_accepts_share_text_and_trims_punctuation() -> None:

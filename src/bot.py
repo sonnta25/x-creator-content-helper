@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import replace
+import time
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any
@@ -12,12 +13,20 @@ from urllib.parse import urlencode
 from telegram import (
     BotCommand,
     CopyTextButton,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from src.ai_service import create_ai_service
 from src.automation import AutomationApproval, AutomationApprovalStore
@@ -65,6 +74,52 @@ REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
 TREND_CONTEXT_SIGNAL_ITEMS = 3
 TREND_CONTEXT_X_ITEMS = 4
+COMMAND_INPUT_TIMEOUT_SECONDS = 5 * 60
+COMMAND_INPUT_PROMPTS = {
+    "download": (
+        "Send the public video URL you want to download.",
+        "Paste a video URL",
+    ),
+    "tweet": (
+        "Send the topic for the Vietnamese X post.",
+        "Enter a topic",
+    ),
+    "tweetx": (
+        "Send a topic or X search query for the English post.",
+        "Enter a topic or search",
+    ),
+    "retweet": (
+        "Send the X post link. You can add a visual note after `|`.",
+        "Paste an X post link",
+    ),
+    "replytargets": (
+        "Send a topic to search, or send `auto` to let the bot choose.",
+        "Topic or auto",
+    ),
+    "persona": (
+        "Send `show`, or update values with:\n"
+        "`niche=...; voice=...; audience=...`",
+        "show or persona values",
+    ),
+    "importcookie": (
+        "Send the X cookie in this private reply:\n"
+        "`auth_token=...; ct0=...`\n"
+        "You may prefix it with an account name.",
+        "Paste auth_token and ct0",
+    ),
+    "xremove": (
+        "Send the X account name to remove.",
+        "Enter account name",
+    ),
+    "reply": (
+        "Send the tweet text or X post link you want to reply to.",
+        "Paste tweet text or link",
+    ),
+    "replyevery": (
+        "Send an interval from 5 to 1440 minutes, or send `show`.",
+        "Minutes or show",
+    ),
+}
 TWEETTREND_LANGUAGE_ALIASES = {
     "en": "English",
     "eng": "English",
@@ -81,6 +136,14 @@ TWEETTREND_LANGUAGE_ALIASES = {
 class _SilentStatus:
     async def edit_text(self, _text: str) -> None:
         return None
+
+
+@dataclass(frozen=True)
+class _PendingCommandInput:
+    command: str
+    expires_at: float
+    prompt_message_id: int | None = None
+
 
 BOT_COMMANDS = [
     BotCommand("start", "Show help and available commands"),
@@ -99,6 +162,7 @@ BOT_COMMANDS = [
     BotCommand("reply", "Generate a witty reply from tweet text or an X post link"),
     BotCommand("automationhere", "Send scheduled approval requests to this chat"),
     BotCommand("replyevery", "Set scheduled replytargets interval in minutes"),
+    BotCommand("cancel", "Cancel the command currently waiting for input"),
 ]
 
 
@@ -116,6 +180,7 @@ class ContentBot:
         self._application: Application | None = None
         self._automation_running: set[str] = set()
         self._automation_tasks: set[asyncio.Task[None]] = set()
+        self._pending_inputs: dict[tuple[int, int], _PendingCommandInput] = {}
 
     def build_application(self) -> Application:
         async def post_init(app: Application) -> None:
@@ -145,6 +210,10 @@ class ContentBot:
             .post_shutdown(post_shutdown)
             .build()
         )
+        app.add_handler(
+            MessageHandler(filters.COMMAND, self._command_started),
+            group=-1,
+        )
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("help", self.start))
         app.add_handler(CommandHandler("download", self.download))
@@ -161,8 +230,15 @@ class ContentBot:
         app.add_handler(CommandHandler("reply", self.reply))
         app.add_handler(CommandHandler("automationhere", self.automationhere))
         app.add_handler(CommandHandler("replyevery", self.replyevery))
+        app.add_handler(CommandHandler("cancel", self.cancel))
         app.add_handler(
             CallbackQueryHandler(self.automation_approval, pattern=r"^automation:")
+        )
+        app.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self.pending_command_input,
+            )
         )
         return app
 
@@ -184,10 +260,95 @@ class ContentBot:
             "/reply <tweet text or X post link> - generate a copy-ready reply\n"
             "/automationhere - send scheduled approval requests to this chat\n"
             "/replyevery <minutes> - set the scheduled /replytargets interval\n"
+            "/cancel - cancel a command that is waiting for input\n"
+            "\n"
+            "Tip: select a command without parameters and the bot will ask for "
+            "the missing input before it runs.\n"
             "\n"
             "AI provider: Chrome extension bridge runs Gemini for all "
             "content commands."
         )
+
+    async def _command_started(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        message = update.effective_message
+        if message is None:
+            return
+        first_token = str(message.text or "").split(maxsplit=1)[0].lower()
+        command = first_token.split("@", 1)[0]
+        if command != "/cancel":
+            self._clear_pending_input(update)
+
+    async def _request_command_input(self, update: Update, command: str) -> None:
+        message = update.effective_message
+        key = _pending_input_key(update)
+        prompt = COMMAND_INPUT_PROMPTS.get(command)
+        if message is None or key is None or prompt is None:
+            return
+        text, placeholder = prompt
+        sent = await message.reply_text(
+            f"{text}\n\nSend /cancel to stop.",
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder=placeholder,
+            ),
+        )
+        self._pending_inputs[key] = _PendingCommandInput(
+            command=command,
+            expires_at=time.monotonic() + COMMAND_INPUT_TIMEOUT_SECONDS,
+            prompt_message_id=getattr(sent, "message_id", None),
+        )
+
+    async def pending_command_input(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        key = _pending_input_key(update)
+        if message is None or key is None:
+            return
+        pending = self._pending_inputs.pop(key, None)
+        if pending is None:
+            return
+        if time.monotonic() > pending.expires_at:
+            await message.reply_text(
+                "That command input request expired. Select the command again."
+            )
+            return
+
+        payload = str(message.text or "").strip()
+        context.args = payload.split()
+        handler = getattr(self, pending.command, None)
+        if handler is None:
+            await message.reply_text("That pending command is no longer available.")
+            return
+        await handler(update, context)
+
+    async def cancel(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        cancelled = self._clear_pending_input(update)
+        message = update.effective_message
+        if message is not None:
+            await message.reply_text(
+                "Cancelled the pending command."
+                if cancelled
+                else "No command is currently waiting for input."
+            )
+
+    def _clear_pending_input(self, update: Update) -> bool:
+        key = _pending_input_key(update)
+        if key is None:
+            return False
+        return self._pending_inputs.pop(key, None) is not None
 
     async def download(
         self,
@@ -197,12 +358,7 @@ class ContentBot:
         message = update.effective_message
         source_url = _extract_media_url(_command_payload(message, context))
         if not source_url:
-            await message.reply_text(
-                "Usage: /download <video URL>\n"
-                "Example: /download https://www.tiktok.com/@creator/video/123\n\n"
-                "Supported when yt-dlp can read the public URL, including TikTok, "
-                "Douyin, Xiaohongshu, Facebook, and X."
-            )
+            await self._request_command_input(update, "download")
             return
 
         status = await message.reply_text("Downloading the video...")
@@ -287,12 +443,12 @@ class ContentBot:
             )
             return
         if not context.args:
+            await self._request_command_input(update, "replyevery")
+            return
+        if str(context.args[0]).strip().lower() in {"show", "current"}:
             current = self.settings.telegram_reply_targets_minutes
             value = f"{current} minutes" if current is not None else "Chrome extension setting"
-            await message.reply_text(
-                f"Current /replytargets interval: {value}.\n"
-                "Set it with /replyevery 30 (minimum 5 minutes)."
-            )
+            await message.reply_text(f"Current /replytargets interval: {value}.")
             return
         try:
             minutes = int(context.args[0])
@@ -559,7 +715,7 @@ class ContentBot:
         message = update.effective_message
         topic = " ".join(context.args).strip()
         if not topic:
-            await message.reply_text("Usage: /tweet <topic>")
+            await self._request_command_input(update, "tweet")
             return
 
         await message.chat.send_action(ChatAction.TYPING)
@@ -645,9 +801,7 @@ class ContentBot:
         message = update.effective_message
         source, visual_note = _parse_retweet_args(_command_payload(message, context))
         if not source:
-            await message.reply_text(
-                "Usage: /retweet <X post link> | <visual description>"
-            )
+            await self._request_command_input(update, "retweet")
             return
 
         tweet_id = extract_tweet_id(source)
@@ -718,7 +872,7 @@ class ContentBot:
         message = update.effective_message
         topic = " ".join(context.args).strip()
         if not topic:
-            await message.reply_text("Usage: /tweetx <topic or X search query>")
+            await self._request_command_input(update, "tweetx")
             return
 
         await message.chat.send_action(ChatAction.TYPING)
@@ -766,6 +920,11 @@ class ContentBot:
     async def replytargets(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         query = " ".join(context.args).strip()
+        if not query:
+            await self._request_command_input(update, "replytargets")
+            return
+        if query.lower() == "auto":
+            query = ""
 
         await message.chat.send_action(ChatAction.TYPING)
         interval_minutes = self.settings.telegram_reply_targets_minutes or 30
@@ -828,6 +987,9 @@ class ContentBot:
         message = update.effective_message
         raw_args = " ".join(context.args).strip()
         if not raw_args:
+            await self._request_command_input(update, "persona")
+            return
+        if raw_args.lower() in {"show", "current"}:
             await message.reply_text(_format_persona(self.settings))
             return
 
@@ -854,16 +1016,13 @@ class ContentBot:
         message = update.effective_message
         raw_args = " ".join(context.args).strip()
         if not raw_args:
-            await message.reply_text(
-                "Usage:\n"
-                "/importcookie auth_token=YOUR_AUTH_TOKEN; ct0=YOUR_CT0\n"
-                "/importcookie account2 auth_token=YOUR_AUTH_TOKEN; ct0=YOUR_CT0\n\n"
-                "Open x.com in a logged-in browser, copy the auth_token and ct0 cookies, "
-                "then paste them in this command.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Open X", url="https://x.com")]]
-                ),
-            )
+            chat = update.effective_chat
+            if chat is not None and chat.type != "private":
+                await message.reply_text(
+                    "For cookie security, select /importcookie in a private chat with this bot."
+                )
+                return
+            await self._request_command_input(update, "importcookie")
             return
 
         account_name, cookie = _parse_importcookie_args(raw_args, self.settings.x_account_name)
@@ -910,7 +1069,7 @@ class ContentBot:
         message = update.effective_message
         account_name = " ".join(context.args).strip()
         if not account_name:
-            await message.reply_text("Usage: /xremove <account_name>\nExample: /xremove account2")
+            await self._request_command_input(update, "xremove")
             return
 
         status = await message.reply_text(f"Removing X account: {account_name}...")
@@ -934,7 +1093,7 @@ class ContentBot:
         message = update.effective_message
         source = _command_payload(message, context)
         if not source:
-            await message.reply_text("Usage: /reply <tweet text or X post link>")
+            await self._request_command_input(update, "reply")
             return
 
         await message.chat.send_action(ChatAction.TYPING)
@@ -1571,10 +1730,20 @@ async def _delete_message_safely(message) -> None:
 def _command_payload(message, context: ContextTypes.DEFAULT_TYPE) -> str:
     raw_text = message.text or message.caption or ""
     if raw_text:
-        parts = raw_text.split(maxsplit=1)
-        if len(parts) > 1:
-            return parts[1].strip()
-    return " ".join(context.args).strip()
+        clean = raw_text.strip()
+        if not clean.startswith("/"):
+            return clean
+        parts = clean.split(maxsplit=1)
+        return parts[1].strip() if len(parts) > 1 else ""
+    return " ".join(getattr(context, "args", None) or []).strip()
+
+
+def _pending_input_key(update: Update) -> tuple[int, int] | None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or user is None:
+        return None
+    return int(chat.id), int(user.id)
 
 
 def _extract_media_url(raw_args: str) -> str:

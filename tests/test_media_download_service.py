@@ -101,10 +101,140 @@ def test_download_returns_file_and_applies_bounded_options() -> None:
     assert captured["writeinfojson"] is False
     assert captured["writethumbnail"] is False
     assert captured["writesubtitles"] is False
+    assert "http_headers" not in captured
 
     parent = result.path.parent
     result.cleanup()
     assert not parent.exists()
+
+
+def test_download_refreshes_browser_cookies_and_retries_auth_failure(tmp_path) -> None:
+    cookie_path = tmp_path / "download-cookies.txt"
+    cookie_path.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    attempts: list[dict] = []
+
+    class RefreshingDownloader:
+        def __init__(self, options):
+            self.options = options
+            attempts.append(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, download):
+            assert download is True
+            if "cookiesfrombrowser" not in self.options:
+                raise RuntimeError("Login required: cookies are expired")
+            path = Path(self.options["paths"]["home"]) / "download.mp4"
+            path.write_bytes(b"refreshed video")
+            return {"title": "Video", "extractor_key": "Facebook"}
+
+    service = MediaDownloadService(
+        Settings(
+            telegram_bot_token="123:ABC",
+            download_cookies_file=str(cookie_path),
+            download_cookies_from_browser="chrome",
+            download_browser_profile="Profile 1",
+        ),
+        ydl_factory=RefreshingDownloader,
+        resolver=_public_resolver,
+    )
+
+    result = service.download("https://www.facebook.com/watch/?v=123")
+
+    assert len(attempts) == 2
+    assert attempts[0]["cookiefile"] == str(cookie_path)
+    assert "cookiesfrombrowser" not in attempts[0]
+    assert attempts[1]["cookiesfrombrowser"] == (
+        "chrome",
+        "Profile 1",
+        None,
+        None,
+    )
+    assert result.path.read_bytes() == b"refreshed video"
+    result.cleanup()
+
+
+def test_browser_cookie_refresh_can_create_cookie_directory(tmp_path) -> None:
+    cookie_path = tmp_path / "nested" / "download-cookies.txt"
+    captured: dict = {}
+
+    class BrowserDownloader:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, download):
+            assert download is True
+            path = Path(captured["paths"]["home"]) / "download.mp4"
+            path.write_bytes(b"video")
+            return {}
+
+    service = MediaDownloadService(
+        Settings(
+            telegram_bot_token="123:ABC",
+            download_cookies_file=str(cookie_path),
+            download_cookies_from_browser="chrome",
+        ),
+        ydl_factory=BrowserDownloader,
+        resolver=_public_resolver,
+    )
+
+    result = service.download("https://www.douyin.com/video/123")
+
+    assert cookie_path.parent.is_dir()
+    assert captured["cookiefile"] == str(cookie_path)
+    assert captured["cookiesfrombrowser"] == ("chrome", None, None, None)
+    result.cleanup()
+
+
+def test_download_rejects_unsupported_browser_cookie_source() -> None:
+    service = MediaDownloadService(
+        Settings(
+            telegram_bot_token="123:ABC",
+            download_cookies_from_browser="internet-explorer",
+        ),
+        ydl_factory=lambda _options: None,
+        resolver=_public_resolver,
+    )
+
+    with pytest.raises(MediaDownloadError, match="Unsupported.*internet-explorer"):
+        service.download("https://example.com/video")
+
+
+def test_download_requests_manual_login_after_browser_refresh_fails() -> None:
+    class LoggedOutDownloader:
+        def __init__(self, options):
+            assert options["cookiesfrombrowser"] == ("chrome", None, None, None)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, _download):
+            raise RuntimeError("Login required after reading cookies")
+
+    service = MediaDownloadService(
+        Settings(
+            telegram_bot_token="123:ABC",
+            download_cookies_from_browser="chrome",
+        ),
+        ydl_factory=LoggedOutDownloader,
+        resolver=_public_resolver,
+    )
+
+    with pytest.raises(MediaDownloadError, match="sign in or complete CAPTCHA"):
+        service.download("https://www.facebook.com/watch/?v=123")
 
 
 def test_rename_for_delivery_removes_original_title_and_source_id(tmp_path) -> None:

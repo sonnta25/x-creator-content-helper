@@ -34,3 +34,5 @@ def test_setup_preserves_download_settings_and_forces_dependency_sync() -> None:
     assert "DOWNLOAD_MAX_FILE_MB=" in script
     assert "DOWNLOAD_TIMEOUT_SECONDS=" in script
     assert "DOWNLOAD_COOKIES_FILE=" in script
+    assert "DOWNLOAD_COOKIES_FROM_BROWSER=" in script
+    assert "DOWNLOAD_BROWSER_PROFILE=" in script

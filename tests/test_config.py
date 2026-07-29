@@ -38,6 +38,8 @@ def test_settings_defaults() -> None:
     assert settings.download_max_file_mb == 45
     assert settings.download_timeout_seconds == 180
     assert settings.download_cookies_file == ""
+    assert settings.download_cookies_from_browser == ""
+    assert settings.download_browser_profile == ""
     assert "square realistic image" in settings.gemini_image_prompt_prefix
     assert settings.grok_image_prompt_prefix == settings.gemini_image_prompt_prefix
 
@@ -49,7 +51,9 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
         "X_POST_CHAR_LIMIT=1800\nTELEGRAM_REPLY_TARGETS_MINUTES=45\n"
         "TELEGRAM_REPLY_TARGETS_UPDATED_AT=123456789\n"
         "DOWNLOAD_MAX_FILE_MB=40\nDOWNLOAD_TIMEOUT_SECONDS=120\n"
-        "DOWNLOAD_COOKIES_FILE=data/cookies.txt\n",
+        "DOWNLOAD_COOKIES_FILE=data/cookies.txt\n"
+        "DOWNLOAD_COOKIES_FROM_BROWSER=chrome\n"
+        "DOWNLOAD_BROWSER_PROFILE=Profile 1\n",
         encoding="utf-8-sig",
     )
     monkeypatch.chdir(tmp_path)
@@ -67,3 +71,5 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
     assert settings.download_max_file_mb == 40
     assert settings.download_timeout_seconds == 120
     assert settings.download_cookies_file == "data/cookies.txt"
+    assert settings.download_cookies_from_browser == "chrome"
+    assert settings.download_browser_profile == "Profile 1"

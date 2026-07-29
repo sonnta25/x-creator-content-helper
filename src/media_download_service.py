@@ -15,6 +15,30 @@ from urllib.parse import urlsplit
 from src.config import Settings
 
 
+SUPPORTED_COOKIE_BROWSERS = {
+    "brave",
+    "chrome",
+    "chromium",
+    "edge",
+    "firefox",
+    "opera",
+    "safari",
+    "vivaldi",
+    "whale",
+}
+COOKIE_REFRESH_ERROR_MARKERS = {
+    "401",
+    "403",
+    "authentication",
+    "captcha",
+    "cookie",
+    "forbidden",
+    "login",
+    "not authorized",
+    "sign in",
+}
+
+
 class MediaDownloadError(RuntimeError):
     """A download failure that is safe to show to a Telegram user."""
 
@@ -58,9 +82,66 @@ class MediaDownloadService:
         normalized_url = validate_media_url(url)
         self._ensure_public_host(normalized_url)
         factory = self._ydl_factory or _load_yt_dlp_factory()
-        workdir = Path(tempfile.mkdtemp(prefix="x-content-download-"))
         started_at = time.monotonic()
         max_bytes = self.settings.download_max_file_mb * 1024 * 1024
+        cookie_path = self._cookie_file_path()
+        browser_spec = _browser_cookie_spec(
+            self.settings.download_cookies_from_browser,
+            self.settings.download_browser_profile,
+        )
+        attempts = _cookie_attempts(cookie_path, browser_spec)
+        browser_attempted = False
+
+        for attempt_index, use_browser in enumerate(attempts):
+            browser_attempted = browser_attempted or use_browser
+            try:
+                return self._download_once(
+                    normalized_url,
+                    factory=factory,
+                    started_at=started_at,
+                    max_bytes=max_bytes,
+                    cookie_path=cookie_path,
+                    browser_spec=browser_spec if use_browser else None,
+                )
+            except MediaDownloadError:
+                raise
+            except Exception as exc:
+                has_next_attempt = attempt_index + 1 < len(attempts)
+                if has_next_attempt and _should_refresh_browser_cookies(exc):
+                    continue
+                raise _friendly_download_error(
+                    exc,
+                    self.settings,
+                    browser_attempted=browser_attempted,
+                ) from exc
+
+        raise MediaDownloadError("Could not download this video.")
+
+    def _cookie_file_path(self) -> Path | None:
+        raw_path = self.settings.download_cookies_file
+        if not raw_path:
+            return None
+        cookie_path = Path(raw_path).expanduser()
+        if cookie_path.is_file():
+            return cookie_path
+        if self.settings.download_cookies_from_browser:
+            cookie_path.parent.mkdir(parents=True, exist_ok=True)
+            return cookie_path
+        raise MediaDownloadError(
+            f"DOWNLOAD_COOKIES_FILE does not exist: {cookie_path}"
+        )
+
+    def _download_once(
+        self,
+        normalized_url: str,
+        *,
+        factory: Callable[[dict[str, Any]], Any],
+        started_at: float,
+        max_bytes: int,
+        cookie_path: Path | None,
+        browser_spec: tuple[str, str | None, None, None] | None,
+    ) -> DownloadedMedia:
+        workdir = Path(tempfile.mkdtemp(prefix="x-content-download-"))
 
         def progress_hook(progress: dict[str, Any]) -> None:
             if time.monotonic() - started_at > self.settings.download_timeout_seconds:
@@ -98,22 +179,11 @@ class MediaDownloadService:
             "fragment_retries": 2,
             "concurrent_fragment_downloads": 1,
             "progress_hooks": [progress_hook],
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/126.0 Safari/537.36"
-                )
-            },
         }
-        if self.settings.download_cookies_file:
-            cookie_path = Path(self.settings.download_cookies_file).expanduser()
-            if not cookie_path.is_file():
-                shutil.rmtree(workdir, ignore_errors=True)
-                raise MediaDownloadError(
-                    f"DOWNLOAD_COOKIES_FILE does not exist: {cookie_path}"
-                )
+        if cookie_path is not None:
             options["cookiefile"] = str(cookie_path)
+        if browser_spec is not None:
+            options["cookiesfrombrowser"] = browser_spec
 
         try:
             with factory(options) as downloader:
@@ -136,34 +206,9 @@ class MediaDownloadService:
         except MediaDownloadError:
             shutil.rmtree(workdir, ignore_errors=True)
             raise
-        except Exception as exc:
+        except Exception:
             shutil.rmtree(workdir, ignore_errors=True)
-            detail = " ".join(str(exc).split())
-            lowered = detail.lower()
-            if "video is larger than" in lowered:
-                raise MediaDownloadError(
-                    f"Video is larger than the {self.settings.download_max_file_mb} MB limit."
-                ) from exc
-            if "download exceeded" in lowered:
-                raise MediaDownloadError(
-                    f"Download exceeded {self.settings.download_timeout_seconds} seconds."
-                ) from exc
-            if "login" in lowered or "cookie" in lowered or "authentication" in lowered:
-                raise MediaDownloadError(
-                    "This video requires a logged-in session. Export a Netscape cookie file "
-                    "and set DOWNLOAD_COOKIES_FILE, then try again."
-                ) from exc
-            if "unsupported url" in lowered:
-                raise MediaDownloadError(
-                    "This website or URL format is not supported by the downloader."
-                ) from exc
-            if "private" in lowered or "not available" in lowered:
-                raise MediaDownloadError(
-                    "This video is private, unavailable, or blocked in the bot's region."
-                ) from exc
-            raise MediaDownloadError(
-                f"Could not download this video. Details: {detail or type(exc).__name__}"
-            ) from exc
+            raise
 
     def _ensure_public_host(self, url: str) -> None:
         host = urlsplit(url).hostname
@@ -179,6 +224,100 @@ class MediaDownloadService:
             ip_text = str(address[4][0]).split("%", 1)[0]
             if not ipaddress.ip_address(ip_text).is_global:
                 raise MediaDownloadError("Private or local network URLs are not allowed.")
+
+
+def _browser_cookie_spec(
+    browser_name: str,
+    profile: str,
+) -> tuple[str, str | None, None, None] | None:
+    normalized_browser = str(browser_name or "").strip().lower()
+    if not normalized_browser:
+        return None
+    if normalized_browser not in SUPPORTED_COOKIE_BROWSERS:
+        supported = ", ".join(sorted(SUPPORTED_COOKIE_BROWSERS))
+        raise MediaDownloadError(
+            f"Unsupported DOWNLOAD_COOKIES_FROM_BROWSER value: {browser_name}. "
+            f"Supported browsers: {supported}."
+        )
+    normalized_profile = str(profile or "").strip() or None
+    return normalized_browser, normalized_profile, None, None
+
+
+def _cookie_attempts(
+    cookie_path: Path | None,
+    browser_spec: tuple[str, str | None, None, None] | None,
+) -> tuple[bool, ...]:
+    if browser_spec is None:
+        return (False,)
+    if cookie_path is not None and cookie_path.is_file():
+        return False, True
+    return (True,)
+
+
+def _should_refresh_browser_cookies(exc: Exception) -> bool:
+    lowered = " ".join(str(exc).split()).lower()
+    return any(marker in lowered for marker in COOKIE_REFRESH_ERROR_MARKERS)
+
+
+def _friendly_download_error(
+    exc: Exception,
+    settings: Settings,
+    *,
+    browser_attempted: bool,
+) -> MediaDownloadError:
+    detail = " ".join(str(exc).split())
+    lowered = detail.lower()
+    if "video is larger than" in lowered:
+        return MediaDownloadError(
+            f"Video is larger than the {settings.download_max_file_mb} MB limit."
+        )
+    if "download exceeded" in lowered:
+        return MediaDownloadError(
+            f"Download exceeded {settings.download_timeout_seconds} seconds."
+        )
+    if browser_attempted and _is_browser_cookie_load_error(lowered):
+        browser = settings.download_cookies_from_browser or "browser"
+        profile = settings.download_browser_profile or "the most recent profile"
+        return MediaDownloadError(
+            f"Could not refresh cookies from {browser} ({profile}). Run the bot and "
+            "browser under the same Windows user, verify the profile, then try again."
+        )
+    if any(marker in lowered for marker in COOKIE_REFRESH_ERROR_MARKERS):
+        if browser_attempted:
+            return MediaDownloadError(
+                "The bot refreshed cookies from the browser, but the website still "
+                "requires authentication. Open the website in that browser profile, "
+                "sign in or complete CAPTCHA, then try again."
+            )
+        return MediaDownloadError(
+            "This video requires a logged-in session. Set "
+            "DOWNLOAD_COOKIES_FROM_BROWSER=chrome for automatic refresh, or provide "
+            "a Netscape cookie file with DOWNLOAD_COOKIES_FILE."
+        )
+    if "unsupported url" in lowered:
+        return MediaDownloadError(
+            "This website or URL format is not supported by the downloader."
+        )
+    if "private" in lowered or "not available" in lowered:
+        return MediaDownloadError(
+            "This video is private, unavailable, or blocked in the bot's region."
+        )
+    return MediaDownloadError(
+        f"Could not download this video. Details: {detail or type(exc).__name__}"
+    )
+
+
+def _is_browser_cookie_load_error(lowered_detail: str) -> bool:
+    return any(
+        marker in lowered_detail
+        for marker in (
+            "could not copy",
+            "could not find",
+            "cookie load error",
+            "failed to decrypt",
+            "keyring",
+        )
+    )
 
 
 def validate_media_url(url: str) -> str:

@@ -37,6 +37,11 @@ class Settings:
     telegram_reply_targets_minutes: int | None = None
     telegram_reply_targets_updated_at: int | None = None
     automation_approvals_path: str = ""
+    download_max_file_mb: int = 45
+    download_timeout_seconds: int = 180
+    download_cookies_file: str = ""
+    download_cookies_from_browser: str = ""
+    download_browser_profile: str = ""
     gemini_image_prompt_prefix: str = (
         "Create one square realistic image for this social post. Return the image only, "
         "with no extra text."
@@ -116,6 +121,15 @@ class Settings:
                 "data/automation_approvals.json",
             ).strip()
             or "data/automation_approvals.json",
+            download_max_file_mb=_int_env("DOWNLOAD_MAX_FILE_MB", 45),
+            download_timeout_seconds=_int_env("DOWNLOAD_TIMEOUT_SECONDS", 180),
+            download_cookies_file=os.getenv("DOWNLOAD_COOKIES_FILE", "").strip(),
+            download_cookies_from_browser=os.getenv(
+                "DOWNLOAD_COOKIES_FROM_BROWSER", ""
+            ).strip(),
+            download_browser_profile=os.getenv(
+                "DOWNLOAD_BROWSER_PROFILE", ""
+            ).strip(),
             gemini_image_prompt_prefix=(
                 os.getenv("GEMINI_IMAGE_PROMPT_PREFIX")
                 or os.getenv(

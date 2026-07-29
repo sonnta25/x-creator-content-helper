@@ -9,6 +9,12 @@ if (-not (Test-Path $pythonExe)) {
     throw "Python venv was not found. Run scripts\windows\setup.ps1 first."
 }
 
+$syncScript = Join-Path $PSScriptRoot "sync-dependencies.ps1"
+if (-not (Test-Path -LiteralPath $syncScript)) {
+    throw "Dependency sync script was not found: $syncScript"
+}
+& $syncScript -ProjectRoot $ProjectRoot
+
 $existing = Get-CimInstance Win32_Process -Filter "name = 'python.exe'" |
     Where-Object {
         $_.CommandLine -like "*$pythonExe*" -and $_.CommandLine -like "*-m src.main*"

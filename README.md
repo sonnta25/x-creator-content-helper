@@ -12,6 +12,7 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 
 ## Commands
 
+- `/download <video URL>`: download one public video and send it back as a Telegram file.
 - `/tweet <topic>`: create one Vietnamese long-form X post, with an optional image.
 - `/tweetx <topic/search>`: search X first, then create one long-form X post from live context.
 - `/tweettrend3 [auto|trending|news|sport|entertainment]`: in `auto` mode, find current topics around `CREATOR_NICHE` first, then create three Vietnamese posts with approval buttons.
@@ -25,8 +26,73 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 - `/xaccounts`: list imported X cookie accounts without exposing cookies.
 - `/xremove <account_name>`: remove an imported X cookie account from the twscrape pool.
 - `/persona`: show or update creator niche, voice, and audience.
+- `/cancel`: cancel a command that is waiting for input.
 
 The bot registers these commands with Telegram on startup.
+
+### Two-step command input
+
+Commands that need input no longer run immediately when selected from Telegram's
+command menu. Select `/download`, `/tweet`, `/tweetx`, `/retweet`, `/replytargets`,
+`/reply`, `/persona`, `/importcookie`, `/xremove`, or `/replyevery`, and the bot
+opens a reply field with a short prompt. Send the requested value as the next
+message to run the command.
+
+The direct form still works, for example `/tweet AI agents` or
+`/download https://...`. Pending input is isolated per chat and Telegram user,
+expires after five minutes, and can be stopped with `/cancel`. Selecting a
+different command replaces the previous pending request. Use `auto` when the
+`/replytargets` prompt should choose its own topic, and `show` to inspect
+`/persona` or `/replyevery`.
+
+### Video downloads
+
+Send a public video link:
+
+```text
+/download https://www.tiktok.com/@creator/video/123
+```
+
+The bot downloads one video and uploads it to the same Telegram chat as a document,
+so the file can be saved directly to a phone or computer without relying on a
+short-lived platform CDN link. The downloader supports sites handled by `yt-dlp`,
+including common TikTok, Douyin, Xiaohongshu, Facebook, and X public-video URLs.
+Playlists are disabled.
+
+Delivered files use a neutral name such as
+`creator-video-20260727-101112-a1b2c3.mp4`; the source title and platform video ID
+are not used in the filename or Telegram caption. The downloader also disables
+description, info JSON, thumbnail, comment, and subtitle sidecar files. Telegram
+keeps the source URL in the message caption for permission and provenance checks,
+but it is not embedded in the delivered filename. These cleanup steps do not make
+copied content original or bypass copyright/reused-content checks.
+
+Downloads are processed one at a time, use a 180-second deadline, and default to a
+45 MB cap to stay below the public Telegram Bot API upload limit. Configure these in
+`.env`:
+
+```env
+DOWNLOAD_MAX_FILE_MB=45
+DOWNLOAD_TIMEOUT_SECONDS=180
+DOWNLOAD_COOKIES_FILE=data/download-cookies.txt
+DOWNLOAD_COOKIES_FROM_BROWSER=chrome
+DOWNLOAD_BROWSER_PROFILE=Default
+```
+
+Some private, age-gated, regional, or anti-bot-protected videos require cookies.
+Export a Netscape-format cookie file on the bot machine and set
+`DOWNLOAD_COOKIES_FILE` to its path. For automatic refresh, set
+`DOWNLOAD_COOKIES_FROM_BROWSER` to `chrome` and optionally identify a profile such
+as `Default` or `Profile 1` with `DOWNLOAD_BROWSER_PROFILE`.
+
+When both sources are configured, the bot first uses the cookie file. If the
+website returns an authentication, cookie, CAPTCHA, 401, or 403 error, the bot
+loads current cookies from that browser profile, merges them into the cookie jar,
+and retries the download once. Browser extraction requires the bot and browser to
+run under the same Windows user. It cannot restore a logged-out or revoked session;
+open the website, sign in or complete CAPTCHA, and retry. Cookie freshness and
+upstream site changes can still make a URL fail. Only download content you are
+authorized to save.
 
 ## Creator Flow
 
@@ -59,6 +125,15 @@ pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
+`start.ps1` compares `pyproject.toml` with the dependencies installed in `.venv`.
+After extracting an updated ZIP over an existing installation, starting the bot
+automatically installs newly added packages such as `yt-dlp` before checking or
+launching the polling process:
+
+```powershell
+.\scripts\windows\start.ps1
+```
+
 ### Ubuntu
 
 ```bash
@@ -74,6 +149,12 @@ Edit `.env`:
 
 ```env
 TELEGRAM_BOT_TOKEN=...
+
+DOWNLOAD_MAX_FILE_MB=45
+DOWNLOAD_TIMEOUT_SECONDS=180
+DOWNLOAD_COOKIES_FILE=data/download-cookies.txt
+DOWNLOAD_COOKIES_FROM_BROWSER=chrome
+DOWNLOAD_BROWSER_PROFILE=Default
 
 CONTENT_PROVIDER=extension_bridge
 EXTENSION_BRIDGE_HOST=127.0.0.1

@@ -105,7 +105,8 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 
 Write-Host "Installing Python dependencies..."
 & $venvPython -m pip install --upgrade pip
-& $venvPython -m pip install -e .
+if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip." }
+& (Join-Path $PSScriptRoot "sync-dependencies.ps1") -ProjectRoot $ProjectRoot -Force
 
 # Preserve every operator setting that setup owns. This prevents an upgrade from
 # erasing the approval chat, schedule interval, trend sources, persona, or image mode.
@@ -115,6 +116,12 @@ TELEGRAM_APPROVAL_CHAT_ID=$(Get-EnvValue "TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_REPLY_TARGETS_MINUTES=$(Get-EnvValue "TELEGRAM_REPLY_TARGETS_MINUTES")
 TELEGRAM_REPLY_TARGETS_UPDATED_AT=$(Get-EnvValue "TELEGRAM_REPLY_TARGETS_UPDATED_AT")
 AUTOMATION_APPROVALS_PATH=$(Get-EnvValue "AUTOMATION_APPROVALS_PATH" "data/automation_approvals.json")
+
+DOWNLOAD_MAX_FILE_MB=$(Get-EnvValue "DOWNLOAD_MAX_FILE_MB" "45")
+DOWNLOAD_TIMEOUT_SECONDS=$(Get-EnvValue "DOWNLOAD_TIMEOUT_SECONDS" "180")
+DOWNLOAD_COOKIES_FILE=$(Get-EnvValue "DOWNLOAD_COOKIES_FILE")
+DOWNLOAD_COOKIES_FROM_BROWSER=$(Get-EnvValue "DOWNLOAD_COOKIES_FROM_BROWSER")
+DOWNLOAD_BROWSER_PROFILE=$(Get-EnvValue "DOWNLOAD_BROWSER_PROFILE")
 
 CONTENT_PROVIDER=extension_bridge
 EXTENSION_BRIDGE_HOST=$(Get-EnvValue "EXTENSION_BRIDGE_HOST" "127.0.0.1")

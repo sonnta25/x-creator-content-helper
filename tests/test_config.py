@@ -27,7 +27,13 @@ def test_settings_defaults() -> None:
     assert settings.trend_sources == "x,google_trends,rss"
     assert settings.google_trends_geo == "US"
     assert settings.trend_rss_urls == ""
-    assert settings.hashtag_mode == "auto"
+    assert settings.hashtag_mode == "none"
+    assert settings.reply_watch_path == "data/reply_watchlist.json"
+    assert settings.reply_target_mode == "balanced"
+    assert settings.creator_daily_reply_cap == 8
+    assert settings.creator_timezone == "Asia/Ho_Chi_Minh"
+    assert settings.content_language == "Vietnamese"
+    assert settings.trend_language == "en"
     assert "gold markets" in settings.creator_niche
     assert "ChatGPT" in settings.creator_niche
     assert settings.creator_voice == (
@@ -64,6 +70,13 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
         "REPLY_LEARNING_ENABLED=false\n"
         "REPLY_LEARNING_PATH=data/test-reply-learning.json\n"
         "REPLY_TRACKING_POLL_MINUTES=3\n"
+        "REPLY_WATCH_PATH=data/test-reply-watch.json\n"
+        "REPLY_TARGET_MODE=relationship\n"
+        "CREATOR_DAILY_REPLY_CAP=6\n"
+        "CREATOR_TIMEZONE=Asia/Tokyo\n"
+        "CONTENT_LANGUAGE=Japanese\n"
+        "TREND_LANGUAGE=ja\n"
+        "HASHTAG_MODE=one\n"
         "DOWNLOAD_MAX_FILE_MB=40\nDOWNLOAD_TIMEOUT_SECONDS=120\n"
         "DOWNLOAD_COOKIES_FILE=data/cookies.txt\n"
         "DOWNLOAD_COOKIES_FROM_BROWSER=chrome\n"
@@ -89,6 +102,13 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
     assert settings.reply_learning_enabled is False
     assert settings.reply_learning_path == "data/test-reply-learning.json"
     assert settings.reply_tracking_poll_minutes == 3
+    assert settings.reply_watch_path == "data/test-reply-watch.json"
+    assert settings.reply_target_mode == "relationship"
+    assert settings.creator_daily_reply_cap == 6
+    assert settings.creator_timezone == "Asia/Tokyo"
+    assert settings.content_language == "Japanese"
+    assert settings.trend_language == "ja"
+    assert settings.hashtag_mode == "one"
     assert settings.download_max_file_mb == 40
     assert settings.download_timeout_seconds == 120
     assert settings.download_cookies_file == "data/cookies.txt"

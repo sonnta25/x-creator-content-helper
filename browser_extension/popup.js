@@ -7,6 +7,7 @@ const DEFAULTS = {
   automationEnabled: false,
   activeStart: "08:00",
   activeEnd: "22:00",
+  creatorTimezone: "Asia/Ho_Chi_Minh",
   replyTargetsMinutes: 15,
   replyTargetsMaxAgeMinutes: 360,
   replyTargetsLanguages: "en,ja",
@@ -29,6 +30,7 @@ const els = {
   automationEnabled: document.getElementById("automationEnabled"),
   activeStart: document.getElementById("activeStart"),
   activeEnd: document.getElementById("activeEnd"),
+  creatorTimezone: document.getElementById("creatorTimezone"),
   replyTargetsMinutes: document.getElementById("replyTargetsMinutes"),
   replyTargetsMaxAgeMinutes: document.getElementById("replyTargetsMaxAgeMinutes"),
   replyTargetsLanguages: document.getElementById("replyTargetsLanguages"),
@@ -152,6 +154,7 @@ function renderConfig(config) {
   els.pollSeconds.value = String(config.pollSeconds);
   els.activeStart.value = config.activeStart;
   els.activeEnd.value = config.activeEnd;
+  els.creatorTimezone.value = config.creatorTimezone;
   els.replyTargetsMinutes.value = String(config.replyTargetsMinutes);
   els.replyTargetsMaxAgeMinutes.value = String(config.replyTargetsMaxAgeMinutes);
   els.replyTargetsLanguages.value = config.replyTargetsLanguages;
@@ -186,6 +189,7 @@ function readConfigFromForm() {
     automationEnabled: Boolean(currentConfig.automationEnabled),
     activeStart: els.activeStart.value || DEFAULTS.activeStart,
     activeEnd: els.activeEnd.value || DEFAULTS.activeEnd,
+    creatorTimezone: els.creatorTimezone.value.trim() || DEFAULTS.creatorTimezone,
     replyTargetsMinutes: Math.max(5, Number(els.replyTargetsMinutes.value || DEFAULTS.replyTargetsMinutes)),
     replyTargetsMaxAgeMinutes: Math.min(1440, Math.max(
       30,

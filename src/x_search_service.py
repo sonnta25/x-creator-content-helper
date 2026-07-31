@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import aclosing
 from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
@@ -21,6 +22,7 @@ SUPPORTED_REPLY_TARGET_LANGUAGES = {
     "sl", "sr", "sv", "ta", "te", "th", "tl", "tr", "ug", "uk", "ur",
     "vi", "zh-cn", "zh-tw",
 }
+MAX_REPLY_TARGET_LANGUAGES = 6
 
 TREND_FALLBACK_QUERIES = {
     "trending": ["openai", "AI", "news", "entertainment"],
@@ -76,16 +78,19 @@ class XSearchService:
         search_limit = limit or self.settings.x_search_limit
         results: list[XSearchResult] = []
         try:
-            async for tweet in api.search(
-                clean_query,
-                limit=search_limit,
-                kv={"product": product or self.settings.x_search_product},
-            ):
-                result = _to_search_result(tweet)
-                if result.text:
-                    results.append(result)
-                if len(results) >= search_limit:
-                    break
+            async with aclosing(
+                api.search(
+                    clean_query,
+                    limit=search_limit,
+                    kv={"product": product or self.settings.x_search_product},
+                )
+            ) as stream:
+                async for tweet in stream:
+                    result = _to_search_result(tweet)
+                    if result.text:
+                        results.append(result)
+                    if len(results) >= search_limit:
+                        break
         except Exception as exc:
             raise RuntimeError(f"X search failed: {exc}") from exc
         return results
@@ -125,12 +130,15 @@ class XSearchService:
             if user is None:
                 raise RuntimeError(f"X user @{clean_username} was not found.")
             results: list[XSearchResult] = []
-            async for tweet in api.user_tweets_and_replies(int(user.id), limit=limit):
-                result = _to_search_result(tweet)
-                if result.text:
-                    results.append(result)
-                if len(results) >= limit:
-                    break
+            async with aclosing(
+                api.user_tweets_and_replies(int(user.id), limit=limit)
+            ) as stream:
+                async for tweet in stream:
+                    result = _to_search_result(tweet)
+                    if result.text:
+                        results.append(result)
+                    if len(results) >= limit:
+                        break
             return results
         except Exception as exc:
             raise RuntimeError(f"X owner timeline lookup failed: {exc}") from exc
@@ -144,12 +152,13 @@ class XSearchService:
         api = await self._get_api()
         try:
             results: list[XSearchResult] = []
-            async for tweet in api.tweet_replies(tweet_id, limit=limit):
-                result = _to_search_result(tweet)
-                if result.text:
-                    results.append(result)
-                if len(results) >= limit:
-                    break
+            async with aclosing(api.tweet_replies(tweet_id, limit=limit)) as stream:
+                async for tweet in stream:
+                    result = _to_search_result(tweet)
+                    if result.text:
+                        results.append(result)
+                    if len(results) >= limit:
+                        break
             return results
         except Exception as exc:
             raise RuntimeError(f"X reply lookup failed: {exc}") from exc
@@ -164,12 +173,13 @@ class XSearchService:
         api = await self._get_api()
         trends: list[XTrend] = []
         try:
-            async for trend in api.trends(clean_category, limit=limit):
-                parsed = _to_trend(trend)
-                if parsed.name:
-                    trends.append(parsed)
-                if len(trends) >= limit:
-                    break
+            async with aclosing(api.trends(clean_category, limit=limit)) as stream:
+                async for trend in stream:
+                    parsed = _to_trend(trend)
+                    if parsed.name:
+                        trends.append(parsed)
+                    if len(trends) >= limit:
+                        break
         except Exception as exc:
             raise RuntimeError(f"X trends failed: {exc}") from exc
         return trends
@@ -387,7 +397,7 @@ def parse_reply_target_languages(
     value: str | list[str] | tuple[str, ...] | None,
     *,
     default: str = "en,ja",
-    max_languages: int = 4,
+    max_languages: int = MAX_REPLY_TARGET_LANGUAGES,
 ) -> list[str]:
     if isinstance(value, (list, tuple)):
         parts = [str(item) for item in value]

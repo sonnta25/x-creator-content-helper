@@ -31,6 +31,7 @@ from src.bot import (
     _parse_tweettrend3_args,
     _reply_target_interval_minutes,
     _reply_target_max_age_minutes,
+    _updated_reply_target_languages,
     _x_account_error_notifications,
 )
 from src.config import Settings
@@ -110,7 +111,8 @@ def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
     assert {"vntweet", "angles", "xsearch"}.isdisjoint(commands)
     assert {"tweet", "tweettrend3", "tweetx", "dailybrief", "retweet", "reply"}.issubset(commands)
     assert "replyevery" in commands
-    assert {"replylearn", "replyreport"}.issubset(commands)
+    assert {"replylearn", "replyreport", "replylangs"}.issubset(commands)
+    assert {"today", "setupcheck"}.issubset(commands)
     assert "download" in commands
     assert "cancel" in commands
 
@@ -302,6 +304,8 @@ def test_automation_config_exposes_telegram_reply_interval() -> None:
         "reply_targets_minutes": 45,
         "reply_targets_updated_at": None,
         "automation_running": False,
+        "creator_timezone": "Asia/Ho_Chi_Minh",
+        "reply_target_languages": "en,ja",
     }
 
     bot._automation_running.add("replytargets")
@@ -316,6 +320,52 @@ def test_parse_tweettrend3_args_accepts_vietnamese_shortcut() -> None:
         "Vietnamese",
     )
     assert _parse_tweettrend3_args(["news", "en"]) == ("news", "Vietnamese")
+
+
+def test_reply_language_updates_add_remove_set_and_validate_limits() -> None:
+    assert _updated_reply_target_languages("en,ja", "add", "ko, es") == [
+        "en",
+        "ja",
+        "ko",
+        "es",
+    ]
+    assert _updated_reply_target_languages("en,ja,ko", "remove", "ja") == [
+        "en",
+        "ko",
+    ]
+    assert _updated_reply_target_languages("en,ja", "set", "vn jp kr") == [
+        "vi",
+        "ja",
+        "ko",
+    ]
+    with pytest.raises(RuntimeError, match="Unsupported X language"):
+        _updated_reply_target_languages("en,ja", "add", "xx")
+    with pytest.raises(RuntimeError, match="At least one"):
+        _updated_reply_target_languages("en", "remove", "en")
+    with pytest.raises(RuntimeError, match="at most 6"):
+        _updated_reply_target_languages("en,ja", "set", "en ja ko es pt id vi")
+
+
+def test_replylangs_command_updates_runtime_settings_and_env(monkeypatch) -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    saved = []
+    replies = []
+
+    async def reply_text(text):
+        replies.append(text)
+
+    monkeypatch.setattr("src.bot.update_env_value", lambda name, value: saved.append((name, value)))
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_message=SimpleNamespace(reply_text=reply_text),
+    )
+    context = SimpleNamespace(args=["add", "ko", "es"])
+
+    asyncio.run(bot.replylangs(update, context))
+
+    assert bot.settings.reply_target_languages == "en,ja,ko,es"
+    assert saved == [("REPLY_TARGET_LANGUAGES", "en,ja,ko,es")]
+    assert "Saved to .env" in replies[0]
 
 
 def test_format_reply_target_messages_are_copy_focused() -> None:
@@ -373,6 +423,40 @@ def test_approval_keyboard_adds_mobile_intent_and_short_copy_button() -> None:
     assert any(button.copy_text and button.copy_text.text == approval.text for button in buttons)
 
 
+def test_reply_and_post_approval_cards_offer_lazy_quick_actions() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    reply = bot.approvals.create(
+        kind="reply",
+        text="A specific reply",
+        chat_id=123,
+        target_url="https://x.com/source/status/1",
+    )
+    post = bot.approvals.create(
+        kind="post",
+        text="An original post",
+        chat_id=123,
+        metadata={"image_prompt": "A square realistic photo"},
+    )
+
+    reply_callbacks = {
+        button.callback_data
+        for row in _approval_keyboard(reply).inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    post_callbacks = {
+        button.callback_data
+        for row in _approval_keyboard(post).inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+
+    assert f"automation:alternative:{reply.id}" in reply_callbacks
+    assert f"automation:shorter:{reply.id}" in reply_callbacks
+    assert f"automation:visual:{post.id}" in post_callbacks
+    assert f"automation:skip:{reply.id}" in reply_callbacks
+
+
 def test_mobile_post_falls_back_to_a_short_composer_url_when_draft_is_long() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
     approval = bot.approvals.create(
@@ -398,7 +482,11 @@ def test_reply_approval_message_contains_only_link_and_draft() -> None:
 
     text = _approval_message_text(approval, reason="High engagement")
 
-    assert text == "https://x.com/user/status/123\n\nThis is the reply draft."
+    assert text == (
+        "https://x.com/user/status/123\n"
+        "Why now: High engagement\n\n"
+        "This is the reply draft."
+    )
     assert "Reply approval" not in text
     assert "Why:" not in text
     assert "Choose" not in text
@@ -557,7 +645,8 @@ def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
         async def edit_text(self, _text):
             return None
 
-    async def auto_queries(_languages=None):
+    async def auto_queries(_languages=None, *, mode="balanced"):
+        del mode
         return ["empty topic", "working topic"]
 
     async def search(query, *, max_age_minutes=360):
@@ -619,7 +708,8 @@ def test_replytargets_auto_mode_compares_candidates_across_topics() -> None:
         async def edit_text(self, _text):
             return None
 
-    async def auto_queries(_languages=None):
+    async def auto_queries(_languages=None, *, mode="balanced"):
+        del mode
         return ["first topic", "second topic"]
 
     async def search(query, *, max_age_minutes=360):
@@ -764,7 +854,8 @@ def test_replytargets_never_accepts_posts_older_than_lookback() -> None:
         async def edit_text(self, _text):
             return None
 
-    async def auto_queries(_languages=None):
+    async def auto_queries(_languages=None, *, mode="balanced"):
+        del mode
         return ["first topic", "second topic"]
 
     async def search(query, *, max_age_minutes=30):
@@ -800,7 +891,7 @@ def test_replytargets_auto_topic_discovery_uses_one_bounded_trend_call() -> None
             ]
 
     bot.x_search = XSearch()
-    queries = asyncio.run(bot._auto_reply_target_queries())
+    queries = asyncio.run(bot._auto_reply_target_queries(mode="reach"))
 
     assert calls == [("trending", 4)]
     assert queries[:4] == [
@@ -823,7 +914,7 @@ def test_replytargets_auto_fallback_round_robins_configured_languages() -> None:
             return []
 
     bot.x_search = XSearch()
-    queries = asyncio.run(bot._auto_reply_target_queries(["en", "ja"]))
+    queries = asyncio.run(bot._auto_reply_target_queries(["en", "ja"], mode="reach"))
 
     assert len(queries) == 6
     assert [query.rsplit("lang:", 1)[-1] for query in queries] == [
@@ -835,6 +926,48 @@ def test_replytargets_auto_fallback_round_robins_configured_languages() -> None:
         "ja",
     ]
     assert queries[-2:] == ["AI lang:en", "AI lang:ja"]
+
+
+def test_reply_target_mode_penalizes_a_dominant_top_reply() -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            creator_niche="AI automation",
+            target_audience="AI builders",
+        )
+    )
+    open_thread = XSearchResult(
+        id=1,
+        username="open",
+        display_name="Open",
+        text="AI automation launch",
+        created_at="",
+        url="https://x.com/open/status/1",
+        viral_score=70,
+        reply_opportunity_score=75,
+        thread_availability_score=80,
+        top_reply_like_count=1,
+    )
+    crowded_thread = XSearchResult(
+        id=2,
+        username="crowded",
+        display_name="Crowded",
+        text="AI automation launch",
+        created_at="",
+        url="https://x.com/crowded/status/2",
+        viral_score=70,
+        reply_opportunity_score=75,
+        thread_availability_score=80,
+        top_reply_like_count=10_000,
+    )
+
+    ranked = bot._apply_reply_target_mode(
+        [crowded_thread, open_thread],
+        "balanced",
+    )
+
+    assert ranked[0].id == open_thread.id
+    assert ranked[0].audience_affinity_score > 0
 
 
 def test_replytargets_searches_top_and_latest_root_posts_within_freshness_window() -> None:

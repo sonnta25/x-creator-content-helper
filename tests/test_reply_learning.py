@@ -3,8 +3,10 @@ from datetime import UTC, datetime, timedelta
 from src.automation import AutomationApproval
 from src.models import XSearchResult
 from src.reply_learning import (
+    MIN_FEEDBACK_SAMPLES_TO_TUNE,
     MIN_FINAL_SAMPLES_TO_TUNE,
     ReplyLearningStore,
+    match_posted_content,
     match_posted_reply,
 )
 
@@ -18,6 +20,7 @@ def _result(
     views: int = 100,
     likes: int = 2,
     username: str = "owner",
+    followers: int | None = None,
 ) -> XSearchResult:
     date = created_at or datetime.now(UTC)
     return XSearchResult(
@@ -33,6 +36,7 @@ def _result(
         in_reply_to_tweet_id=target_id,
         view_count=views,
         like_count=likes,
+        author_followers_count=followers,
     )
 
 
@@ -155,3 +159,83 @@ def test_learning_waits_for_60_samples_then_tunes_with_bounded_rollback(tmp_path
         assert abs(new[strategy] - weight) <= weight * 0.100001
     assert store.rollback() is True
     assert store.weights == old
+
+
+def test_matches_original_post_and_reports_account_follower_window_proxy(tmp_path) -> None:
+    approved_at = datetime(2026, 7, 30, 8, 0, tzinfo=UTC)
+    approval = AutomationApproval(
+        id="post-1",
+        kind="post",
+        text="A concrete original post",
+        chat_id=1,
+        approver_user_id=1,
+        status="mobile_approved",
+        created_at=approved_at,
+        decided_at=approved_at,
+    )
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    record = store.register_approval(approval)
+    assert record is not None
+
+    posted = _result(
+        501,
+        text="A concrete original post",
+        created_at=approved_at + timedelta(minutes=4),
+        followers=1_000,
+    )
+    reply = _result(
+        502,
+        target_id=99,
+        text="A concrete original post",
+        created_at=approved_at + timedelta(minutes=3),
+    )
+    assert match_posted_content(record, [reply, posted]) == posted
+
+    store.mark_discovered(approval.id, posted)
+    measured = _result(
+        501,
+        text=posted.text,
+        created_at=posted.created_at_timestamp
+        and datetime.fromtimestamp(posted.created_at_timestamp, tz=UTC),
+        views=2_000,
+        likes=50,
+        followers=1_012,
+    )
+    store.add_snapshot(
+        approval.id,
+        checkpoint_minutes=1440,
+        reply=measured,
+        root=None,
+        captured_at=approved_at + timedelta(days=1),
+    )
+
+    report = store.report(now=approved_at + timedelta(days=1, minutes=1))
+    assert report["posts"] == 1
+    assert report["replies"] == 0
+    assert report["follower_window_lift"] == 12
+
+
+def test_approval_feedback_can_tune_strategy_mix_without_analytics_import(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    now = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+    for index in range(MIN_FEEDBACK_SAMPLES_TO_TUNE):
+        strategy = (
+            "specific_observation"
+            if index < MIN_FEEDBACK_SAMPLES_TO_TUNE // 2
+            else "natural_humor"
+        )
+        approval = _approval(
+            f"feedback-{index}",
+            target_id=2000 + index,
+            approved_at=now,
+            strategy=strategy,
+        )
+        store.record_feedback(
+            approval,
+            approved=strategy == "specific_observation",
+        )
+
+    old = store.weights
+    assert store.maybe_tune(now=now) is True
+    assert store.weights["specific_observation"] > old["specific_observation"]
+    assert store.weights["natural_humor"] < old["natural_humor"]

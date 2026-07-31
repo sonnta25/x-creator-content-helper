@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, replace
@@ -9,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from typing import Any
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import (
     BotCommand,
@@ -31,6 +33,7 @@ from telegram.ext import (
 from src.ai_service import create_ai_service
 from src.automation import AutomationApproval, AutomationApprovalStore
 from src.config import Settings
+from src.creator_ops import ReplyWatchStore
 from src.env_store import update_env_value
 from src.media_download_service import (
     DownloadedMedia,
@@ -41,16 +44,19 @@ from src.models import GeneratedContent, ReplyTargetDraft, TrendPostVariant, XSe
 from src.reply_target_metrics import ReplyTargetMetricStore
 from src.reply_learning import (
     CHECKPOINT_MINUTES,
+    MIN_FEEDBACK_SAMPLES_TO_TUNE,
     MIN_FINAL_SAMPLES_TO_TUNE,
     STRATEGIES,
     ReplyLearningStore,
-    match_posted_reply,
+    match_posted_content,
 )
 from src.trend_source_service import TrendSourceService, summarize_trend_signals
 from src.x_search_service import (
     MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
     MIN_REPLY_TARGET_VELOCITY_SCORE,
     MIN_REPLY_TARGET_VIEW_VELOCITY_SCORE,
+    MAX_REPLY_TARGET_LANGUAGES,
+    SUPPORTED_REPLY_TARGET_LANGUAGES,
     TREND_FALLBACK_QUERIES,
     XSearchService,
     default_english_query,
@@ -177,8 +183,11 @@ BOT_COMMANDS = [
     BotCommand("reply", "Generate a witty reply from tweet text or an X post link"),
     BotCommand("automationhere", "Send scheduled approval requests to this chat"),
     BotCommand("replyevery", "Set scheduled replytargets interval in minutes"),
+    BotCommand("replylangs", "Show, add, or remove reply-target languages"),
     BotCommand("replylearn", "Show or control automatic reply learning"),
-    BotCommand("replyreport", "Show tracked reply performance"),
+    BotCommand("replyreport", "Show tracked post and reply performance"),
+    BotCommand("today", "Build today's prioritized creator queue"),
+    BotCommand("setupcheck", "Check X, tracking, scheduling, and learning health"),
     BotCommand("cancel", "Cancel the command currently waiting for input"),
 ]
 
@@ -200,6 +209,7 @@ class ContentBot:
             settings.reply_learning_path,
             enabled=settings.reply_learning_enabled,
         )
+        self.reply_watch = ReplyWatchStore(settings.reply_watch_path)
         self.approval_chat_id = settings.telegram_approval_chat_id
         self._application: Application | None = None
         self._automation_running: set[str] = set()
@@ -261,8 +271,11 @@ class ContentBot:
         app.add_handler(CommandHandler("reply", self.reply))
         app.add_handler(CommandHandler("automationhere", self.automationhere))
         app.add_handler(CommandHandler("replyevery", self.replyevery))
+        app.add_handler(CommandHandler("replylangs", self.replylangs))
         app.add_handler(CommandHandler("replylearn", self.replylearn))
         app.add_handler(CommandHandler("replyreport", self.replyreport))
+        app.add_handler(CommandHandler("today", self.today))
+        app.add_handler(CommandHandler("setupcheck", self.setupcheck))
         app.add_handler(CommandHandler("cancel", self.cancel))
         app.add_handler(
             CallbackQueryHandler(self.automation_approval, pattern=r"^automation:")
@@ -293,8 +306,11 @@ class ContentBot:
             "/reply <tweet text or X post link> - generate a copy-ready reply\n"
             "/automationhere - send scheduled approval requests to this chat\n"
             "/replyevery <minutes> - set the scheduled /replytargets interval\n"
+            "/replylangs [show|add|remove|set] - manage reply-target languages\n"
             "/replylearn [status|on|off|rollback|username @name] - control learning\n"
             "/replyreport [7d|30d] - show tracked reply performance\n"
+            "/today [balanced|reach|qualified|relationship] - build today's queue\n"
+            "/setupcheck - check bot and X readiness\n"
             "/cancel - cancel a command that is waiting for input\n"
             "\n"
             "Tip: select a command without parameters and the bot will ask for "
@@ -510,11 +526,73 @@ class ContentBot:
             "Chrome will sync it within about 30 seconds."
         )
 
+    async def replylangs(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text("Use /replylangs in a private chat with this bot.")
+            return
+        if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
+            await message.reply_text(
+                "Only the chat configured with /automationhere can change reply languages."
+            )
+            return
+        raw = " ".join(context.args).strip()
+        if not raw or raw.lower() in {"show", "current", "status"}:
+            languages = parse_reply_target_languages(
+                self.settings.reply_target_languages
+            )
+            await message.reply_text(
+                "Reply-target languages: "
+                f"{', '.join(languages)}\n\n"
+                "Examples:\n"
+                "/replylangs add ko es\n"
+                "/replylangs remove ja\n"
+                "/replylangs set en ja ko id"
+            )
+            return
+
+        action, separator, values = raw.partition(" ")
+        action = action.strip().lower()
+        if action not in {"add", "remove", "set"} or not separator or not values.strip():
+            await message.reply_text(
+                "Usage: /replylangs show|add <codes>|remove <codes>|set <codes>"
+            )
+            return
+        try:
+            languages = _updated_reply_target_languages(
+                self.settings.reply_target_languages,
+                action,
+                values,
+            )
+        except RuntimeError as exc:
+            await message.reply_text(str(exc))
+            return
+
+        serialized = ",".join(languages)
+        update_env_value("REPLY_TARGET_LANGUAGES", serialized)
+        self.settings = replace(
+            self.settings,
+            reply_target_languages=serialized,
+        )
+        await message.reply_text(
+            f"Reply-target languages updated: {serialized}\n"
+            "Saved to .env and will sync to scheduled Chrome scans within about 30 seconds."
+        )
+
     async def get_automation_config(self) -> dict[str, Any]:
         return {
             "reply_targets_minutes": self.settings.telegram_reply_targets_minutes,
             "reply_targets_updated_at": self.settings.telegram_reply_targets_updated_at,
             "automation_running": bool(self._automation_running),
+            "creator_timezone": self.settings.creator_timezone,
+            "reply_target_languages": self.settings.reply_target_languages,
         }
 
     async def replylearn(
@@ -582,7 +660,8 @@ class ContentBot:
             f"{status.waiting}/{status.tracking}/{status.measured}/{status.unmatched}\n"
             f"Weight version: {status.version}\n"
             f"Last tuned: {last_tuned}\n"
-            f"Auto-tuning starts after {MIN_FINAL_SAMPLES_TO_TUNE} measured 24h replies.\n\n"
+            f"Auto-tuning starts after {MIN_FEEDBACK_SAMPLES_TO_TUNE} approval feedback "
+            f"events or {MIN_FINAL_SAMPLES_TO_TUNE} measured 24h outcomes.\n\n"
             f"Strategy weights:\n{weights}"
         )
 
@@ -605,11 +684,213 @@ class ContentBot:
         await message.reply_text(
             f"Reply performance - last {days} days\n"
             f"Posted/tracked: {report['posted']}\n"
+            f"Replies/posts: {report['replies']}/{report['posts']}\n"
             f"Completed 24h measurement: {report['measured']}\n"
             f"Author replies detected: {report['author_replies']}\n"
+            f"Follower lift during tracked post windows: "
+            f"{report['follower_window_lift']} (account-level proxy)\n"
             f"Average outcome score: {report['average_score']:.1f}/100\n\n"
             f"By strategy:\n{strategy_lines}"
         )
+
+    async def setupcheck(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        message = update.effective_message
+        learning = self.reply_learning.status()
+        accounts: list[dict] = []
+        account_error = ""
+        try:
+            accounts = await self.x_search.accounts_info()
+        except Exception as exc:
+            account_error = _friendly_error(exc)
+        healthy_accounts = [
+            row
+            for row in accounts
+            if bool(row.get("active")) and not _account_error_text(row)
+        ]
+        approvals = self.approvals.items()
+        stale_mobile = sum(
+            approval.status == "mobile_approved"
+            and datetime.now(UTC) - approval.created_at > timedelta(hours=2)
+            for approval in approvals
+        )
+        blockers = []
+        if not self.settings.x_owner_username:
+            blockers.append("Set the posting account with /replylearn username @name.")
+        if not accounts:
+            blockers.append("Import an authorized X session with /importcookie.")
+        elif not healthy_accounts:
+            blockers.append("X account pool has no error-free active account; run /xaccounts.")
+        if self.approval_chat_id is None:
+            blockers.append("Run /automationhere in the approval chat.")
+        state = "READY" if not blockers else "NEEDS ATTENTION"
+        detail = "\n".join(f"- {item}" for item in blockers) or "- No blocking setup issue found."
+        await message.reply_text(
+            f"Creator bot health: {state}\n\n"
+            f"X account records/healthy: {len(accounts)}/{len(healthy_accounts)}\n"
+            f"Tracking username: "
+            f"{('@' + self.settings.x_owner_username) if self.settings.x_owner_username else 'missing'}\n"
+            f"Learning: {'ON' if learning.enabled else 'OFF'}; "
+            f"{learning.measured} measured, {learning.waiting} waiting\n"
+            f"Reply schedule: {self.settings.telegram_reply_targets_minutes or 'extension default'} minutes\n"
+            f"Timezone: {self.settings.creator_timezone}\n"
+            f"Stale mobile approvals: {stale_mobile}\n"
+            f"Mode/languages: {self.settings.reply_target_mode}; "
+            f"{self.settings.reply_target_languages}\n\n"
+            f"Actions:\n{detail}"
+            + (f"\n\nAccount check error: {account_error}" if account_error else "")
+        )
+
+    async def today(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        mode = (
+            context.args[0].strip().lower()
+            if context.args
+            else self.settings.reply_target_mode
+        )
+        if mode not in {"balanced", "reach", "qualified", "relationship"}:
+            await message.reply_text(
+                "Usage: /today [balanced|reach|qualified|relationship]"
+            )
+            return
+        status = await message.reply_text(
+            f"Building today's creator queue in {mode} mode..."
+        )
+        try:
+            max_age = self.settings.reply_target_max_age_minutes
+            languages = parse_reply_target_languages(
+                self.settings.reply_target_languages
+            )
+            search_query, results, _note = await self._get_reply_target_context(
+                "",
+                status,
+                max_age_minutes=max_age,
+                languages=languages,
+                mode=mode,
+            )
+            ready, watching = self.reply_watch.classify(results)
+            remaining_cap = max(
+                0,
+                self.settings.creator_daily_reply_cap
+                - _reply_approvals_created_today(
+                    self.approvals.items(),
+                    timezone_name=self.settings.creator_timezone,
+                ),
+            )
+            ready = ready[: min(2, remaining_cap)]
+            await status.edit_text(
+                "Today's queue\n"
+                f"Reply now: {len(ready)}\n"
+                f"Watching: {len(watching)}\n"
+                f"Daily reply capacity remaining: {remaining_cap}\n"
+                "Preparing one original post and any reply-now drafts..."
+            )
+            approver_user_id = (
+                update.effective_user.id
+                if update.effective_user is not None
+                else message.chat.id
+            )
+            sent_replies = await self._create_reply_approvals(
+                ready,
+                query=search_query,
+                chat_id=message.chat.id,
+                approver_user_id=approver_user_id,
+            )
+
+            contexts = await self._get_trend_contexts_for_tweettrend3(
+                "auto",
+                status,
+                count=1,
+            )
+            sent_posts = 0
+            if contexts:
+                topic, x_context, source, selected_category = contexts[0]
+                generated = (
+                    await self.ai.generate_trend_posts_batch(
+                        [(topic, x_context)],
+                        output_language=self.settings.content_language,
+                    )
+                )[0]
+                approval = self.approvals.create(
+                    kind="post",
+                    text=generated.text,
+                    chat_id=message.chat.id,
+                    approver_user_id=approver_user_id,
+                    target_label=topic,
+                    metadata={
+                        "image_prompt": generated.image_prompt,
+                        "source": source,
+                        "category": selected_category,
+                    },
+                )
+                await self._send_approval(
+                    approval,
+                    reason=f"{source} | {selected_category} | {topic}",
+                )
+                sent_posts = 1
+            await status.edit_text(
+                "Today's queue is ready.\n"
+                f"Reply cards: {sent_replies}\n"
+                f"Original post cards: {sent_posts}\n"
+                f"Watching for confirmation: {len(watching)}\n\n"
+                "Use Alternative/Shorter only when needed; images are generated on demand."
+            )
+        except Exception as exc:
+            await status.edit_text(_friendly_error(exc))
+        finally:
+            await self._notify_x_account_errors(message)
+
+    async def _create_reply_approvals(
+        self,
+        results: list[XSearchResult],
+        *,
+        query: str,
+        chat_id: int,
+        approver_user_id: int,
+    ) -> int:
+        if not results:
+            return 0
+        selected = results[:REPLY_TARGET_CONTEXT_ITEMS]
+        strategy_by_url = {
+            result.url: self.reply_learning.choose_strategy()
+            for result in selected
+        }
+        drafts = await self.ai.generate_reply_targets(
+            query,
+            summarize_reply_target_context(
+                selected,
+                max_items=REPLY_TARGET_CONTEXT_ITEMS,
+            ),
+            strategy_by_url=strategy_by_url,
+        )
+        sent = 0
+        for draft in drafts:
+            target_url = _format_reply_target_link(draft)
+            if self.approvals.has_active_target(target_url):
+                continue
+            result = _result_for_url(selected, target_url)
+            strategy = strategy_by_url.get(target_url, draft.strategy)
+            approval = self.approvals.create(
+                kind="reply",
+                text=_format_reply_target_reply(draft),
+                chat_id=chat_id,
+                approver_user_id=approver_user_id,
+                target_url=target_url,
+                target_label=draft.target,
+                metadata=_reply_tracking_metadata(result, strategy),
+            )
+            await self._send_approval(approval, reason=draft.reason)
+            self.reply_watch.mark_drafted(target_url)
+            sent += 1
+        return sent
 
     async def _reply_tracking_loop(self) -> None:
         while True:
@@ -631,7 +912,7 @@ class ContentBot:
         current = now or datetime.now(UTC)
         for approval in self.approvals.items():
             if (
-                approval.kind == "reply"
+                approval.kind in {"reply", "post"}
                 and approval.status in {"mobile_approved", "completed"}
             ):
                 self.reply_learning.register_approval(approval)
@@ -641,13 +922,21 @@ class ContentBot:
         if waiting and owner:
             timeline = await self.x_search.user_tweets_and_replies(owner, limit=60)
             for record in waiting:
-                match = match_posted_reply(record, timeline)
+                match = match_posted_content(record, timeline)
                 if match is not None:
                     self.reply_learning.mark_discovered(record["approval_id"], match)
+                    self.approvals.finish_mobile(
+                        record["approval_id"],
+                        published=True,
+                    )
                     continue
                 approved_at = datetime.fromisoformat(str(record["approved_at"]))
                 if current - approved_at > timedelta(minutes=90):
                     self.reply_learning.mark_unmatched(record["approval_id"])
+                    self.approvals.finish_mobile(
+                        record["approval_id"],
+                        published=False,
+                    )
 
         for record in self.reply_learning.records("tracking"):
             checkpoint = self.reply_learning.due_checkpoint(record, now=current)
@@ -656,16 +945,26 @@ class ContentBot:
             reply = await self.x_search.tweet_by_id(int(record["reply_id"]))
             if reply is None:
                 continue
-            root = await self.x_search.tweet_by_id(int(record["target_id"]))
+            root = (
+                await self.x_search.tweet_by_id(int(record["target_id"]))
+                if record.get("kind") == "reply" and record.get("target_id")
+                else None
+            )
             author_replied = False
-            if checkpoint >= CHECKPOINT_MINUTES[-1]:
+            author_response: XSearchResult | None = None
+            if record.get("kind") == "reply":
                 direct_replies = await self.x_search.tweet_replies(reply.id, limit=20)
                 root_author = str(record.get("root_author") or "").casefold()
-                author_replied = any(
-                    item.in_reply_to_tweet_id == reply.id
-                    and item.username.casefold() == root_author
-                    for item in direct_replies
+                author_response = next(
+                    (
+                        item
+                        for item in direct_replies
+                        if item.in_reply_to_tweet_id == reply.id
+                        and item.username.casefold() == root_author
+                    ),
+                    None,
                 )
+                author_replied = author_response is not None
             self.reply_learning.add_snapshot(
                 record["approval_id"],
                 checkpoint_minutes=checkpoint,
@@ -674,6 +973,12 @@ class ContentBot:
                 author_replied=author_replied,
                 captured_at=current,
             )
+            if (
+                author_response is not None
+                and not bool(record.get("followup_created"))
+            ):
+                await self._create_author_followup(record, author_response)
+                self.reply_learning.mark_followup_created(record["approval_id"])
         tuned = self.reply_learning.maybe_tune(now=current)
         if tuned and self._application is not None and self.approval_chat_id is not None:
             status = self.reply_learning.status()
@@ -684,6 +989,35 @@ class ContentBot:
                     f"Version: {status.version}. Use /replylearn rollback to undo."
                 ),
             )
+
+    async def _create_author_followup(
+        self,
+        record: dict[str, Any],
+        author_response: XSearchResult,
+    ) -> None:
+        if self._application is None:
+            return
+        original = self.approvals.get(str(record.get("approval_id") or ""))
+        if original is None:
+            return
+        generated = await self.ai.generate_reply_from_text(author_response.text)
+        approval = self.approvals.create(
+            kind="reply",
+            text=generated.text,
+            chat_id=original.chat_id,
+            approver_user_id=original.approver_user_id,
+            target_url=author_response.url,
+            target_label=f"@{author_response.username} follow-up",
+            metadata=_reply_tracking_metadata(
+                author_response,
+                "author_specific_question",
+            )
+            | {"relationship_followup": True},
+        )
+        await self._send_approval(
+            approval,
+            reason="The original author replied to you; continuing now can strengthen the conversation.",
+        )
 
     async def automation_approval(
         self,
@@ -699,11 +1033,61 @@ class ContentBot:
             await query.answer("Invalid approval request.", show_alert=True)
             return
         decision, approval_id = parts[1], parts[2]
-        if decision not in {"approve", "mobile", "reject"}:
+        if decision not in {
+            "approve",
+            "mobile",
+            "reject",
+            "skip",
+            "alternative",
+            "shorter",
+            "visual",
+        }:
             await query.answer("Unknown approval action.", show_alert=True)
             return
         answered = False
         try:
+            existing = self.approvals.get(approval_id)
+            if existing is None:
+                raise RuntimeError("Unknown approval request.")
+            if decision in {"alternative", "shorter"}:
+                if existing.kind != "reply":
+                    raise RuntimeError("This quick edit is only available for replies.")
+                await query.answer("Generating a revised reply...")
+                answered = True
+                instruction = (
+                    "Write a genuinely different angle using another supported detail. "
+                    "Do not merely swap synonyms."
+                    if decision == "alternative"
+                    else "Make it shorter and faster to read while preserving the specific point."
+                )
+                revised = await self.ai.generate_reply_revision(
+                    str(existing.metadata.get("root_text") or existing.target_label),
+                    existing.text,
+                    instruction,
+                )
+                approval = self.approvals.update_text(existing.id, revised)
+                self.approvals.update_metadata(
+                    existing.id,
+                    revision_count=int(existing.metadata.get("revision_count", 0)) + 1,
+                    last_revision=decision,
+                )
+                await query.edit_message_text(
+                    _approval_message_text(approval, reason="Revised on request"),
+                    reply_markup=_approval_keyboard(approval),
+                )
+                return
+            if decision == "visual":
+                prompt = str(existing.metadata.get("image_prompt") or "").strip()
+                if existing.kind != "post" or not prompt:
+                    raise RuntimeError("No visual prompt is available for this approval.")
+                await query.answer("Generating the visual...")
+                answered = True
+                image = await self.ai.generate_image(prompt)
+                await query.message.reply_photo(
+                    photo=_as_photo(image),
+                    caption="On-demand visual for this post draft.",
+                )
+                return
             approval = self.approvals.decide(
                 approval_id,
                 approve=decision in {"approve", "mobile"},
@@ -711,7 +1095,14 @@ class ContentBot:
                 user_id=query.from_user.id,
                 destination="mobile",
             )
-            if approval.status == "mobile_approved" and approval.kind == "reply":
+            self.reply_learning.record_feedback(
+                approval,
+                approved=decision in {"approve", "mobile"},
+            )
+            if (
+                approval.status == "mobile_approved"
+                and approval.kind in {"reply", "post"}
+            ):
                 self.reply_learning.register_approval(approval)
             await query.answer()
             answered = True
@@ -786,7 +1177,7 @@ class ContentBot:
         if self._application is None:
             return
         if success:
-            if approval.kind == "reply":
+            if approval.kind in {"reply", "post"}:
                 self.reply_learning.register_approval(approval)
             detail = "Reply draft" if approval.kind == "reply" else "Post draft"
             text = f"{detail} opened and filled in X. Review it, then click the final X button."
@@ -860,34 +1251,33 @@ class ContentBot:
                     max_age_minutes=max_age_minutes,
                 ))
                 return
-            await status.edit_text(
-                f"Found {len(results)} fresh candidate(s). Generating reply drafts..."
+            ready, watching = self.reply_watch.classify(results)
+            remaining_cap = max(
+                0,
+                self.settings.creator_daily_reply_cap
+                - _reply_approvals_created_today(
+                    self.approvals.items(),
+                    timezone_name=self.settings.creator_timezone,
+                ),
             )
-            strategy = self.reply_learning.choose_strategy()
-            drafts = await self.ai.generate_reply_targets(
-                search_query,
-                summarize_reply_target_context(results, max_items=REPLY_TARGET_CONTEXT_ITEMS),
-                strategy=strategy,
-            )
-            sent = 0
-            for draft in drafts:
-                target_url = _format_reply_target_link(draft)
-                if self.approvals.has_active_target(target_url):
-                    continue
-                approval = self.approvals.create(
-                    kind="reply",
-                    text=_format_reply_target_reply(draft),
-                    chat_id=self.approval_chat_id,
-                    approver_user_id=self.approval_chat_id,
-                    target_url=target_url,
-                    target_label=draft.target,
-                    metadata=_reply_tracking_metadata(
-                        _result_for_url(results, target_url),
-                        strategy,
-                    ),
+            ready = ready[:remaining_cap]
+            if not ready:
+                await status.edit_text(
+                    "Scheduled scan found candidates, but none is confirmed enough to "
+                    f"spend a Gemini job yet. Watching: {len(watching)}. "
+                    "The next scan will measure acceleration again."
                 )
-                await self._send_approval(approval, reason=draft.reason)
-                sent += 1
+                return
+            await status.edit_text(
+                f"Found {len(ready)} reply-now candidate(s); "
+                f"watching {len(watching)}. Generating one batch..."
+            )
+            sent = await self._create_reply_approvals(
+                ready,
+                query=search_query,
+                chat_id=self.approval_chat_id,
+                approver_user_id=self.approval_chat_id,
+            )
             if sent:
                 await _delete_message_safely(status)
             else:
@@ -904,18 +1294,25 @@ class ContentBot:
             raise RuntimeError("Automation chat is not ready.")
         status = _SilentStatus()
         contexts = await self._get_trend_contexts_for_tweettrend3(category, status)
-        for topic, x_context, source, selected_category in contexts:
-            generated = await self.ai.generate_trend_post(
-                topic,
-                x_context,
-                output_language="Vietnamese",
-            )
+        generated_posts = await self.ai.generate_trend_posts_batch(
+            [(topic, x_context) for topic, x_context, _source, _category in contexts],
+            output_language=self.settings.content_language,
+        )
+        for (topic, _x_context, source, selected_category), generated in zip(
+            contexts,
+            generated_posts,
+        ):
             approval = self.approvals.create(
                 kind="post",
                 text=generated.text,
                 chat_id=self.approval_chat_id,
                 approver_user_id=self.approval_chat_id,
                 target_label=topic,
+                metadata={
+                    "image_prompt": generated.image_prompt,
+                    "source": source,
+                    "category": selected_category,
+                },
             )
             await self._send_approval(
                 approval,
@@ -949,8 +1346,19 @@ class ContentBot:
         try:
             generated = await self.ai.generate_topic_post(topic)
             await status.delete()
-            await message.reply_text(f"Topic: {generated.topic}\n\nPost:\n{generated.text}")
-            await self._send_optional_image(message, generated, "topic")
+            approval = self.approvals.create(
+                kind="post",
+                text=generated.text,
+                chat_id=message.chat.id,
+                approver_user_id=(
+                    update.effective_user.id
+                    if update.effective_user is not None
+                    else message.chat.id
+                ),
+                target_label=generated.topic or topic,
+                metadata={"image_prompt": generated.image_prompt, "source": "user topic"},
+            )
+            await self._send_approval(approval, reason="User topic")
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
 
@@ -972,21 +1380,19 @@ class ContentBot:
             approver_user_id = (
                 update.effective_user.id if update.effective_user is not None else message.chat.id
             )
-            for index, (topic, x_context, source, selected_category) in enumerate(
-                contexts,
-                start=1,
-            ):
-                await status.edit_text(
-                    f"Generating topic {index}/{total} with Gemini...\n"
-                    f"Topic: {topic}\n"
-                    f"Language: {output_language}\n\n"
-                    "If extension Auto Run is OFF, open its popup and click Run next job."
-                )
-                generated = await self.ai.generate_trend_post(
-                    topic,
-                    x_context,
-                    output_language=output_language,
-                )
+            await status.edit_text(
+                f"Generating {total} distinct topics in one Gemini batch...\n"
+                f"Language: {output_language}\n\n"
+                "If extension Auto Run is OFF, open its popup and click Run next job."
+            )
+            generated_posts = await self.ai.generate_trend_posts_batch(
+                [(topic, x_context) for topic, x_context, _source, _category in contexts],
+                output_language=output_language,
+            )
+            for index, (
+                (topic, _x_context, source, selected_category),
+                generated,
+            ) in enumerate(zip(contexts, generated_posts), start=1):
                 variant = TrendPostVariant(
                     angle=topic,
                     text=generated.text,
@@ -1000,6 +1406,11 @@ class ContentBot:
                     chat_id=message.chat.id,
                     approver_user_id=approver_user_id,
                     target_label=topic,
+                    metadata={
+                        "image_prompt": generated.image_prompt,
+                        "source": source,
+                        "category": selected_category,
+                    },
                 )
                 await self._send_trend_variant(
                     message,
@@ -1010,10 +1421,6 @@ class ContentBot:
                         f"{source} | {selected_category} | {variant.angle}"
                     ),
                 )
-                if index < total:
-                    await status.edit_text(
-                        f"Sent topic {index}/{total}. Preparing Gemini job {index + 1}/{total}..."
-                    )
             await status.edit_text(
                 f"Language: {output_language}\n"
                 f"All {total} topic-based tweet drafts sent."
@@ -1052,11 +1459,22 @@ class ContentBot:
                 visual_note=visual_note,
             )
             await status.delete()
-            await message.reply_text(
-                f"Source: {result.url}\n\n"
-                f"Remix tweet:\n{generated.text}"
+            approval = self.approvals.create(
+                kind="post",
+                text=generated.text,
+                chat_id=message.chat.id,
+                approver_user_id=(
+                    update.effective_user.id
+                    if update.effective_user is not None
+                    else message.chat.id
+                ),
+                target_label=f"Remix of @{result.username}",
+                metadata={
+                    "image_prompt": generated.image_prompt,
+                    "source": result.url,
+                },
             )
-            await self._send_optional_image(message, generated, "remix")
+            await self._send_approval(approval, reason=f"Original remix of {result.url}")
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -1079,11 +1497,29 @@ class ContentBot:
                 "Sending daily tweet options with optional images..."
             )
             for index, variant in enumerate(variants, start=1):
+                approval = self.approvals.create(
+                    kind="post",
+                    text=_format_trend_variant_copy(variant),
+                    chat_id=message.chat.id,
+                    approver_user_id=(
+                        update.effective_user.id
+                        if update.effective_user is not None
+                        else message.chat.id
+                    ),
+                    target_label=variant.angle or topic,
+                    metadata={
+                        "image_prompt": variant.image_prompt,
+                        "source": source,
+                        "category": category,
+                    },
+                )
                 await self._send_trend_variant(
                     message,
                     variant,
                     index,
                     label="Daily tweet",
+                    approval=approval,
+                    approval_reason=f"{source} | {category} | {topic}",
                 )
             await status.edit_text(
                 f"Source: {source}\nCategory: {category}\nTopic: {topic}\n\n"
@@ -1116,8 +1552,25 @@ class ContentBot:
                 summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS),
             )
             await status.delete()
-            await message.reply_text(f"Topic: {generated.topic}\n\nTweet:\n{generated.text}")
-            await self._send_optional_image(message, generated, "topic")
+            approval = self.approvals.create(
+                kind="post",
+                text=generated.text,
+                chat_id=message.chat.id,
+                approver_user_id=(
+                    update.effective_user.id
+                    if update.effective_user is not None
+                    else message.chat.id
+                ),
+                target_label=generated.topic or topic,
+                metadata={
+                    "image_prompt": generated.image_prompt,
+                    "source": f"X search: {search_query}",
+                },
+            )
+            await self._send_approval(
+                approval,
+                reason=f"Live X context: {search_query}",
+            )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -1146,9 +1599,6 @@ class ContentBot:
     async def replytargets(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         query = " ".join(context.args).strip()
-        if not query:
-            await self._request_command_input(update, "replytargets")
-            return
         if query.lower() == "auto":
             query = ""
 
@@ -1182,39 +1632,39 @@ class ContentBot:
                     )
                 )
                 return
-
-            await status.edit_text("Drafting high-signal replies...")
-            strategy = self.reply_learning.choose_strategy()
-            drafts = await self.ai.generate_reply_targets(
-                search_query,
-                summarize_reply_target_context(
-                    results,
-                    max_items=REPLY_TARGET_CONTEXT_ITEMS,
+            ready, watching = self.reply_watch.classify(results)
+            remaining_cap = max(
+                0,
+                self.settings.creator_daily_reply_cap
+                - _reply_approvals_created_today(
+                    self.approvals.items(),
+                    timezone_name=self.settings.creator_timezone,
                 ),
-                strategy=strategy,
             )
-            del auto_note
-            await status.delete()
+            ready = ready[:remaining_cap]
+            if not ready:
+                await status.edit_text(
+                    f"Watching {len(watching)} promising candidate(s). None has enough "
+                    "confirmation yet, so no Gemini job was spent. Run /replytargets again "
+                    "after the next 15-minute snapshot, or use /today for the full queue."
+                )
+                return
+            await status.edit_text(
+                f"Drafting {len(ready)} confirmed reply-now candidate(s); "
+                f"watching {len(watching)}..."
+            )
             approver_user_id = (
                 update.effective_user.id if update.effective_user is not None else message.chat.id
             )
-            for draft in drafts:
-                target_url = _format_reply_target_link(draft)
-                if self.approvals.has_active_target(target_url):
-                    continue
-                approval = self.approvals.create(
-                    kind="reply",
-                    text=_format_reply_target_reply(draft),
-                    chat_id=message.chat.id,
-                    approver_user_id=approver_user_id,
-                    target_url=target_url,
-                    target_label=draft.target,
-                    metadata=_reply_tracking_metadata(
-                        _result_for_url(results, target_url),
-                        strategy,
-                    ),
-                )
-                await self._send_approval(approval, reason=draft.reason)
+            sent = await self._create_reply_approvals(
+                ready,
+                query=search_query,
+                chat_id=message.chat.id,
+                approver_user_id=approver_user_id,
+            )
+            await status.edit_text(
+                f"Sent {sent} reply card(s). Watching {len(watching)} candidate(s)."
+            )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -1481,11 +1931,17 @@ class ContentBot:
 
         niche_topic_count = len({_trend_topic_key(item[0].title) for item in candidates})
         if niche_topic_count < count:
-            for selected_category in categories:
-                await status.edit_text(
-                    f"Scanning X, Google Trends, and RSS sources for {selected_category}..."
-                )
-                signals, errors = await self.trend_sources.collect(selected_category)
+            await status.edit_text(
+                "Scanning X, Google Trends, and RSS categories concurrently..."
+            )
+            category_results = await asyncio.gather(
+                *(self.trend_sources.collect(item) for item in categories),
+                return_exceptions=True,
+            )
+            for selected_category, response in zip(categories, category_results):
+                if isinstance(response, Exception):
+                    continue
+                signals, errors = response
                 for signal in signals:
                     candidates.append((signal, selected_category, signals, errors))
 
@@ -1504,11 +1960,14 @@ class ContentBot:
             if len(selected) == count:
                 break
 
-        contexts: list[tuple[str, str, str, str]] = []
-        for signal, selected_category, signals, errors in selected:
-            await status.edit_text(
-                f"Enriching trend {len(contexts) + 1}/{len(selected)}: {signal.title}"
-            )
+        await status.edit_text(
+            f"Enriching {len(selected)} selected trend(s) with X context concurrently..."
+        )
+
+        async def enrich_selected(
+            item: tuple[Any, str, list[Any], list[str]],
+        ) -> tuple[str, str, str, str]:
+            signal, selected_category, signals, errors = item
             search_query = ""
             results: list[XSearchResult] = []
             notes = list(errors)
@@ -1539,15 +1998,14 @@ class ContentBot:
                 context_parts.append(
                     "Source notes:\n" + "\n".join(f"- {note}" for note in notes[-4:])
                 )
-            contexts.append(
-                (
-                    signal.title,
-                    "\n\n".join(context_parts),
-                    f"multi-source trend scan ({signal.source})",
-                    selected_category,
-                )
+            return (
+                signal.title,
+                "\n\n".join(context_parts),
+                f"multi-source trend scan ({signal.source})",
+                selected_category,
             )
 
+        contexts = list(await asyncio.gather(*(enrich_selected(item) for item in selected)))
         if contexts:
             return contexts
 
@@ -1567,7 +2025,9 @@ class ContentBot:
         *,
         max_age_minutes: int = 360,
         languages: list[str] | tuple[str, ...] | str | None = None,
+        mode: str | None = None,
     ) -> tuple[str, list[XSearchResult], str]:
+        selected_mode = mode or self.settings.reply_target_mode
         selected_languages = parse_reply_target_languages(
             languages,
             default=self.settings.reply_target_languages,
@@ -1575,30 +2035,44 @@ class ContentBot:
         if query:
             candidates = _expand_reply_target_query(query, selected_languages)
         else:
-            candidates = await self._auto_reply_target_queries(selected_languages)
+            candidates = await self._auto_reply_target_queries(
+                selected_languages,
+                mode=selected_mode,
+            )
         candidates = _dedupe_queries(candidates)[:REPLY_TARGET_MAX_CANDIDATES]
         last_search_query = query or "auto hot topics"
 
-        searched: list[tuple[str, str, list[XSearchResult]]] = []
-        for candidate in candidates:
-            await status.edit_text(
-                "Comparing fresh conversation momentum...\n"
-                f"Trying: {candidate}\n"
-                f"Lookback: {max_age_minutes} minutes\n"
-                f"Languages: {', '.join(selected_languages)}"
-            )
+        await status.edit_text(
+            "Comparing fresh conversation momentum...\n"
+            f"Queries: {len(candidates)} (up to 3 concurrently)\n"
+            f"Mode: {selected_mode}\n"
+            f"Lookback: {max_age_minutes} minutes\n"
+            f"Languages: {', '.join(selected_languages)}"
+        )
+        semaphore = asyncio.Semaphore(3)
+
+        async def search_one(
+            candidate: str,
+        ) -> tuple[str, str, list[XSearchResult]] | None:
             try:
-                search_query, recent_results = await asyncio.wait_for(
-                    self._search_reply_target_pool(
-                        candidate,
-                        max_age_minutes=max_age_minutes,
-                    ),
-                    timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
-                )
+                async with semaphore:
+                    search_query, recent_results = await asyncio.wait_for(
+                        self._search_reply_target_pool(
+                            candidate,
+                            max_age_minutes=max_age_minutes,
+                        ),
+                        timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
+                    )
             except Exception:
-                continue
-            last_search_query = search_query
-            searched.append((candidate, search_query, recent_results))
+                return None
+            return candidate, search_query, recent_results
+
+        responses = await asyncio.gather(
+            *(search_one(candidate) for candidate in candidates)
+        )
+        searched = [item for item in responses if item is not None]
+        if searched:
+            last_search_query = searched[-1][1]
 
         # Compare every configured language/topic in one pool. Snapshot deltas
         # replace lifetime averages once the same post has been observed twice.
@@ -1609,6 +2083,8 @@ class ContentBot:
             max_age_minutes=max_age_minutes,
             relaxed=False,
         )
+        results = await self._enrich_reply_thread_context(results)
+        results = self._apply_reply_target_mode(results, selected_mode)
         if results:
             selected_query = search_query_by_url.get(results[0].url, last_search_query)
             note = (
@@ -1625,11 +2101,117 @@ class ContentBot:
             max_age_minutes=max_age_minutes,
             relaxed=True,
         )
+        results = await self._enrich_reply_thread_context(results)
+        results = self._apply_reply_target_mode(results, selected_mode)
         if results:
             selected_query = search_query_by_url.get(results[0].url, last_search_query)
             return selected_query, results, "Selected the strongest fresh fallback.\n"
 
         return last_search_query, [], ""
+
+    async def _enrich_reply_thread_context(
+        self,
+        results: list[XSearchResult],
+    ) -> list[XSearchResult]:
+        semaphore = asyncio.Semaphore(3)
+
+        async def enrich(result: XSearchResult) -> XSearchResult:
+            try:
+                async with semaphore:
+                    replies = await asyncio.wait_for(
+                        self.x_search.tweet_replies(result.id, limit=12),
+                        timeout=12,
+                    )
+            except Exception:
+                return result
+            non_author = [
+                item
+                for item in replies
+                if item.username.casefold() != result.username.casefold()
+            ]
+            top_reply_likes = max(
+                (item.like_count for item in non_author),
+                default=0,
+            )
+            author_has_replied = any(
+                item.username.casefold() == result.username.casefold()
+                and item.id != result.id
+                for item in replies
+            )
+            return replace(
+                result,
+                top_reply_like_count=top_reply_likes,
+                root_author_has_replied=author_has_replied,
+            )
+
+        return list(await asyncio.gather(*(enrich(result) for result in results[:5])))
+
+    def _apply_reply_target_mode(
+        self,
+        results: list[XSearchResult],
+        mode: str,
+    ) -> list[XSearchResult]:
+        niche_terms = {
+            token.casefold()
+            for token in re.findall(
+                r"[A-Za-z0-9+#]{3,}",
+                f"{self.settings.creator_niche} {self.settings.target_audience}",
+            )
+        }
+        adjusted: list[XSearchResult] = []
+        for result in results:
+            text_terms = {
+                token.casefold()
+                for token in re.findall(r"[A-Za-z0-9+#]{3,}", result.text)
+            }
+            overlap = len(niche_terms & text_terms)
+            affinity = min(100.0, overlap * 22.0)
+            relationship = min(
+                100.0,
+                self.reply_learning.author_response_rate(result.username) * 100.0,
+            )
+            if mode == "reach":
+                score = (result.viral_score * 0.82) + (
+                    result.thread_availability_score * 0.18
+                )
+            elif mode == "qualified":
+                score = (
+                    result.reply_opportunity_score * 0.58
+                    + affinity * 0.27
+                    + result.breakout_ratio * 15.0
+                )
+            elif mode == "relationship":
+                score = (
+                    result.reply_opportunity_score * 0.52
+                    + relationship * 0.30
+                    + result.thread_availability_score * 0.18
+                )
+            else:
+                score = (
+                    result.reply_opportunity_score * 0.75
+                    + affinity * 0.15
+                    + relationship * 0.10
+                )
+            top_reply_penalty = min(
+                16.0,
+                math.log10(max(result.top_reply_like_count, 1)) * 4.0,
+            )
+            if result.root_author_has_replied:
+                score += 6.0
+            score -= top_reply_penalty
+            adjusted.append(
+                replace(
+                    result,
+                    reply_opportunity_score=min(max(score, 0.0), 100.0),
+                    audience_affinity_score=affinity,
+                    relationship_score=relationship,
+                )
+            )
+        return sorted(
+            adjusted,
+            key=lambda item: item.reply_opportunity_score,
+            reverse=True,
+        )
 
     async def _search_reply_target_pool(
         self,
@@ -1714,6 +2296,8 @@ class ContentBot:
     async def _auto_reply_target_queries(
         self,
         languages: list[str] | tuple[str, ...] | str | None = None,
+        *,
+        mode: str = "balanced",
     ) -> list[str]:
         # /replytargets is deliberately independent from CREATOR_NICHE. Its job
         # is reach discovery across today's largest conversations; niche-led
@@ -1734,6 +2318,17 @@ class ContentBot:
             _query_for_languages(trend_name, selected_languages)
             for trend_name in trend_names
         ]
+        if mode in {"qualified", "balanced"}:
+            niche_query = " OR ".join(
+                f'"{part.strip()}"'
+                for part in re.split(r"[,;]", self.settings.creator_niche)
+                if part.strip()
+            )
+            if niche_query:
+                queries.insert(
+                    0,
+                    _query_for_languages(f"({niche_query})", selected_languages),
+                )
         lanes: dict[str, list[str]] = {}
         for language in selected_languages:
             fallback = AUTO_REPLY_TARGET_FALLBACK_QUERIES_BY_LANGUAGE.get(
@@ -1817,6 +2412,9 @@ class ContentBot:
             await message.reply_text(copy_text)
         else:
             await self._send_approval(approval, reason=approval_reason)
+            # Approval cards expose an on-demand visual button. Avoid spending a
+            # Gemini image job before the user chooses this post.
+            return
 
         if not self.settings.generate_images:
             return
@@ -1896,11 +2494,15 @@ def _reply_tracking_metadata(
     metadata.update(
         {
             "language": result.language,
+            "root_text": result.text,
             "root_author": result.username,
             "root_author_id": result.author_id,
             "root_views": result.view_count,
             "root_replies": result.reply_count,
             "reply_opportunity_score": result.reply_opportunity_score,
+            "viral_score": result.viral_score,
+            "top_reply_like_count": result.top_reply_like_count,
+            "root_author_has_replied": result.root_author_has_replied,
         }
     )
     return metadata
@@ -1944,7 +2546,29 @@ def _approval_message_text(
     reason: str = "",
 ) -> str:
     if approval.kind == "reply":
-        return f"{approval.target_url}\n\n{approval.text}".strip()
+        metadata = approval.metadata or {}
+        signal_parts = []
+        if metadata.get("root_views") is not None:
+            signal_parts.append(f"{int(metadata['root_views']):,} views")
+        if metadata.get("root_replies") is not None:
+            signal_parts.append(f"{int(metadata['root_replies']):,} replies")
+        if metadata.get("reply_opportunity_score") is not None:
+            signal_parts.append(
+                f"opportunity {float(metadata['reply_opportunity_score']):.0f}/100"
+            )
+        if metadata.get("reply_strategy"):
+            signal_parts.append(str(metadata["reply_strategy"]).replace("_", " "))
+        signal_text = " | ".join(signal_parts)
+        details = "\n".join(
+            item
+            for item in (
+                approval.target_url,
+                signal_text,
+                f"Why now: {reason}" if reason else "",
+            )
+            if item
+        )
+        return f"{details}\n\n{approval.text}".strip()
 
     context_lines = []
     if approval.target_label:
@@ -1973,6 +2597,28 @@ def _approval_keyboard(
                 )
             ]
         )
+        if approval.kind == "reply":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "Alternative",
+                        callback_data=f"automation:alternative:{approval.id}",
+                    ),
+                    InlineKeyboardButton(
+                        "Shorter",
+                        callback_data=f"automation:shorter:{approval.id}",
+                    ),
+                ]
+            )
+        elif approval.kind == "post" and approval.metadata.get("image_prompt"):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "Generate visual",
+                        callback_data=f"automation:visual:{approval.id}",
+                    )
+                ]
+            )
     else:
         rows.append(
             [
@@ -1994,7 +2640,7 @@ def _approval_keyboard(
         final_row.append(
             InlineKeyboardButton(
                 "Reject",
-                callback_data=f"automation:reject:{approval.id}",
+                callback_data=f"automation:skip:{approval.id}",
             )
         )
     if final_row:
@@ -2287,6 +2933,81 @@ def _format_persona(settings: Settings) -> str:
         f"- Audience: {settings.target_audience}\n\n"
         "Update with:\n"
         "/persona niche=...; voice=...; audience=..."
+    )
+
+
+def _updated_reply_target_languages(
+    current_value: str,
+    action: str,
+    requested_value: str,
+) -> list[str]:
+    aliases = {
+        "jp": "ja",
+        "kr": "ko",
+        "vn": "vi",
+        "cn": "zh-cn",
+        "zh": "zh-cn",
+    }
+    requested: list[str] = []
+    unsupported: list[str] = []
+    for raw_code in re.split(r"[\s,;]+", requested_value):
+        code = raw_code.strip().lower()
+        if not code:
+            continue
+        code = aliases.get(code, code)
+        if code not in SUPPORTED_REPLY_TARGET_LANGUAGES:
+            unsupported.append(raw_code.strip())
+            continue
+        if code not in requested:
+            requested.append(code)
+    if unsupported:
+        raise RuntimeError(
+            "Unsupported X language code(s): " + ", ".join(unsupported) + ". "
+            "Examples: en, ja, ko, es, pt, id, vi, fr, de, th, zh-cn."
+        )
+    if not requested:
+        raise RuntimeError("Provide at least one supported X language code.")
+
+    current = parse_reply_target_languages(
+        current_value,
+        max_languages=MAX_REPLY_TARGET_LANGUAGES,
+    )
+    if action == "set":
+        updated = requested
+    elif action == "add":
+        updated = current + [code for code in requested if code not in current]
+    elif action == "remove":
+        updated = [code for code in current if code not in requested]
+    else:
+        raise RuntimeError("Language action must be add, remove, or set.")
+
+    if not updated:
+        raise RuntimeError("At least one reply-target language must remain enabled.")
+    if len(updated) > MAX_REPLY_TARGET_LANGUAGES:
+        raise RuntimeError(
+            f"Use at most {MAX_REPLY_TARGET_LANGUAGES} reply-target languages so each scan "
+            "keeps enough search coverage."
+        )
+    return updated
+
+
+def _reply_approvals_created_today(
+    approvals: list[AutomationApproval],
+    *,
+    timezone_name: str = "Asia/Ho_Chi_Minh",
+) -> int:
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone = UTC
+    today = datetime.now(timezone).date()
+    ignored_statuses = {"rejected", "expired", "failed", "not_found"}
+    return sum(
+        1
+        for approval in approvals
+        if approval.kind == "reply"
+        and approval.created_at.astimezone(timezone).date() == today
+        and approval.status not in ignored_statuses
     )
 
 

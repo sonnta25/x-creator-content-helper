@@ -7,6 +7,7 @@ const DEFAULTS = {
   automationEnabled: false,
   activeStart: "08:00",
   activeEnd: "22:00",
+  creatorTimezone: "Asia/Ho_Chi_Minh",
   replyTargetsMinutes: 15,
   replyTargetsMaxAgeMinutes: 360,
   replyTargetsLanguages: "en,ja",
@@ -52,6 +53,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
   if (
     changes.automationEnabled || changes.activeStart || changes.activeEnd ||
+    changes.creatorTimezone ||
     changes.replyTargetsMinutes || changes.replyTargetsMaxAgeMinutes ||
     changes.replyTargetsLanguages || changes.trendTimes
   ) {
@@ -207,11 +209,17 @@ async function automationTick() {
     return { runJobs: false };
   }
   config = await syncTelegramAutomationConfig(config);
-  if (!isInsideActiveWindow(new Date(), config.activeStart, config.activeEnd)) {
+  if (!isInsideActiveWindow(
+    new Date(),
+    config.activeStart,
+    config.activeEnd,
+    config.creatorTimezone
+  )) {
     return { runJobs: Boolean(config.automationRunning) };
   }
 
   const now = new Date();
+  const zoned = zonedDateParts(now, config.creatorTimezone);
   const nowMs = now.getTime();
   let shouldRunJobs = Boolean(config.automationRunning);
   if (!config.nextReplyTargetsAt) {
@@ -240,10 +248,11 @@ async function automationTick() {
 
   const runKeys = new Set(config.trendRunKeys);
   for (const time of parseTrendTimes(config.trendTimes)) {
-    const scheduled = scheduledTimeToday(now, time);
-    const ageMs = nowMs - scheduled.getTime();
-    const key = `${localDateKey(now)}|${time}`;
-    if (ageMs >= 0 && ageMs < 10 * 60 * 1000 && !runKeys.has(key)) {
+    const scheduledMinutes = clockMinutes(time, 0);
+    const currentMinutes = zoned.hour * 60 + zoned.minute;
+    const ageMinutes = currentMinutes - scheduledMinutes;
+    const key = `${zoned.dateKey}|${time}`;
+    if (ageMinutes >= 0 && ageMinutes < 10 && !runKeys.has(key)) {
       await setStatus(`Starting scheduled /tweettrend3 ${config.trendCategory}...`);
       const trigger = await bridgeFetch(config, "/automation/triggers/tweettrend3", {
         method: "POST",
@@ -265,6 +274,20 @@ async function syncTelegramAutomationConfig(config) {
   const minutes = Number(remote.reply_targets_minutes || 0);
   const updatedAt = Number(remote.reply_targets_updated_at || 0);
   const automationRunning = Boolean(remote.automation_running);
+  const creatorTimezone = String(
+    remote.creator_timezone || config.creatorTimezone || DEFAULTS.creatorTimezone
+  );
+  if (creatorTimezone !== config.creatorTimezone) {
+    await chromeStorageSet({ creatorTimezone });
+    config = { ...config, creatorTimezone };
+  }
+  const replyTargetsLanguages = String(
+    remote.reply_target_languages || config.replyTargetsLanguages || DEFAULTS.replyTargetsLanguages
+  ).trim();
+  if (replyTargetsLanguages && replyTargetsLanguages !== config.replyTargetsLanguages) {
+    await chromeStorageSet({ replyTargetsLanguages });
+    config = { ...config, replyTargetsLanguages };
+  }
   if (!Number.isFinite(minutes) || minutes < 5) {
     return { ...config, automationRunning };
   }
@@ -288,8 +311,9 @@ async function syncTelegramAutomationConfig(config) {
   };
 }
 
-function isInsideActiveWindow(date, start, end) {
-  const current = date.getHours() * 60 + date.getMinutes();
+function isInsideActiveWindow(date, start, end, timezone = DEFAULTS.creatorTimezone) {
+  const parts = zonedDateParts(date, timezone);
+  const current = parts.hour * 60 + parts.minute;
   const startMinutes = clockMinutes(start, 0);
   const endMinutes = clockMinutes(end, 24 * 60 - 1);
   if (startMinutes === endMinutes) return true;
@@ -297,6 +321,43 @@ function isInsideActiveWindow(date, start, end) {
     return current >= startMinutes && current < endMinutes;
   }
   return current >= startMinutes || current < endMinutes;
+}
+
+function zonedDateParts(date, timezone) {
+  let formatter;
+  try {
+    formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: String(timezone || DEFAULTS.creatorTimezone),
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    });
+  } catch (_error) {
+    formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: DEFAULTS.creatorTimezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    });
+  }
+  const values = {};
+  for (const part of formatter.formatToParts(date)) {
+    if (part.type !== "literal") values[part.type] = part.value;
+  }
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+    dateKey: `${values.year}-${values.month}-${values.day}`
+  };
 }
 
 function clockMinutes(value, fallback) {
@@ -2035,6 +2096,7 @@ async function loadConfig() {
     automationEnabled: Boolean(saved.automationEnabled),
     activeStart: String(saved.activeStart || DEFAULTS.activeStart),
     activeEnd: String(saved.activeEnd || DEFAULTS.activeEnd),
+    creatorTimezone: String(saved.creatorTimezone || DEFAULTS.creatorTimezone),
     replyTargetsMinutes: Math.max(5, Number(saved.replyTargetsMinutes || DEFAULTS.replyTargetsMinutes)),
     replyTargetsMaxAgeMinutes: Math.min(1440, Math.max(
       30,
@@ -2064,6 +2126,7 @@ async function saveConfig(config) {
     automationEnabled: Boolean(config.automationEnabled),
     activeStart: String(config.activeStart || DEFAULTS.activeStart),
     activeEnd: String(config.activeEnd || DEFAULTS.activeEnd),
+    creatorTimezone: String(config.creatorTimezone || DEFAULTS.creatorTimezone),
     replyTargetsMinutes: Math.max(5, Number(config.replyTargetsMinutes || DEFAULTS.replyTargetsMinutes)),
     replyTargetsMaxAgeMinutes: Math.min(1440, Math.max(
       30,

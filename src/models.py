@@ -25,6 +25,7 @@ class ReplyTargetDraft:
     target: str
     reason: str
     reply: str
+    strategy: str = "specific_observation"
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,10 @@ class XSearchResult:
     author_id: int | None = None
     conversation_id: int | None = None
     in_reply_to_tweet_id: int | None = None
+    top_reply_like_count: int = 0
+    root_author_has_replied: bool = False
+    audience_affinity_score: float = 0.0
+    relationship_score: float = 0.0
 
 
 @dataclass(frozen=True)

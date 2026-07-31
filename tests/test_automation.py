@@ -150,3 +150,32 @@ def test_mobile_approval_can_be_retried_after_a_failed_telegram_edit(tmp_path) -
 
     assert first.status == "mobile_approved"
     assert retried.status == "mobile_approved"
+
+
+def test_pending_draft_can_be_revised_then_marked_published(tmp_path) -> None:
+    path = tmp_path / "approvals.json"
+    store = AutomationApprovalStore(path)
+    approval = store.create(
+        kind="reply",
+        text="First draft",
+        chat_id=10,
+        target_url="https://x.com/source/status/42",
+    )
+
+    store.update_text(approval.id, "Shorter, stronger draft")
+    store.update_metadata(approval.id, revision_count=1)
+    store.decide(
+        approval.id,
+        approve=True,
+        chat_id=10,
+        user_id=10,
+        destination="mobile",
+    )
+    store.finish_mobile(approval.id, published=True)
+
+    restored = AutomationApprovalStore(path).get(approval.id)
+    assert restored is not None
+    assert restored.text == "Shorter, stronger draft"
+    assert restored.metadata["revision_count"] == 1
+    assert restored.status == "published"
+    assert store.has_active_target("https://x.com/source/status/42") is True

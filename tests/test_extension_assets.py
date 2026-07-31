@@ -38,11 +38,31 @@ def test_replytargets_schedule_and_lookback_are_separate_multilingual_controls()
     assert 'replyTargetsLanguages: "en,ja"' in background_js
     assert "reply_target_max_age_minutes: config.replyTargetsMaxAgeMinutes" in background_js
     assert "reply_target_languages: config.replyTargetsLanguages" in background_js
+    assert "remote.reply_target_languages" in background_js
     assert "replyTargetsMaxAgeMinutes" in popup_js
     assert "replyTargetsLanguages" in popup_js
     assert "/replytargets scan interval" in popup_html
     assert "/replytargets maximum post age" in popup_html
     assert "/replytargets languages" in popup_html
+
+
+def test_extension_scheduling_uses_configured_creator_timezone() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+    popup_js = (PROJECT_ROOT / "browser_extension" / "popup.js").read_text(
+        encoding="utf-8"
+    )
+    popup_html = (PROJECT_ROOT / "browser_extension" / "popup.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'creatorTimezone: "Asia/Ho_Chi_Minh"' in background_js
+    assert "saved.creatorTimezone || DEFAULTS.creatorTimezone" in background_js
+    assert "function zonedDateParts" in background_js
+    assert "config.creatorTimezone" in background_js
+    assert "creatorTimezone" in popup_js
+    assert "Creator timezone" in popup_html
 
 
 def test_gemini_recovery_does_not_leave_the_only_tab_on_about_blank() -> None:

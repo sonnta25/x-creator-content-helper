@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 import re
 from urllib.parse import quote_plus
@@ -49,43 +53,56 @@ class TrendSourceService:
     ) -> tuple[list[TrendSignal], list[str]]:
         clean_category = normalize_trend_category(category)
         sources = _configured_sources(self.settings.trend_sources)
-        signals: list[TrendSignal] = []
-        errors: list[str] = []
-
+        jobs: list[tuple[str, object]] = []
         if "x" in sources:
-            try:
-                signals.extend(await self._x_trends(clean_category, limit=limit_per_source))
-            except Exception as exc:
-                errors.append(f"X trends: {exc}")
+            jobs.append(
+                ("X trends", self._x_trends(clean_category, limit=limit_per_source))
+            )
 
         if "google_trends" in sources:
-            try:
-                signals.extend(
-                    await self._rss_url_signals(
+            jobs.append(
+                (
+                    "Google Trends RSS",
+                    self._rss_url_signals(
                         google_trends_rss_url(self.settings.google_trends_geo),
                         source="Google Trends",
                         category=clean_category,
                         limit=limit_per_source,
-                    )
+                    ),
                 )
-            except Exception as exc:
-                errors.append(f"Google Trends RSS: {exc}")
+            )
 
         if "rss" in sources:
-            rss_feeds = _rss_feeds_for_category(self.settings.trend_rss_urls, clean_category)
+            rss_feeds = _rss_feeds_for_category(
+                self.settings.trend_rss_urls,
+                clean_category,
+                geo=self.settings.google_trends_geo,
+                language=self.settings.trend_language,
+            )
             for label, url in rss_feeds:
-                try:
-                    signals.extend(
-                        await self._rss_url_signals(
+                jobs.append(
+                    (
+                        label,
+                        self._rss_url_signals(
                             url,
                             source=label,
                             category=clean_category,
                             limit=limit_per_source,
-                        )
+                        ),
                     )
-                except Exception as exc:
-                    errors.append(f"{label}: {exc}")
+                )
 
+        signals: list[TrendSignal] = []
+        errors: list[str] = []
+        responses = await asyncio.gather(
+            *(job for _label, job in jobs),
+            return_exceptions=True,
+        )
+        for (label, _job), response in zip(jobs, responses):
+            if isinstance(response, Exception):
+                errors.append(f"{label}: {response}")
+            else:
+                signals.extend(response)
         return rank_trend_signals(signals), errors
 
     async def collect_niche(
@@ -182,9 +199,31 @@ def google_trends_rss_url(geo: str) -> str:
 def google_news_search_rss_url(query: str, geo: str) -> str:
     clean_query = " ".join(query.split())
     clean_geo = re.sub(r"[^A-Za-z0-9_-]", "", geo.strip() or "US")
+    language = "vi" if clean_geo.upper() == "VN" else "en"
+    locale = "vi" if language == "vi" else "en-US"
     return (
         "https://news.google.com/rss/search?"
-        f"q={quote_plus(clean_query)}&hl=en-US&gl={clean_geo}&ceid={clean_geo}:en"
+        f"q={quote_plus(clean_query)}&hl={locale}&gl={clean_geo}&ceid={clean_geo}:{language}"
+    )
+
+
+def google_news_category_rss_url(
+    category: str,
+    geo: str,
+    language: str,
+) -> str:
+    clean_geo = re.sub(r"[^A-Za-z0-9_-]", "", geo.strip() or "US").upper()
+    clean_language = re.sub(r"[^A-Za-z-]", "", language.strip() or "en").lower()
+    locale = "vi" if clean_language == "vi" else "en-US"
+    topic = {
+        "trending": "topstories",
+        "news": "headlines/section/topic/NATION",
+        "sport": "headlines/section/topic/SPORTS",
+        "entertainment": "headlines/section/topic/ENTERTAINMENT",
+    }[category]
+    return (
+        f"https://news.google.com/rss/{topic}?"
+        f"hl={locale}&gl={clean_geo}&ceid={clean_geo}:{clean_language}"
     )
 
 
@@ -244,15 +283,25 @@ def summarize_trend_signals(signals: list[TrendSignal], max_items: int = 10) -> 
 
 
 def rank_trend_signals(signals: list[TrendSignal]) -> list[TrendSignal]:
-    deduped: list[TrendSignal] = []
-    seen: set[str] = set()
-    for signal in sorted(signals, key=lambda item: item.score, reverse=True):
+    grouped: dict[str, list[TrendSignal]] = {}
+    for signal in signals:
         key = _trend_key(signal.title)
-        if not key or key in seen:
+        if not key:
             continue
-        seen.add(key)
-        deduped.append(signal)
-    return deduped
+        grouped.setdefault(key, []).append(signal)
+    ranked: list[TrendSignal] = []
+    now = datetime.now(timezone.utc)
+    for group in grouped.values():
+        best = max(group, key=lambda item: item.score)
+        confirmations = len({item.source for item in group})
+        recency_bonus = _published_recency_bonus(best.published_at, now)
+        ranked.append(
+            replace(
+                best,
+                score=best.score + min(30.0, (confirmations - 1) * 12.0) + recency_bonus,
+            )
+        )
+    return sorted(ranked, key=lambda item: item.score, reverse=True)
 
 
 def _configured_sources(raw_sources: str) -> set[str]:
@@ -273,8 +322,19 @@ def _configured_sources(raw_sources: str) -> set[str]:
     return sources or {"x", "google_trends", "rss"}
 
 
-def _rss_feeds_for_category(raw_urls: str, category: str) -> list[tuple[str, str]]:
-    feeds = [("Google News RSS", DEFAULT_GOOGLE_NEWS_RSS_URLS[category])]
+def _rss_feeds_for_category(
+    raw_urls: str,
+    category: str,
+    *,
+    geo: str = "US",
+    language: str = "en",
+) -> list[tuple[str, str]]:
+    feeds = [
+        (
+            "Google News RSS",
+            google_news_category_rss_url(category, geo, language),
+        )
+    ]
     feeds.extend(_custom_rss_feeds(raw_urls))
     return feeds
 
@@ -318,6 +378,26 @@ def _compact_text(text: str, limit: int) -> str:
 
 
 def _trend_key(title: str) -> str:
-    clean = re.sub(r"[^a-z0-9]+", " ", title.lower())
-    words = [word for word in clean.split() if len(word) > 2]
+    clean = "".join(
+        char.casefold() if char.isalnum() else " "
+        for char in title
+    )
+    words = [
+        word
+        for word in clean.split()
+        if len(word) > 2 or any(ord(char) > 127 for char in word)
+    ]
     return " ".join(words[:8])
+
+
+def _published_recency_bonus(value: str, now: datetime) -> float:
+    if not value:
+        return 0.0
+    try:
+        published = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    age_hours = max(0.0, (now - published.astimezone(timezone.utc)).total_seconds() / 3600)
+    return max(0.0, 18.0 * (1.0 - min(age_hours, 48.0) / 48.0))

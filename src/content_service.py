@@ -121,9 +121,9 @@ source with real detail can use a few short paragraphs. Do not force a hook, les
 and rhetorical question into the same post.
 
 WRITING RULES
-- Long-form single posts are allowed.
-- Aim for 400-1,200 characters when the topic/source has enough substance; shorter is
-  better than padding a thin trend.
+- Long-form single posts are allowed, but most drafts should be compact.
+- Prefer 80-600 characters. Use 600-1,200 only when the source has enough concrete
+  substance to reward the extra reading time.
 - Use 2-6 short paragraphs or compact bullets if that makes the idea easier to scan.
 - Stay under the bot's configured X post character limit.
 - One topic only.
@@ -562,6 +562,70 @@ class ContentService:
         )
         return await self._generate_content(prompt)
 
+    async def generate_trend_posts_batch(
+        self,
+        contexts: list[tuple[str, str]],
+        output_language: str = "Vietnamese",
+    ) -> list[GeneratedContent]:
+        if not contexts:
+            return []
+        language = _normalize_output_language(output_language)
+        context_blocks = "\n\n".join(
+            f"TOPIC {index}: {topic}\nCONTEXT {index}:\n{x_context}"
+            for index, (topic, x_context) in enumerate(contexts[:3], start=1)
+        )
+        prompt = _tweet_engine_prompt(
+            self.settings,
+            topic="three distinct current topics",
+            brief=(
+                f"Create exactly {len(contexts[:3])} independent {language} X posts, "
+                "one for each numbered topic. Preserve the topic order. Each post needs "
+                "one context-grounded point of view and must not mix facts between topics. "
+                "Vary length naturally: at least one concise post, one medium post, and use "
+                "a longer post only when the supplied facts support it."
+            ),
+            context=context_blocks,
+            output_language=language,
+            output_contract=f"""
+Return JSON only:
+{{
+  "posts": [
+    {{
+      "topic": "exact numbered topic",
+      "text": "copy-ready post under {self.settings.x_post_char_limit} characters",
+      "image_prompt": "square realistic visual prompt"
+    }}
+  ]
+}}
+Return exactly {len(contexts[:3])} posts in the same order as the numbered topics.
+""",
+        )
+        raw = await self._generate_text(prompt)
+        payload = _parse_json(raw)
+        rows = _first_list_value(payload, "posts", "items", "results")
+        if not isinstance(rows, list):
+            raise RuntimeError("AI response missed required posts list.")
+        generated: list[GeneratedContent] = []
+        for index, row in enumerate(rows[: len(contexts[:3])]):
+            if not isinstance(row, dict):
+                continue
+            text = _limit_x_post_text(
+                _payload_text(row, "text", "tweet", "post", "content"),
+                self.settings.x_post_char_limit,
+            )
+            if not text or _looks_like_prompt_leak(text):
+                continue
+            topic = _payload_text(row, "topic", "title") or contexts[index][0]
+            image_prompt = _realistic_image_prompt(
+                _payload_text(row, "image_prompt", "image", "visual_prompt")
+            ) or _fallback_image_prompt(topic, text)
+            generated.append(
+                GeneratedContent(text=text, image_prompt=image_prompt, topic=topic)
+            )
+        if len(generated) != len(contexts[:3]):
+            raise RuntimeError("AI did not return one usable post for every trend topic.")
+        return generated
+
     async def generate_daily_brief(
         self,
         category: str,
@@ -584,9 +648,9 @@ Recent X context:
 {x_context}
 
 Requirements:
-- Each option must be one long-form single X post, not a thread.
-- Aim for 400-1,200 characters per option when the context supports it; do not pad a
-  thin trend into an essay.
+- Each option must be one single X post, not a thread.
+- Deliberately mix lengths: one short punchy post (80-220 characters), one medium post
+  (220-600), and one deeper post (600-1,200 only when the context supports it).
 - Each option must stay under {self.settings.x_post_char_limit} characters.
 - Make the options meaningfully different, but let the available context choose the
   angle: a grounded reaction, a concrete detail, or a restrained alternative read.
@@ -602,8 +666,9 @@ Requirements:
   the supplied context itself does so.
 - Avoid engagement bait, fake urgency, and generic summaries.
 - {_hashtag_instruction(self.settings.hashtag_mode)}
-- Suggest 1-2 concise, relevant hashtags per option. Do not use generic hashtags like
-  #viral, #trending, #news, or #motivation.
+- If the hashtag instruction above says none, return an empty hashtags array.
+- Otherwise use at most the allowed number of concise, relevant hashtags. Never use
+  generic tags like #viral, #trending, #news, or #motivation.
 - Add a short score for each option: Originality, Clarity, Follow potential.
 - Add one English image_prompt per option for a square realistic photo, created from
   that option's final post text using the Editorial Visual Strategist rules below.
@@ -641,6 +706,26 @@ Return only valid JSON with this shape:
             image_prompt="",
             topic="reply",
         )
+
+    async def generate_reply_revision(
+        self,
+        source_text: str,
+        current_reply: str,
+        instruction: str,
+    ) -> str:
+        prompt = _reply_engine_prompt(
+            self.settings,
+            task=(
+                "Revise the current reply without changing its supported factual meaning. "
+                f"Revision request: {instruction}"
+            ),
+            context=(
+                f"Source post:\n{source_text}\n\n"
+                f"Current reply:\n{current_reply}"
+            ),
+            output_contract=_single_reply_output_contract(),
+        )
+        return _parse_single_reply(await self._generate_text(prompt))
 
     async def generate_retweet_remix(
         self,
@@ -728,8 +813,19 @@ Requirements:
         x_context: str,
         *,
         strategy: str = "specific_observation",
+        strategy_by_url: dict[str, str] | None = None,
     ) -> list[ReplyTargetDraft]:
         strategy_instruction = _reply_strategy_instruction(strategy)
+        allocation = ""
+        if strategy_by_url:
+            allocation = (
+                "Use the exact strategy assigned to each URL below and return that strategy "
+                "in the JSON object:\n"
+                + "\n".join(
+                    f"- {url}: {name} — {_reply_strategy_instruction(name)}"
+                    for url, name in strategy_by_url.items()
+                )
+            )
         prompt = _reply_engine_prompt(
             self.settings,
             task=(
@@ -744,7 +840,8 @@ Requirements:
                 "natural Japanese for a Japanese post. When a precise question follows "
                 "naturally, aim it at a concrete decision, assumption, or tradeoff the "
                 "original author can actually answer; never append a generic engagement hook. "
-                f"For this batch, use this reply strategy: {strategy_instruction}"
+                f"For this batch, use this reply strategy when no per-URL strategy is assigned: "
+                f"{strategy_instruction}\n{allocation}"
             ),
             context=f"Candidate X posts:\n{x_context}",
             output_contract=_reply_targets_output_contract(),
@@ -892,14 +989,16 @@ def _tweet_variants_output_contract(
     language = _normalize_output_language(output_language)
     return f"""
 Internal output format for the bot:
-- Return exactly 3 long-form X post options.
+- Return exactly 3 single-post X options.
 - Each option must independently follow the shared Knowledge Engine rules.
 - Each option must have a distinct POV; do not return three versions of the same generic take.
 - Each text must be written in {language}.
 - Each text must be one single post, not a thread.
 - Each text must be under {char_limit} characters.
-- Aim for 400-1,200 characters when the trend/context supports it; use fewer words when the available facts are thin.
-- Put 2-5 directly relevant hashtags in the "hashtags" array.
+- Deliberately mix lengths: one short option (80-220 characters), one medium option
+  (220-600), and one deep option (600-1,200 only when facts support it).
+- Follow the configured hashtag instruction. When hashtags are disabled, return an
+  empty "hashtags" array; otherwise use only the allowed number.
 - Do not use generic hashtags like #viral, #trending, #news, or #motivation.
 - Add a short score for each option: Originality, Clarity, Follow potential.
 - Add one English image_prompt per option for a square realistic photo, created from that option's final post text using the Editorial Visual Strategist rules.
@@ -985,7 +1084,7 @@ CRITICAL FORMAT RULES:
 - The top-level object must contain a "targets" array.
 - Return at most 3 targets, choosing the strongest available candidates.
 - Do not return "replies", "items", "results", "options", or plain text.
-- Each target must include url, target, reason, and reply.
+- Each target must include url, target, reason, strategy, and reply.
 - URL values must be plain https://x.com/... strings, never Markdown links.
 - Escape every double quote inside a JSON string as \\\". The complete response must parse as JSON.
 
@@ -1005,6 +1104,7 @@ Return only valid JSON with this shape:
       "url": "exact candidate URL",
       "target": "@author - short topic",
       "reason": "why this is worth replying to",
+      "strategy": "assigned strategy name",
       "reply": "copy-ready reply under 220 characters"
     }
   ]
@@ -1022,7 +1122,7 @@ def _reply_targets_repair_prompt(
 You are a Twitter/X Reply Engine repairing an unusable reply-target response.
 
 Return JSON only with one top-level `targets` array. Return 1-3 targets.
-Each object must contain exactly: url, target, reason, reply.
+Each object must contain: url, target, reason, strategy, reply.
 Copy each url exactly from Candidate X posts. Never invent or omit a URL.
 Write one short, natural reply for each selected candidate. Do not return an empty array.
 Each reply must add one source-grounded observation, tension, implication, or real
@@ -1040,7 +1140,7 @@ Previous unusable output:
 {_compact_error_text(failed_output, 1200)}
 
 Required shape:
-{{"targets":[{{"url":"exact candidate URL","target":"@author - topic","reason":"short reach reason","reply":"copy-ready reply"}}]}}
+{{"targets":[{{"url":"exact candidate URL","target":"@author - topic","reason":"short reach reason","strategy":"specific_observation","reply":"copy-ready reply"}}]}}
 """.strip()
 
 
@@ -1405,6 +1505,18 @@ def _parse_reply_targets(
                 target=str(item.get("target", "")).strip(),
                 reason=str(item.get("reason", "")).strip(),
                 reply=reply,
+                strategy=(
+                    str(item.get("strategy", "")).strip()
+                    if str(item.get("strategy", "")).strip()
+                    in {
+                        "specific_observation",
+                        "practical_implication",
+                        "respectful_counterpoint",
+                        "author_specific_question",
+                        "natural_humor",
+                    }
+                    else "specific_observation"
+                ),
             )
         )
 

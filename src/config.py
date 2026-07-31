@@ -29,10 +29,16 @@ class Settings:
     reply_learning_enabled: bool = True
     reply_learning_path: str = "data/reply_learning.json"
     reply_tracking_poll_minutes: int = 5
+    reply_watch_path: str = "data/reply_watchlist.json"
+    reply_target_mode: str = "balanced"
+    creator_daily_reply_cap: int = 8
+    creator_timezone: str = "Asia/Ho_Chi_Minh"
+    content_language: str = "Vietnamese"
+    trend_language: str = "en"
     trend_sources: str = "x,google_trends,rss"
     google_trends_geo: str = "US"
     trend_rss_urls: str = ""
-    hashtag_mode: str = "auto"
+    hashtag_mode: str = "none"
     creator_niche: str = "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products"
     creator_voice: str = "witty, practical, dry, slightly contrarian, with a sharp creator POV"
     target_audience: str = "Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools"
@@ -107,11 +113,33 @@ class Settings:
             reply_tracking_poll_minutes=max(
                 1, _int_env("REPLY_TRACKING_POLL_MINUTES", 5)
             ),
+            reply_watch_path=os.getenv(
+                "REPLY_WATCH_PATH", "data/reply_watchlist.json"
+            ).strip()
+            or "data/reply_watchlist.json",
+            reply_target_mode=_choice_env(
+                "REPLY_TARGET_MODE",
+                "balanced",
+                {"balanced", "reach", "qualified", "relationship"},
+            ),
+            creator_daily_reply_cap=max(
+                1, _int_env("CREATOR_DAILY_REPLY_CAP", 8)
+            ),
+            creator_timezone=os.getenv(
+                "CREATOR_TIMEZONE", "Asia/Ho_Chi_Minh"
+            ).strip()
+            or "Asia/Ho_Chi_Minh",
+            content_language=os.getenv(
+                "CONTENT_LANGUAGE", "Vietnamese"
+            ).strip()
+            or "Vietnamese",
+            trend_language=os.getenv("TREND_LANGUAGE", "en").strip().lower()
+            or "en",
             trend_sources=os.getenv("TREND_SOURCES", "x,google_trends,rss").strip()
             or "x,google_trends,rss",
             google_trends_geo=os.getenv("GOOGLE_TRENDS_GEO", "US").strip() or "US",
             trend_rss_urls=os.getenv("TREND_RSS_URLS", "").strip(),
-            hashtag_mode=_choice_env("HASHTAG_MODE", "auto", {"none", "auto", "one"}),
+            hashtag_mode=_choice_env("HASHTAG_MODE", "none", {"none", "auto", "one"}),
             creator_niche=os.getenv(
                 "CREATOR_NICHE",
                 "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products",

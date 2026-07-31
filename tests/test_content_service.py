@@ -658,6 +658,87 @@ def test_generate_reply_targets_includes_selected_learning_strategy() -> None:
     assert "ask the author one precise" in service.last_prompt
 
 
+def test_generate_reply_targets_assigns_strategy_per_candidate_url() -> None:
+    class StrategyService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/88",'
+                '"target":"@source","reason":"Early opening",'
+                '"strategy":"natural_humor",'
+                '"reply":"The quiet part just got its own launch plan."}]}'
+            )
+
+    service = StrategyService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "product launch",
+            "URL: https://x.com/source/status/88\nPost: We changed the rollout plan.",
+            strategy_by_url={
+                "https://x.com/source/status/88": "natural_humor",
+            },
+        )
+    )
+
+    assert "https://x.com/source/status/88: natural_humor" in service.last_prompt
+    assert targets[0].strategy == "natural_humor"
+
+
+def test_generate_trend_posts_batch_uses_one_job_for_multiple_topics() -> None:
+    class BatchService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            return """
+            {"posts":[
+              {"topic":"Gold","text":"Gold moved after the policy detail, not the headline.",
+               "image_prompt":"A square realistic photo of gold bars on a market desk"},
+              {"topic":"AI","text":"The useful AI update is the boring one: fewer handoffs.",
+               "image_prompt":"A square realistic photo of a clean automation workspace"}
+            ]}
+            """
+
+    service = BatchService(Settings(telegram_bot_token="123:ABC"))
+    posts = asyncio.run(
+        service.generate_trend_posts_batch(
+            [
+                ("Gold", "Policy detail and price context"),
+                ("AI", "Workflow release context"),
+            ]
+        )
+    )
+
+    assert len(service.prompts) == 1
+    assert [post.topic for post in posts] == ["Gold", "AI"]
+    assert "Return exactly 2 posts" in service.prompts[0]
+
+
+def test_generate_reply_revision_returns_copy_ready_text() -> None:
+    class RevisionService(ContentService):
+        async def _generate_text(self, prompt: str) -> str:
+            assert "Make it shorter" in prompt
+            assert "Current reply:" in prompt
+            return '{"reply":"The rollout tradeoff matters more than the launch date."}'
+
+    service = RevisionService(Settings(telegram_bot_token="123:ABC"))
+    revised = asyncio.run(
+        service.generate_reply_revision(
+            "We changed the rollout plan.",
+            "This is a much longer current reply about the rollout.",
+            "Make it shorter.",
+        )
+    )
+
+    assert revised == "The rollout tradeoff matters more than the launch date"
+
+
 def test_parse_reply_targets_recovers_all_items_from_unescaped_reply_quotes() -> None:
     targets = _parse_reply_targets(
         r'''

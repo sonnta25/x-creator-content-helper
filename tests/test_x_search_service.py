@@ -50,7 +50,14 @@ def test_default_english_query() -> None:
 def test_reply_target_languages_support_japanese_and_bound_the_scan() -> None:
     assert parse_reply_target_languages("en, ja,ko,ja") == ["en", "ja", "ko"]
     assert parse_reply_target_languages("bad-code", default="en,ja") == ["en", "ja"]
-    assert parse_reply_target_languages("en,ja,ko,es,pt") == ["en", "ja", "ko", "es"]
+    assert parse_reply_target_languages("en,ja,ko,es,pt,id,vi") == [
+        "en",
+        "ja",
+        "ko",
+        "es",
+        "pt",
+        "id",
+    ]
     assert query_for_language("OpenAI", "ja") == "OpenAI lang:ja"
     assert query_for_language("OpenAI lang:vi", "ja") == "OpenAI lang:vi"
 

@@ -29,6 +29,7 @@ DEFAULT_STRATEGY_WEIGHTS = {
 }
 CHECKPOINT_MINUTES = (15, 60, 360, 1440)
 MIN_FINAL_SAMPLES_TO_TUNE = 60
+MIN_FEEDBACK_SAMPLES_TO_TUNE = 20
 TUNE_INTERVAL_DAYS = 7
 MAX_WEIGHT_CHANGE = 0.10
 
@@ -65,6 +66,7 @@ class ReplyLearningStore:
             "last_tuned_at": "",
             "last_tuned_sample_count": 0,
             "records": {},
+            "feedback_events": [],
         }
 
     @property
@@ -101,10 +103,10 @@ class ReplyLearningStore:
         return {strategy: value / total for strategy, value in weights.items()}
 
     def register_approval(self, approval: AutomationApproval) -> dict[str, Any] | None:
-        if approval.kind != "reply":
+        if approval.kind not in {"reply", "post"}:
             return None
         target_id = extract_tweet_id(approval.target_url)
-        if target_id is None:
+        if approval.kind == "reply" and target_id is None:
             return None
         records = self.data.setdefault("records", {})
         existing = records.get(approval.id)
@@ -113,6 +115,7 @@ class ReplyLearningStore:
         metadata = dict(approval.metadata or {})
         record = {
             "approval_id": approval.id,
+            "kind": approval.kind,
             "target_id": target_id,
             "target_url": approval.target_url,
             "draft_text": approval.text,
@@ -133,6 +136,8 @@ class ReplyLearningStore:
             "snapshots": [],
             "author_replied": False,
             "final_score": None,
+            "edit_similarity": None,
+            "followup_created": False,
         }
         records[approval.id] = record
         self._save()
@@ -168,6 +173,11 @@ class ReplyLearningStore:
                 "actual_text": reply.text,
                 "posted_at": _result_datetime(reply).isoformat(),
                 "language": reply.language or record.get("language", ""),
+                "owner_followers_at_posting": reply.author_followers_count,
+                "edit_similarity": _text_similarity(
+                    str(record.get("draft_text") or ""),
+                    reply.text,
+                ),
             }
         )
         self._save()
@@ -206,6 +216,7 @@ class ReplyLearningStore:
         reply: XSearchResult,
         root: XSearchResult | None,
         author_replied: bool = False,
+        owner_followers: int | None = None,
         captured_at: datetime | None = None,
     ) -> dict[str, Any]:
         record = self._record(approval_id)
@@ -219,6 +230,11 @@ class ReplyLearningStore:
             "quotes": int(reply.quote_count),
             "root_views": int(root.view_count or 0) if root else None,
             "root_replies": int(root.reply_count) if root else None,
+            "owner_followers": (
+                int(owner_followers)
+                if owner_followers is not None
+                else reply.author_followers_count
+            ),
         }
         snapshots = [
             item
@@ -231,41 +247,84 @@ class ReplyLearningStore:
         record["author_replied"] = bool(record.get("author_replied") or author_replied)
         if checkpoint_minutes >= CHECKPOINT_MINUTES[-1]:
             record["status"] = "measured"
-            record["final_score"] = _outcome_score(record, snapshot)
+            record["final_score"] = (
+                _post_outcome_score(record, snapshot)
+                if record.get("kind") == "post"
+                else _outcome_score(record, snapshot)
+            )
         self._save()
         return record
 
     def maybe_tune(self, *, now: datetime | None = None) -> bool:
         measured = self.records("measured")
-        if len(measured) < MIN_FINAL_SAMPLES_TO_TUNE:
+        feedback = [
+            row
+            for row in self.data.get("feedback_events", [])
+            if isinstance(row, dict)
+        ]
+        if (
+            len(measured) < MIN_FINAL_SAMPLES_TO_TUNE
+            and len(feedback) < MIN_FEEDBACK_SAMPLES_TO_TUNE
+        ):
             return False
-        if len(measured) <= int(self.data.get("last_tuned_sample_count", 0)):
+        total_samples = len(measured) + len(feedback)
+        if total_samples <= int(self.data.get("last_tuned_sample_count", 0)):
             return False
         current = now or datetime.now(UTC)
         last_raw = str(self.data.get("last_tuned_at") or "")
         if last_raw and current - datetime.fromisoformat(last_raw) < timedelta(days=TUNE_INTERVAL_DAYS):
             return False
 
-        scores: dict[str, list[float]] = {strategy: [] for strategy in STRATEGIES}
+        scores: dict[str, list[tuple[float, float]]] = {
+            strategy: [] for strategy in STRATEGIES
+        }
         for row in measured:
             strategy = str(row.get("strategy") or "")
             if strategy in scores and row.get("final_score") is not None:
-                scores[strategy].append(float(row["final_score"]))
+                edit_weight = max(0.15, float(row.get("edit_similarity") or 1.0))
+                scores[strategy].append((float(row["final_score"]), edit_weight))
+        for row in feedback:
+            strategy = str(row.get("strategy") or "")
+            if strategy in scores:
+                scores[strategy].append(
+                    (70.0 if row.get("approved") else 25.0, 0.35)
+                )
         if sum(bool(values) for values in scores.values()) < 2:
             return False
 
         old = self.weights
-        global_mean = sum(
-            score for values in scores.values() for score in values
-        ) / max(1, sum(len(values) for values in scores.values()))
+        weighted_total = sum(
+            score * weight
+            for values in scores.values()
+            for score, weight in values
+        )
+        weight_total = sum(
+            weight for values in scores.values() for _score, weight in values
+        )
+        global_mean = weighted_total / max(1.0, weight_total)
         quality: dict[str, float] = {}
         for strategy in STRATEGIES:
             values = scores[strategy]
             # Six virtual samples at the global mean prevent a small lucky batch
             # from taking over strategy selection.
-            quality[strategy] = (sum(values) + 6 * global_mean) / (len(values) + 6)
-        quality_total = sum(quality.values()) or 1.0
-        desired = {strategy: quality[strategy] / quality_total for strategy in STRATEGIES}
+            observed_weight = sum(weight for _score, weight in values)
+            quality[strategy] = (
+                sum(score * weight for score, weight in values)
+                + 6 * global_mean
+            ) / (observed_weight + 6)
+        # Treat quality as a multiplier on the current distribution. This makes
+        # an above-average strategy move up and a below-average strategy move
+        # down without flattening untouched strategies toward equal weights.
+        desired_raw = {
+            strategy: old[strategy]
+            * max(0.25, min(4.0, quality[strategy] / max(1.0, global_mean)))
+            for strategy in STRATEGIES
+        }
+        desired_total = sum(desired_raw.values()) or 1.0
+        desired = {
+            strategy: desired_raw[strategy] / desired_total
+            for strategy in STRATEGIES
+        }
         changes = [
             MAX_WEIGHT_CHANGE * old[strategy]
             / abs(desired[strategy] - old[strategy])
@@ -291,7 +350,7 @@ class ReplyLearningStore:
         self.data["strategy_weights"] = new
         self.data["weight_version"] = int(self.data.get("weight_version", 1)) + 1
         self.data["last_tuned_at"] = current.isoformat()
-        self.data["last_tuned_sample_count"] = len(measured)
+        self.data["last_tuned_sample_count"] = total_samples
         self._save()
         return True
 
@@ -319,6 +378,50 @@ class ReplyLearningStore:
             version=int(self.data.get("weight_version", 1)),
             last_tuned_at=str(self.data.get("last_tuned_at") or ""),
         )
+
+    def record_feedback(self, approval: AutomationApproval, *, approved: bool) -> None:
+        strategy = str((approval.metadata or {}).get("reply_strategy") or "")
+        if strategy not in STRATEGIES:
+            return
+        events = self.data.setdefault("feedback_events", [])
+        if any(
+            isinstance(row, dict)
+            and row.get("approval_id") == approval.id
+            and row.get("approved") == bool(approved)
+            for row in events
+        ):
+            return
+        events.append(
+            {
+                "approval_id": approval.id,
+                "strategy": strategy,
+                "language": str((approval.metadata or {}).get("language") or ""),
+                "approved": bool(approved),
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        self.data["feedback_events"] = events[-1000:]
+        self._save()
+
+    def author_response_rate(self, username: str) -> float:
+        clean = username.strip().lstrip("@").casefold()
+        rows = [
+            row
+            for row in self.records("tracking", "measured")
+            if str(row.get("root_author") or "").casefold() == clean
+        ]
+        if not rows:
+            return 0.0
+        # One virtual success and three virtual failures avoid over-trusting a
+        # single lucky author interaction.
+        return (
+            1 + sum(bool(row.get("author_replied")) for row in rows)
+        ) / (4 + len(rows))
+
+    def mark_followup_created(self, approval_id: str) -> None:
+        record = self._record(approval_id)
+        record["followup_created"] = True
+        self._save()
 
     def report(self, days: int = 30, *, now: datetime | None = None) -> dict[str, Any]:
         current = now or datetime.now(UTC)
@@ -351,6 +454,9 @@ class ReplyLearningStore:
                 else 0.0
             ),
             "by_strategy": by_strategy,
+            "posts": sum(row.get("kind") == "post" for row in rows),
+            "replies": sum(row.get("kind") == "reply" for row in rows),
+            "follower_window_lift": _follower_window_lift(rows),
         }
 
     def _record(self, approval_id: str) -> dict[str, Any]:
@@ -391,11 +497,27 @@ def match_posted_reply(
     *,
     discovery_window_minutes: int = 90,
 ) -> XSearchResult | None:
+    return match_posted_content(
+        record,
+        replies,
+        discovery_window_minutes=discovery_window_minutes,
+    )
+
+
+def match_posted_content(
+    record: dict[str, Any],
+    replies: Iterable[XSearchResult],
+    *,
+    discovery_window_minutes: int = 90,
+) -> XSearchResult | None:
     approved_at = _parse_datetime(record.get("approved_at"))
     target_id = int(record.get("target_id") or 0)
+    kind = str(record.get("kind") or "reply")
     candidates = []
     for reply in replies:
-        if reply.in_reply_to_tweet_id != target_id:
+        if kind == "reply" and reply.in_reply_to_tweet_id != target_id:
+            continue
+        if kind == "post" and reply.in_reply_to_tweet_id is not None:
             continue
         posted_at = _result_datetime(reply)
         seconds = (posted_at - approved_at).total_seconds()
@@ -433,6 +555,48 @@ def _outcome_score(record: dict[str, Any], snapshot: dict[str, Any]) -> float:
         + (20 if record.get("author_replied") else 0)
     )
     return round(max(0.0, min(100.0, score)), 2)
+
+
+def _post_outcome_score(record: dict[str, Any], snapshot: dict[str, Any]) -> float:
+    views = max(0, int(snapshot.get("views") or 0))
+    followers = max(1, int(record.get("owner_followers_at_posting") or 1))
+    weighted_engagement = (
+        int(snapshot.get("likes") or 0)
+        + 2 * int(snapshot.get("replies") or 0)
+        + 2 * int(snapshot.get("reposts") or 0)
+        + 3 * int(snapshot.get("quotes") or 0)
+    )
+    reach_ratio = views / followers
+    engagement_rate = weighted_engagement / max(1, views)
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                (60 * min(1.0, reach_ratio / 2.0))
+                + (40 * min(1.0, engagement_rate / 0.05)),
+            ),
+        ),
+        2,
+    )
+
+
+def _follower_window_lift(rows: list[dict[str, Any]]) -> int:
+    """Account delta across tracked post windows without double-counting overlaps."""
+    baselines = []
+    observed = []
+    for row in rows:
+        if row.get("kind") != "post" or not row.get("snapshots"):
+            continue
+        baseline = int(row.get("owner_followers_at_posting") or 0)
+        latest = int((row.get("snapshots") or [{}])[-1].get("owner_followers") or 0)
+        if baseline > 0:
+            baselines.append(baseline)
+        if latest > 0:
+            observed.append(latest)
+    if not baselines or not observed:
+        return 0
+    return max(0, max(observed) - min(baselines))
 
 
 def _result_datetime(result: XSearchResult) -> datetime:

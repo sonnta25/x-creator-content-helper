@@ -55,6 +55,12 @@
         </div>
 
         <label>
+          Creator timezone
+          <input id="creatorTimezone" spellcheck="false" placeholder="Asia/Ho_Chi_Minh">
+        </label>
+        <p class="hint">Active hours and fixed trend times use this IANA timezone, not the VPS clock.</p>
+
+        <label>
           /replytargets scan interval (minutes)
           <input id="replyTargetsMinutes" type="number" min="5" step="1">
         </label>
@@ -68,7 +74,7 @@
           /replytargets languages
           <input id="replyTargetsLanguages" spellcheck="false" placeholder="en,ja">
         </label>
-        <p class="hint">Comma-separated X language codes. No country filter is applied.</p>
+        <p class="hint">Comma-separated X language codes. /replylangs in Telegram is the source of truth and syncs this field. No country filter is applied.</p>
         <p id="replyScheduleStatus" class="hint"></p>
 
         <label>

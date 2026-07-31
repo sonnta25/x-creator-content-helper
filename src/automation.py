@@ -87,6 +87,8 @@ class AutomationApprovalStore:
             "completed",
             "rejected",
             "mobile_approved",
+            "published",
+            "not_found",
         }:
             approval.status = "expired"
             self._save()
@@ -135,13 +137,60 @@ class AutomationApprovalStore:
         return any(
             approval.target_url == clean_url
             and approval.status
-            in {"pending", "approved", "dispatching", "completed", "mobile_approved"}
+            in {
+                "pending",
+                "approved",
+                "dispatching",
+                "completed",
+                "mobile_approved",
+                "published",
+            }
             for approval in self._items.values()
         )
 
     def items(self) -> list[AutomationApproval]:
         self.prune()
         return list(self._items.values())
+
+    def update_text(self, approval_id: str, text: str) -> AutomationApproval:
+        approval = self.get(approval_id)
+        if approval is None:
+            raise RuntimeError("Unknown approval request.")
+        if approval.status != "pending":
+            raise RuntimeError("Only a pending approval can be revised.")
+        clean = str(text or "").strip()
+        if not clean:
+            raise RuntimeError("Approval text cannot be empty.")
+        approval.text = clean
+        self._save()
+        return approval
+
+    def update_metadata(
+        self,
+        approval_id: str,
+        **values: object,
+    ) -> AutomationApproval:
+        approval = self.get(approval_id)
+        if approval is None:
+            raise RuntimeError("Unknown approval request.")
+        approval.metadata.update(values)
+        self._save()
+        return approval
+
+    def finish_mobile(
+        self,
+        approval_id: str,
+        *,
+        published: bool,
+    ) -> AutomationApproval:
+        approval = self.get(approval_id)
+        if approval is None:
+            raise RuntimeError("Unknown approval request.")
+        if approval.status not in {"mobile_approved", "completed"}:
+            return approval
+        approval.status = "published" if published else "not_found"
+        self._save()
+        return approval
 
     def claim_next(self) -> AutomationApproval | None:
         self.prune()
@@ -173,7 +222,15 @@ class AutomationApprovalStore:
             key
             for key, approval in self._items.items()
             if approval.status
-            in {"completed", "rejected", "expired", "failed", "mobile_approved"}
+            in {
+                "completed",
+                "rejected",
+                "expired",
+                "failed",
+                "mobile_approved",
+                "published",
+                "not_found",
+            }
         ]
         for key in removable[: max(0, len(self._items) - keep)]:
             self._items.pop(key, None)

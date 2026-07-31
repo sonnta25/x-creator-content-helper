@@ -15,6 +15,7 @@ from src.content_service import (
     _parse_json,
     _parse_reply_targets,
     _parse_single_reply,
+    _reply_is_question_only,
     _parse_trend_variants,
     _remove_ai_art_terms,
     _realistic_image_prompt,
@@ -93,6 +94,8 @@ def test_reply_engine_is_text_only() -> None:
     assert "Shared reply-family rules" in prompt
     assert "Humor and sarcasm are optional tools, never the default" in prompt
     assert "one distinctive" in prompt
+    assert "question-only reply is invalid" in prompt
+    assert "concrete read first" in prompt
 
 
 def test_tweet_engine_prompt_is_shared_for_tweet_family() -> None:
@@ -296,6 +299,44 @@ def test_generate_reply_from_text_rejects_prompt_leak() -> None:
         assert "prompt instructions instead of a reply" in str(exc)
     else:
         raise AssertionError("Expected prompt leak to be rejected")
+
+
+def test_generate_reply_from_text_repairs_question_only_draft() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return "What changed the rollout decision?"
+            return (
+                "The slower sequence makes retention look more important than launch speed. "
+                "What changed the rollout decision?"
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    generated = asyncio.run(
+        service.generate_reply_from_text("We changed the rollout plan after the first cohort.")
+    )
+
+    assert len(service.prompts) == 2
+    assert "question without first contributing value" in service.prompts[1]
+    assert generated.text.startswith("The slower sequence makes retention")
+
+
+def test_reply_question_only_detector_accepts_observation_then_question() -> None:
+    assert _reply_is_question_only("Why did the timing change?") is True
+    assert _reply_is_question_only("どうして介入を早めたのでしょうか？") is True
+    assert _reply_is_question_only("介入の基準が気になります") is True
+    assert (
+        _reply_is_question_only(
+            "The slower sequence makes retention the real constraint. What changed?"
+        )
+        is False
+    )
+    assert _reply_is_question_only("初動より継続率を優先した判断に見えます。基準は何でしたか？") is False
 
 
 def test_parse_single_reply_accepts_plain_text_and_removes_label() -> None:
@@ -643,7 +684,7 @@ def test_generate_reply_targets_includes_selected_learning_strategy() -> None:
             return (
                 '{"targets":[{"url":"https://x.com/source/status/88",'
                 '"target":"@source","reason":"Early opening",'
-                '"reply":"Which tradeoff mattered most here?"}]}'
+                '"reply":"The slower rollout makes retention look like the real constraint. Which tradeoff mattered most here?"}]}'
             )
 
     service = StrategyService(Settings(telegram_bot_token="123:ABC"))
@@ -655,7 +696,40 @@ def test_generate_reply_targets_includes_selected_learning_strategy() -> None:
         )
     )
 
-    assert "ask the author one precise" in service.last_prompt
+    assert "lead with one concrete source-grounded observation" in service.last_prompt
+
+
+def test_generate_reply_targets_repairs_question_only_reply() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return (
+                    '{"targets":[{"url":"https://x.com/source/status/90",'
+                    '"target":"@source","reason":"Early opening",'
+                    '"reply":"What changed the rollout decision?"}]}'
+                )
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/90",'
+                '"target":"@source","reason":"Early opening",'
+                '"reply":"The slower sequence makes retention look like the constraint. What changed the decision?"}]}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "product launch",
+            "URL: https://x.com/source/status/90\nPost: We changed the rollout plan.",
+        )
+    )
+
+    assert len(service.prompts) == 2
+    assert "question-only reply is invalid" in service.prompts[1]
+    assert targets[0].reply.startswith("The slower sequence")
 
 
 def test_generate_reply_targets_assigns_strategy_per_candidate_url() -> None:

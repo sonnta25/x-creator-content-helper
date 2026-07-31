@@ -239,3 +239,64 @@ def test_approval_feedback_can_tune_strategy_mix_without_analytics_import(tmp_pa
     assert store.maybe_tune(now=now) is True
     assert store.weights["specific_observation"] > old["specific_observation"]
     assert store.weights["natural_humor"] < old["natural_humor"]
+
+
+def test_author_response_builds_relationship_strength_and_stop_signal(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    posted_at = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+    approval = _approval(
+        "relationship-1",
+        target_id=42,
+        approved_at=posted_at - timedelta(minutes=2),
+    )
+    store.register_approval(approval)
+    posted = _result(100, target_id=42, created_at=posted_at)
+    store.mark_discovered(approval.id, posted)
+    tracking = store.records("tracking")[0]
+    assert store.author_response_check_due(
+        tracking,
+        now=posted_at + timedelta(minutes=20),
+    ) is True
+    store.mark_author_response_checked(
+        approval.id,
+        checked_at=posted_at + timedelta(minutes=20),
+    )
+    assert store.author_response_check_due(
+        tracking,
+        now=posted_at + timedelta(minutes=24),
+    ) is False
+    assert store.author_response_check_due(
+        tracking,
+        now=posted_at + timedelta(minutes=25),
+    ) is True
+    response = _result(
+        101,
+        target_id=100,
+        text="Good question. Retention was the deciding factor.",
+        created_at=posted_at + timedelta(minutes=18),
+        username="source",
+    )
+
+    record = store.mark_author_response(
+        approval.id,
+        response,
+        detected_at=posted_at + timedelta(minutes=20),
+    )
+    strength_before_stop = store.relationship_strength(
+        "source",
+        now=posted_at + timedelta(minutes=20),
+    )
+
+    assert record["author_replied"] is True
+    assert record["author_response_id"] == 101
+    assert record["author_response_text"].startswith("Good question")
+    assert record["author_response_latency_minutes"] == 18
+    assert strength_before_stop > 0
+
+    store.mark_conversation_stopped(approval.id)
+    strength_after_stop = store.relationship_strength(
+        "source",
+        now=posted_at + timedelta(minutes=20),
+    )
+    assert store.records("tracking")[0]["conversation_stopped"] is True
+    assert strength_after_stop < strength_before_stop

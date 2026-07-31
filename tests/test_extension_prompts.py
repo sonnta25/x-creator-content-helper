@@ -30,6 +30,7 @@ def test_gemini_single_pass_prompt_combines_task_and_reply_quality_rules() -> No
     assert "SINGLE-PASS WRITING AND QA" in prompt
     assert "Sarcasm, slang, a dry joke, or a jab" in prompt
     assert "specific source-grounded observation" in prompt
+    assert "question-only reply is invalid" in prompt
     assert "Return only the final answer required by the original task." in prompt
 
 
@@ -43,6 +44,7 @@ def test_gemini_single_pass_reply_prompt_keeps_replytargets_human() -> None:
     assert "could not be pasted under an unrelated post" in prompt
     assert "answer about one decision" in prompt
     assert "every `reply` field" in prompt
+    assert "concrete read or comparison first" in prompt
 
 
 def test_gemini_single_pass_tweet_prompt_avoids_forced_lessons_and_hallucinated_facts() -> None:

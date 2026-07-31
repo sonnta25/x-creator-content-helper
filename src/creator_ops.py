@@ -11,6 +11,8 @@ from src.models import XSearchResult
 WATCH_RETENTION_HOURS = 24
 READY_OPPORTUNITY_SCORE = 68.0
 READY_VIRAL_SCORE = 58.0
+JAPANESE_READY_OPPORTUNITY_SCORE = 62.0
+JAPANESE_READY_VIRAL_SCORE = 52.0
 
 
 class ReplyWatchStore:
@@ -36,9 +38,16 @@ class ReplyWatchStore:
             row = items.get(key, {})
             seen_count = int(row.get("seen_count", 0)) + 1
             first_seen_at = str(row.get("first_seen_at") or current.isoformat())
+            is_japanese = str(result.language or "").lower().startswith("ja")
+            opportunity_floor = (
+                JAPANESE_READY_OPPORTUNITY_SCORE
+                if is_japanese
+                else READY_OPPORTUNITY_SCORE
+            )
+            viral_floor = JAPANESE_READY_VIRAL_SCORE if is_japanese else READY_VIRAL_SCORE
             is_exceptional = (
-                result.reply_opportunity_score >= READY_OPPORTUNITY_SCORE
-                and result.viral_score >= READY_VIRAL_SCORE
+                result.reply_opportunity_score >= opportunity_floor
+                and result.viral_score >= viral_floor
             )
             is_confirmed = result.momentum_observation_count >= 2 or seen_count >= 2
             state = "ready" if is_exceptional or is_confirmed else "watching"
@@ -82,6 +91,62 @@ class ReplyWatchStore:
             ),
             reverse=True,
         )
+        return rows[: max(0, limit)]
+
+    def candidates_for_refresh(
+        self,
+        *,
+        limit: int = 6,
+        languages: list[str] | tuple[str, ...] | None = None,
+        states: tuple[str, ...] = ("watching",),
+        max_age_minutes: int | None = None,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return persisted watching rows that should be re-fetched by tweet ID."""
+        current = now or datetime.now(UTC)
+        allowed_languages = {
+            str(language or "").strip().lower()
+            for language in (languages or [])
+            if str(language or "").strip()
+        }
+        changed = False
+        rows: list[dict[str, Any]] = []
+        for row in self.data.get("items", {}).values():
+            if not isinstance(row, dict) or row.get("state") not in states:
+                continue
+            language = str(row.get("language") or "").strip().lower()
+            if allowed_languages and language and language not in allowed_languages:
+                continue
+            if max_age_minutes is not None:
+                try:
+                    first_seen = datetime.fromisoformat(str(row.get("first_seen_at") or ""))
+                except ValueError:
+                    first_seen = current
+                if first_seen.tzinfo is None:
+                    first_seen = first_seen.replace(tzinfo=UTC)
+                if current - first_seen > timedelta(minutes=max(1, max_age_minutes)):
+                    row["state"] = "expired"
+                    row["expired_at"] = current.isoformat()
+                    changed = True
+                    continue
+            try:
+                tweet_id = int(row.get("tweet_id"))
+            except (TypeError, ValueError):
+                continue
+            if tweet_id <= 0:
+                continue
+            rows.append(dict(row))
+
+        rows.sort(
+            key=lambda row: (
+                float(row.get("opportunity_score", 0.0)),
+                float(row.get("viral_score", 0.0)),
+                str(row.get("last_seen_at") or ""),
+            ),
+            reverse=True,
+        )
+        if changed:
+            self._save()
         return rows[: max(0, limit)]
 
     def _prune(self, now: datetime) -> None:

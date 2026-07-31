@@ -135,9 +135,16 @@ class ReplyLearningStore:
             "posted_at": "",
             "snapshots": [],
             "author_replied": False,
+            "author_response_id": None,
+            "author_response_url": "",
+            "author_response_text": "",
+            "author_response_detected_at": "",
+            "author_response_latency_minutes": None,
+            "last_author_response_check_at": "",
             "final_score": None,
             "edit_similarity": None,
             "followup_created": False,
+            "conversation_stopped": False,
         }
         records[approval.id] = record
         self._save()
@@ -418,9 +425,127 @@ class ReplyLearningStore:
             1 + sum(bool(row.get("author_replied")) for row in rows)
         ) / (4 + len(rows))
 
+    def relationship_strength(
+        self,
+        username: str,
+        *,
+        now: datetime | None = None,
+    ) -> float:
+        clean = username.strip().lstrip("@").casefold()
+        rows = [
+            row
+            for row in self.records("tracking", "measured")
+            if str(row.get("root_author") or "").casefold() == clean
+        ]
+        responses = [row for row in rows if bool(row.get("author_replied"))]
+        if not responses:
+            return 0.0
+
+        response_rate = len(responses) / max(1, len(rows))
+        conversation_depth = min(1.0, len(responses) / 3.0)
+        latencies = [
+            float(row["author_response_latency_minutes"])
+            for row in responses
+            if row.get("author_response_latency_minutes") is not None
+        ]
+        latency_score = (
+            max(0.0, 1.0 - (sum(latencies) / len(latencies)) / 360.0)
+            if latencies
+            else 0.5
+        )
+        current = now or datetime.now(UTC)
+        detected = [
+            _parse_datetime(row.get("author_response_detected_at"))
+            for row in responses
+            if row.get("author_response_detected_at")
+        ]
+        recency_score = 0.5
+        if detected:
+            age_days = max(0.0, (current - max(detected)).total_seconds() / 86400)
+            recency_score = max(0.0, 1.0 - min(age_days, 30.0) / 30.0)
+        stop_ratio = sum(bool(row.get("conversation_stopped")) for row in rows) / max(
+            1,
+            len(rows),
+        )
+        score = 100.0 * (
+            0.50 * response_rate
+            + 0.20 * conversation_depth
+            + 0.15 * latency_score
+            + 0.15 * recency_score
+        )
+        return round(max(0.0, min(100.0, score * (1.0 - 0.25 * stop_ratio))), 2)
+
+    def mark_author_response(
+        self,
+        approval_id: str,
+        response: XSearchResult,
+        *,
+        detected_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        record = self._record(approval_id)
+        detected = detected_at or datetime.now(UTC)
+        response_at = _result_datetime(response)
+        posted_at = _parse_datetime(record.get("posted_at"))
+        record.update(
+            {
+                "author_replied": True,
+                "author_response_id": response.id,
+                "author_response_url": response.url,
+                "author_response_text": response.text,
+                "author_response_detected_at": detected.isoformat(),
+                "author_response_latency_minutes": round(
+                    max(0.0, (response_at - posted_at).total_seconds() / 60),
+                    2,
+                ),
+            }
+        )
+        self._save()
+        return record
+
+    def author_response_check_due(
+        self,
+        record: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if (
+            record.get("kind") != "reply"
+            or record.get("status") != "tracking"
+            or record.get("followup_created")
+            or record.get("conversation_stopped")
+        ):
+            return False
+        current = now or datetime.now(UTC)
+        posted_at = _parse_datetime(record.get("posted_at"))
+        age_minutes = max(0.0, (current - posted_at).total_seconds() / 60)
+        interval_minutes = 5 if age_minutes <= 60 else 15 if age_minutes <= 360 else 60
+        last_check_raw = str(record.get("last_author_response_check_at") or "")
+        if not last_check_raw:
+            return True
+        return (
+            current - _parse_datetime(last_check_raw)
+        ).total_seconds() >= interval_minutes * 60
+
+    def mark_author_response_checked(
+        self,
+        approval_id: str,
+        *,
+        checked_at: datetime | None = None,
+    ) -> None:
+        record = self._record(approval_id)
+        record["last_author_response_check_at"] = (
+            checked_at or datetime.now(UTC)
+        ).isoformat()
+        self._save()
+
     def mark_followup_created(self, approval_id: str) -> None:
         record = self._record(approval_id)
         record["followup_created"] = True
+        self._save()
+
+    def mark_conversation_stopped(self, approval_id: str) -> None:
+        record = self._record(approval_id)
+        record["conversation_stopped"] = True
         self._save()
 
     def report(self, days: int = 30, *, now: datetime | None = None) -> dict[str, Any]:

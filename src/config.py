@@ -31,7 +31,7 @@ class Settings:
     reply_tracking_poll_minutes: int = 5
     reply_watch_path: str = "data/reply_watchlist.json"
     reply_target_mode: str = "balanced"
-    creator_daily_reply_cap: int = 8
+    creator_daily_reply_cap: int = 40
     creator_timezone: str = "Asia/Ho_Chi_Minh"
     content_language: str = "Vietnamese"
     trend_language: str = "en"
@@ -123,7 +123,7 @@ class Settings:
                 {"balanced", "reach", "qualified", "relationship"},
             ),
             creator_daily_reply_cap=max(
-                1, _int_env("CREATOR_DAILY_REPLY_CAP", 8)
+                1, _int_env("CREATOR_DAILY_REPLY_CAP", 40)
             ),
             creator_timezone=os.getenv(
                 "CREATOR_TIMEZONE", "Asia/Ho_Chi_Minh"

@@ -193,7 +193,7 @@ REPLY_TARGET_MAX_AGE_MINUTES=360
 REPLY_TARGET_LANGUAGES=en,ja
 REPLY_TARGET_MODE=balanced
 REPLY_WATCH_PATH=data/reply_watchlist.json
-CREATOR_DAILY_REPLY_CAP=8
+CREATOR_DAILY_REPLY_CAP=40
 REPLY_TARGET_METRICS_PATH=data/reply_target_metrics.json
 REPLY_LEARNING_ENABLED=true
 REPLY_LEARNING_PATH=data/reply_learning.json
@@ -278,15 +278,15 @@ You can also change **/replytargets every** from the private Telegram approval c
 
 For both manual commands and scheduled runs, Telegram sends approval cards. Reply cards add **Alternative** and **Shorter**; post cards add **Generate visual** when an image prompt exists. Only the Telegram user who requested a manual draft can approve it.
 
-`/replytargets` cards show the target link, visible metrics, selected strategy, why-now reason, and copy-ready reply. Auto discovery uses the authenticated account's current X trends plus localized broad queries. `balanced` and `qualified` modes also add a creator-niche lane; `reach` prioritizes distribution; `relationship` favors authors who have responded before. The trends timeline can reflect the logged-in account's locale/personalization and is not claimed to be a global chart. Search applies language filters but no country filter because most X posts do not carry reliable place metadata.
+`/replytargets` cards show the target link, visible metrics, selected strategy, why-now reason, and copy-ready reply. Auto discovery uses the authenticated account's current X trends plus localized broad queries. When Japanese is enabled, one protected discovery lane covers hot Japanese conversations in economics, current affairs, sports, anime/games, and technology/AI, so personalized trends cannot consume the whole six-query budget. `balanced` and `qualified` modes also add a creator-niche lane; `reach` prioritizes distribution; `relationship` favors authors who have responded before. The trends timeline can reflect the logged-in account's locale/personalization and is not claimed to be a global chart. Search applies language filters but no country filter because most X posts do not carry reliable place metadata.
 
 Up to six topic/language queries run three at a time. Every query searches `Top` and `Latest` concurrently, with at most eight results from each product. `Top` supplies confirmed distribution while `Latest` supplies earlier breakout candidates. `-is:reply -is:retweet` is added at search time, and parsed results are checked again; original and quote posts remain eligible. An explicit `/replytargets <topic>` stays inside that topic but expands it across configured languages unless the user supplies a `lang:` operator.
 
-The first time a normal candidate is seen, it is persisted in `data/reply_watchlist.json` rather than immediately spending a Gemini job. A later scan confirms acceleration; an exceptional first observation can enter reply-now immediately. Metric snapshots in `data/reply_target_metrics.json` use view, weighted-engagement, direct-reply, and reply/quote deltas plus acceleration. This avoids treating a fixed 15-minute window as a final viral verdict and still catches two-to-six-hour breakouts.
+The first time a normal candidate is seen, it is persisted in `data/reply_watchlist.json` rather than immediately spending a Gemini job. Each later auto scan actively re-fetches up to six persisted `watching` or undrafted `ready` tweets by ID, so confirmation no longer depends on a tweet appearing in Top/Latest search again. Watch rows expire when they exceed the configured reply-target lookback. An exceptional first observation can enter reply-now immediately. Japanese candidates that already pass discovery quality checks use slightly earlier first-observation thresholds, helping the bot enter fast-moving local conversations before the thread fills up. Metric snapshots in `data/reply_target_metrics.json` use view, weighted-engagement, direct-reply, and reply/quote deltas plus acceleration. This avoids treating a fixed 15-minute window as a final viral verdict and still catches two-to-six-hour breakouts.
 
 Viral confidence and reply opportunity are separate. Reply activity remains a capped viral signal, but crowded threads are penalized. The bot samples visible replies for top-reply likes and whether the root author participates, then combines that context with recent views per reply, total reply load, new-reply pressure, audience fit, and prior author-response rate. A dominant top reply lowers opportunity because a new reply is less likely to surface.
 
-This design favors a post that is still gaining distribution while its root reply section remains open, including two-to-six-hour late breakouts. The 500-view minimum remains a hard floor whenever X exposes view count. The configured 50,000-follower value is a small capped reach bonus rather than a hard gate. Replies match the source language and must add one source-grounded observation, tension, implication, or real question; when a question fits, it targets a concrete decision, assumption, consequence, or tradeoff the original author can answer. Generic agreement, recap, unsupported context, generic engagement questions, and forced sarcasm are rejected.
+This design favors a post that is still gaining distribution while its root reply section remains open, including two-to-six-hour late breakouts. The 500-view minimum remains a hard floor whenever X exposes view count. The configured 50,000-follower value is a small capped reach bonus rather than a hard gate. Replies match the source language and must first add one source-grounded observation, implication, comparison, caveat, or reason. A precise question may follow, but question-only replies are automatically rewritten once and rejected if they still fail. Japanese replies prefer a concrete first sentence plus an optional precise question, rather than polite-only endings such as `気になります` or `どう思いますか`. Generic agreement, recap, unsupported context, generic engagement questions, and forced sarcasm are rejected.
 
 ### Automatic reply tracking and learning
 
@@ -298,14 +298,20 @@ account's public timeline through twscrape and matches the new item by parent,
 posting window, and text similarity. You do not send the published URL back.
 
 The tracker captures public metrics at approximately 15 minutes, 1 hour, 6 hours,
-and 24 hours. Reply scores combine:
+and 24 hours. Author-response detection is separate: while a reply is being tracked,
+the bot checks direct responses every five minutes in the first hour, every 15 minutes
+through hour six, and hourly afterward, even when a metrics checkpoint is not due.
+Reply scores combine:
 
 - reply views relative to new root-post views;
 - reply engagement per view, with replies, reposts, and quotes weighted above likes;
 - whether the original root author directly replied.
 
-When a root author directly responds, the bot creates a manual-approval follow-up
-card to continue the relationship. Original-post scores use public views relative
+When a root author directly responds, the bot immediately creates a manual-approval
+follow-up card showing the author's response, its URL, and a suggested draft. Use
+**Continue conversation** to approve the follow-up or **Stop here** to end that
+exchange. Stop decisions are persisted and reduce that author's relationship score.
+Original-post scores use public views relative
 to the account follower count and engagement per view. `/replyreport` also shows
 the follower-count change during tracked post windows as an account-level proxy;
 it does not attribute a follower to one specific post.
@@ -316,6 +322,9 @@ Use `/replyreport 7d` or `/replyreport 30d` to inspect results. Use
 
 The bot rotates among five fixed strategies: a specific observation, practical
 implication, respectful counterpoint, author-specific question, and natural humor.
+Relationship strength is stored per root author and combines actual response rate,
+conversation count, response latency, recency, and explicit Stop decisions. It is
+used directly by `relationship` mode and as a smaller signal in `balanced` mode.
 Approve/reject decisions provide an early preference signal; posted outcomes are
 weighted by how closely the published text matches the draft. Automatic adjustment
 starts after either 20 feedback events or 60 completed 24-hour samples. Later
@@ -341,7 +350,7 @@ Mobile approval is deliberately two-step because one Telegram button cannot both
 1. Tap **Approve on mobile**. The bot records the approval and removes the decision buttons.
 2. Tap **Open X on phone**. The official mobile-friendly X Web Intent opens the matching reply or post composer and pre-populates the draft when the URL is short enough. For a long post, Telegram rejects a URL containing the full encoded draft; the bot instead opens the X composer safely and keeps the draft above for you to copy and paste.
 
-Once a reply target is pending, approved, or confirmed published, the bot skips the same target to avoid duplicate approval cards. This history is persisted in `data/automation_approvals.json`, so deduplication survives bot restarts. `CREATOR_DAILY_REPLY_CAP` limits daily reply cards in `CREATOR_TIMEZONE`.
+Once a reply target is pending, approved, or confirmed published, the bot skips the same target to avoid duplicate approval cards. This history is persisted in `data/automation_approvals.json`, so deduplication survives bot restarts. `CREATOR_DAILY_REPLY_CAP` limits daily reply cards in `CREATOR_TIMEZONE`; the default is 40 to support a 30-50 reply/day workflow, but it is a ceiling rather than a guaranteed quota and every final X submission remains manual. Scheduled status messages distinguish an exhausted daily cap from candidates that still need confirmation and show both current-scan and persisted-watching counts.
 
 - **Open X on phone** uses the official mobile-friendly X Web Intent.
 - **Copy draft** uses Telegram's native clipboard button for drafts up to 256 characters. For longer drafts that cannot safely fit in an encoded X URL, copy the message text and paste it into the composer opened by **Open X on phone**.

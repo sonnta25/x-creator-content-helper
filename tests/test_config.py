@@ -30,7 +30,7 @@ def test_settings_defaults() -> None:
     assert settings.hashtag_mode == "none"
     assert settings.reply_watch_path == "data/reply_watchlist.json"
     assert settings.reply_target_mode == "balanced"
-    assert settings.creator_daily_reply_cap == 8
+    assert settings.creator_daily_reply_cap == 40
     assert settings.creator_timezone == "Asia/Ho_Chi_Minh"
     assert settings.content_language == "Vietnamese"
     assert settings.trend_language == "en"

@@ -88,11 +88,17 @@ AUTO_REPLY_TARGET_FALLBACK_QUERIES_BY_LANGUAGE = {
         "AI",
     ),
 }
+JAPANESE_HIGH_VALUE_REPLY_QUERY = (
+    "(経済 OR 日銀 OR 円相場 OR 株価 OR 速報 OR 政治 OR スポーツ OR 野球 OR "
+    "サッカー OR アニメ OR ゲーム OR テクノロジー OR AI)"
+)
 REPLY_TARGET_MAX_CANDIDATES = 6
 REPLY_TARGET_RESULT_LIMIT = 8
 REPLY_TARGET_CONTEXT_ITEMS = 3
 REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
+REPLY_TARGET_REFRESH_TIMEOUT_SECONDS = 12
+REPLY_TARGET_REFRESH_LIMIT = 6
 TREND_CONTEXT_SIGNAL_ITEMS = 3
 TREND_CONTEXT_X_ITEMS = 4
 COMMAND_INPUT_TIMEOUT_SECONDS = 5 * 60
@@ -777,6 +783,13 @@ class ContentBot:
                 mode=mode,
             )
             ready, watching = self.reply_watch.classify(results)
+            watching_total = len(
+                self.reply_watch.candidates_for_refresh(
+                    limit=1_000,
+                    languages=languages,
+                    max_age_minutes=max_age,
+                )
+            )
             remaining_cap = max(
                 0,
                 self.settings.creator_daily_reply_cap
@@ -789,7 +802,7 @@ class ContentBot:
             await status.edit_text(
                 "Today's queue\n"
                 f"Reply now: {len(ready)}\n"
-                f"Watching: {len(watching)}\n"
+                f"Watching now/total: {len(watching)}/{watching_total}\n"
                 f"Daily reply capacity remaining: {remaining_cap}\n"
                 "Preparing one original post and any reply-now drafts..."
             )
@@ -840,7 +853,7 @@ class ContentBot:
                 "Today's queue is ready.\n"
                 f"Reply cards: {sent_replies}\n"
                 f"Original post cards: {sent_posts}\n"
-                f"Watching for confirmation: {len(watching)}\n\n"
+                f"Watching for confirmation: {watching_total}\n\n"
                 "Use Alternative/Shorter only when needed; images are generated on demand."
             )
         except Exception as exc:
@@ -900,7 +913,10 @@ class ContentBot:
                 raise
             except Exception:
                 LOGGER.exception("Automatic reply tracking pass failed")
-            await asyncio.sleep(max(60, self.settings.reply_tracking_poll_minutes * 60))
+            # Author responses are high-value and time-sensitive. Wake at least
+            # every five minutes even when metric snapshots use a slower cadence.
+            poll_minutes = min(5, self.settings.reply_tracking_poll_minutes)
+            await asyncio.sleep(max(60, poll_minutes * 60))
 
     async def _process_reply_tracking_once(
         self,
@@ -940,6 +956,48 @@ class ContentBot:
 
         for record in self.reply_learning.records("tracking"):
             checkpoint = self.reply_learning.due_checkpoint(record, now=current)
+            author_response: XSearchResult | None = None
+            should_watch_author = (
+                self.reply_learning.author_response_check_due(
+                    record,
+                    now=current,
+                )
+            )
+            if should_watch_author:
+                try:
+                    direct_replies = await self.x_search.tweet_replies(
+                        int(record["reply_id"]),
+                        limit=20,
+                    )
+                    self.reply_learning.mark_author_response_checked(
+                        record["approval_id"],
+                        checked_at=current,
+                    )
+                    root_author = str(record.get("root_author") or "").casefold()
+                    author_response = next(
+                        (
+                            item
+                            for item in direct_replies
+                            if item.in_reply_to_tweet_id == int(record["reply_id"])
+                            and item.username.casefold() == root_author
+                        ),
+                        None,
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "Could not check author response for approval %s",
+                        record.get("approval_id"),
+                        exc_info=True,
+                    )
+                if author_response is not None:
+                    self.reply_learning.mark_author_response(
+                        record["approval_id"],
+                        author_response,
+                        detected_at=current,
+                    )
+                    await self._create_author_followup(record, author_response)
+                    self.reply_learning.mark_followup_created(record["approval_id"])
+
             if checkpoint is None:
                 continue
             reply = await self.x_search.tweet_by_id(int(record["reply_id"]))
@@ -950,35 +1008,14 @@ class ContentBot:
                 if record.get("kind") == "reply" and record.get("target_id")
                 else None
             )
-            author_replied = False
-            author_response: XSearchResult | None = None
-            if record.get("kind") == "reply":
-                direct_replies = await self.x_search.tweet_replies(reply.id, limit=20)
-                root_author = str(record.get("root_author") or "").casefold()
-                author_response = next(
-                    (
-                        item
-                        for item in direct_replies
-                        if item.in_reply_to_tweet_id == reply.id
-                        and item.username.casefold() == root_author
-                    ),
-                    None,
-                )
-                author_replied = author_response is not None
             self.reply_learning.add_snapshot(
                 record["approval_id"],
                 checkpoint_minutes=checkpoint,
                 reply=reply,
                 root=root,
-                author_replied=author_replied,
+                author_replied=bool(record.get("author_replied") or author_response),
                 captured_at=current,
             )
-            if (
-                author_response is not None
-                and not bool(record.get("followup_created"))
-            ):
-                await self._create_author_followup(record, author_response)
-                self.reply_learning.mark_followup_created(record["approval_id"])
         tuned = self.reply_learning.maybe_tune(now=current)
         if tuned and self._application is not None and self.approval_chat_id is not None:
             status = self.reply_learning.status()
@@ -1012,7 +1049,12 @@ class ContentBot:
                 author_response,
                 "author_specific_question",
             )
-            | {"relationship_followup": True},
+            | {
+                "relationship_followup": True,
+                "relationship_parent_approval_id": str(record.get("approval_id") or ""),
+                "author_response_text": author_response.text,
+                "author_response_url": author_response.url,
+            },
         )
         await self._send_approval(
             approval,
@@ -1036,8 +1078,10 @@ class ContentBot:
         if decision not in {
             "approve",
             "mobile",
+            "continue",
             "reject",
             "skip",
+            "stop",
             "alternative",
             "shorter",
             "visual",
@@ -1049,6 +1093,10 @@ class ContentBot:
             existing = self.approvals.get(approval_id)
             if existing is None:
                 raise RuntimeError("Unknown approval request.")
+            if decision in {"continue", "stop"} and not bool(
+                existing.metadata.get("relationship_followup")
+            ):
+                raise RuntimeError("This action is only available for an author follow-up.")
             if decision in {"alternative", "shorter"}:
                 if existing.kind != "reply":
                     raise RuntimeError("This quick edit is only available for replies.")
@@ -1090,14 +1138,22 @@ class ContentBot:
                 return
             approval = self.approvals.decide(
                 approval_id,
-                approve=decision in {"approve", "mobile"},
+                approve=decision in {"approve", "mobile", "continue"},
                 chat_id=query.message.chat.id,
                 user_id=query.from_user.id,
                 destination="mobile",
             )
+            if decision == "stop" and bool(
+                approval.metadata.get("relationship_followup")
+            ):
+                parent_id = str(
+                    approval.metadata.get("relationship_parent_approval_id") or ""
+                )
+                if parent_id:
+                    self.reply_learning.mark_conversation_stopped(parent_id)
             self.reply_learning.record_feedback(
                 approval,
-                approved=decision in {"approve", "mobile"},
+                approved=decision in {"approve", "mobile", "continue"},
             )
             if (
                 approval.status == "mobile_approved"
@@ -1112,7 +1168,12 @@ class ContentBot:
                 (
                     f"{original}\n\n{mobile_note}".strip()
                     if approval.status == "mobile_approved"
-                    else f"{original}\n\nRejected."
+                    else (
+                        f"{original}\n\nConversation stopped. No further follow-up "
+                        "will be suggested for this exchange."
+                        if decision == "stop"
+                        else f"{original}\n\nRejected."
+                    )
                 ),
                 reply_markup=(
                     _approval_keyboard(approval, include_decisions=False)
@@ -1252,6 +1313,17 @@ class ContentBot:
                 ))
                 return
             ready, watching = self.reply_watch.classify(results)
+            watching_total = (
+                len(
+                    self.reply_watch.candidates_for_refresh(
+                        limit=1_000,
+                        languages=languages,
+                        max_age_minutes=max_age_minutes,
+                    )
+                )
+                if not query
+                else len(watching)
+            )
             remaining_cap = max(
                 0,
                 self.settings.creator_daily_reply_cap
@@ -1260,17 +1332,28 @@ class ContentBot:
                     timezone_name=self.settings.creator_timezone,
                 ),
             )
+            confirmed_count = len(ready)
+            if remaining_cap <= 0:
+                await status.edit_text(
+                    "Scheduled /replytargets reached today's reply-card cap. "
+                    f"Confirmed now: {confirmed_count}. Watching total: {watching_total}. "
+                    f"The cap resets with the next creator day in "
+                    f"{self.settings.creator_timezone}."
+                )
+                return
             ready = ready[:remaining_cap]
             if not ready:
                 await status.edit_text(
                     "Scheduled scan found candidates, but none is confirmed enough to "
-                    f"spend a Gemini job yet. Watching: {len(watching)}. "
-                    "The next scan will measure acceleration again."
+                    f"spend a Gemini job yet. Watching now/total: "
+                    f"{len(watching)}/{watching_total}. The next scan will re-fetch "
+                    "those tweet IDs and measure their latest acceleration."
                 )
                 return
             await status.edit_text(
                 f"Found {len(ready)} reply-now candidate(s); "
-                f"watching {len(watching)}. Generating one batch..."
+                f"watching now/total {len(watching)}/{watching_total}. "
+                "Generating one batch..."
             )
             sent = await self._create_reply_approvals(
                 ready,
@@ -1633,6 +1716,17 @@ class ContentBot:
                 )
                 return
             ready, watching = self.reply_watch.classify(results)
+            watching_total = (
+                len(
+                    self.reply_watch.candidates_for_refresh(
+                        limit=1_000,
+                        languages=languages,
+                        max_age_minutes=max_age_minutes,
+                    )
+                )
+                if not query
+                else len(watching)
+            )
             remaining_cap = max(
                 0,
                 self.settings.creator_daily_reply_cap
@@ -1641,17 +1735,27 @@ class ContentBot:
                     timezone_name=self.settings.creator_timezone,
                 ),
             )
+            confirmed_count = len(ready)
+            if remaining_cap <= 0:
+                await status.edit_text(
+                    "Today's reply-card cap has been reached. "
+                    f"Confirmed now: {confirmed_count}. Watching total: {watching_total}. "
+                    f"The cap resets with the next creator day in "
+                    f"{self.settings.creator_timezone}."
+                )
+                return
             ready = ready[:remaining_cap]
             if not ready:
                 await status.edit_text(
-                    f"Watching {len(watching)} promising candidate(s). None has enough "
-                    "confirmation yet, so no Gemini job was spent. Run /replytargets again "
-                    "after the next 15-minute snapshot, or use /today for the full queue."
+                    f"Watching now/total: {len(watching)}/{watching_total}. None has "
+                    "enough confirmation yet, so no Gemini job was spent. The next scan "
+                    "will re-fetch those tweet IDs instead of waiting for them to reappear "
+                    "in search."
                 )
                 return
             await status.edit_text(
                 f"Drafting {len(ready)} confirmed reply-now candidate(s); "
-                f"watching {len(watching)}..."
+                f"watching now/total {len(watching)}/{watching_total}..."
             )
             approver_user_id = (
                 update.effective_user.id if update.effective_user is not None else message.chat.id
@@ -1663,7 +1767,7 @@ class ContentBot:
                 approver_user_id=approver_user_id,
             )
             await status.edit_text(
-                f"Sent {sent} reply card(s). Watching {len(watching)} candidate(s)."
+                f"Sent {sent} reply card(s). Watching total: {watching_total}."
             )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
@@ -2034,10 +2138,17 @@ class ContentBot:
         )
         if query:
             candidates = _expand_reply_target_query(query, selected_languages)
+            watched_rows: list[dict[str, Any]] = []
         else:
             candidates = await self._auto_reply_target_queries(
                 selected_languages,
                 mode=selected_mode,
+            )
+            watched_rows = self.reply_watch.candidates_for_refresh(
+                limit=REPLY_TARGET_REFRESH_LIMIT,
+                languages=selected_languages,
+                states=("watching", "ready"),
+                max_age_minutes=max_age_minutes,
             )
         candidates = _dedupe_queries(candidates)[:REPLY_TARGET_MAX_CANDIDATES]
         last_search_query = query or "auto hot topics"
@@ -2047,7 +2158,8 @@ class ContentBot:
             f"Queries: {len(candidates)} (up to 3 concurrently)\n"
             f"Mode: {selected_mode}\n"
             f"Lookback: {max_age_minutes} minutes\n"
-            f"Languages: {', '.join(selected_languages)}"
+            f"Languages: {', '.join(selected_languages)}\n"
+            f"Previously watched to recheck: {len(watched_rows)}"
         )
         semaphore = asyncio.Semaphore(3)
 
@@ -2077,6 +2189,17 @@ class ContentBot:
         # Compare every configured language/topic in one pool. Snapshot deltas
         # replace lifetime averages once the same post has been observed twice.
         combined_results, search_query_by_url = _combine_reply_target_results(searched)
+        current_urls = {result.url for result in combined_results if result.url}
+        refreshed = await self._refresh_watched_reply_targets(
+            watched_rows,
+            exclude_urls=current_urls,
+        )
+        if refreshed:
+            combined_results = _merge_reply_target_search_products(
+                [combined_results, refreshed]
+            )
+            for result in refreshed:
+                search_query_by_url.setdefault(result.url, "persisted watchlist refresh")
         combined_results = self.reply_target_metrics.observe(combined_results)
         results = self._rank_reply_target_pool(
             combined_results,
@@ -2108,6 +2231,31 @@ class ContentBot:
             return selected_query, results, "Selected the strongest fresh fallback.\n"
 
         return last_search_query, [], ""
+
+    async def _refresh_watched_reply_targets(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        exclude_urls: set[str] | None = None,
+    ) -> list[XSearchResult]:
+        excluded = exclude_urls or set()
+        semaphore = asyncio.Semaphore(3)
+
+        async def fetch(row: dict[str, Any]) -> XSearchResult | None:
+            if str(row.get("url") or "") in excluded:
+                return None
+            try:
+                tweet_id = int(row.get("tweet_id"))
+                async with semaphore:
+                    return await asyncio.wait_for(
+                        self.x_search.tweet_by_id(tweet_id),
+                        timeout=REPLY_TARGET_REFRESH_TIMEOUT_SECONDS,
+                    )
+            except Exception:
+                return None
+
+        refreshed = await asyncio.gather(*(fetch(row) for row in rows))
+        return [result for result in refreshed if isinstance(result, XSearchResult)]
 
     async def _enrich_reply_thread_context(
         self,
@@ -2166,10 +2314,7 @@ class ContentBot:
             }
             overlap = len(niche_terms & text_terms)
             affinity = min(100.0, overlap * 22.0)
-            relationship = min(
-                100.0,
-                self.reply_learning.author_response_rate(result.username) * 100.0,
-            )
+            relationship = self.reply_learning.relationship_strength(result.username)
             if mode == "reach":
                 score = (result.viral_score * 0.82) + (
                     result.thread_availability_score * 0.18
@@ -2329,6 +2474,10 @@ class ContentBot:
                     0,
                     _query_for_languages(f"({niche_query})", selected_languages),
                 )
+        if "ja" in selected_languages:
+            # Keep one Japanese high-value lane inside the six-query execution budget
+            # even when personalized trends consume the other discovery slots.
+            queries.append(query_for_language(JAPANESE_HIGH_VALUE_REPLY_QUERY, "ja"))
         lanes: dict[str, list[str]] = {}
         for language in selected_languages:
             fallback = AUTO_REPLY_TARGET_FALLBACK_QUERIES_BY_LANGUAGE.get(
@@ -2547,6 +2696,25 @@ def _approval_message_text(
 ) -> str:
     if approval.kind == "reply":
         metadata = approval.metadata or {}
+        if metadata.get("relationship_followup"):
+            author = str(metadata.get("root_author") or "author").lstrip("@")
+            response_text = _truncate_text(
+                str(metadata.get("author_response_text") or "").strip(),
+                700,
+            )
+            response_url = str(
+                metadata.get("author_response_url") or approval.target_url
+            ).strip()
+            response_block = (
+                f"@{author} replied:\n{response_text}"
+                if response_text
+                else f"@{author} replied to your post."
+            )
+            return (
+                f"{response_block}\n"
+                f"{response_url}\n\n"
+                f"Suggested follow-up:\n{approval.text}"
+            ).strip()
         signal_parts = []
         if metadata.get("root_views") is not None:
             signal_parts.append(f"{int(metadata['root_views']):,} views")
@@ -2588,12 +2756,21 @@ def _approval_keyboard(
     include_decisions: bool = True,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    relationship_followup = bool(approval.metadata.get("relationship_followup"))
     if include_decisions:
         rows.append(
             [
                 InlineKeyboardButton(
-                    "Approve on mobile",
-                    callback_data=f"automation:mobile:{approval.id}",
+                    (
+                        "Continue conversation"
+                        if relationship_followup
+                        else "Approve on mobile"
+                    ),
+                    callback_data=(
+                        f"automation:continue:{approval.id}"
+                        if relationship_followup
+                        else f"automation:mobile:{approval.id}"
+                    ),
                 )
             ]
         )
@@ -2639,8 +2816,12 @@ def _approval_keyboard(
     if include_decisions:
         final_row.append(
             InlineKeyboardButton(
-                "Reject",
-                callback_data=f"automation:skip:{approval.id}",
+                "Stop here" if relationship_followup else "Reject",
+                callback_data=(
+                    f"automation:stop:{approval.id}"
+                    if relationship_followup
+                    else f"automation:skip:{approval.id}"
+                ),
             )
         )
     if final_row:

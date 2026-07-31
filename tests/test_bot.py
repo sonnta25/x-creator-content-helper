@@ -457,6 +457,213 @@ def test_reply_and_post_approval_cards_offer_lazy_quick_actions() -> None:
     assert f"automation:skip:{reply.id}" in reply_callbacks
 
 
+def test_author_followup_card_shows_response_and_continue_stop_actions() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Retention being decisive explains the slower rollout.",
+        chat_id=123,
+        target_url="https://x.com/source/status/101",
+        metadata={
+            "relationship_followup": True,
+            "relationship_parent_approval_id": "parent-1",
+            "root_author": "source",
+            "author_response_url": "https://x.com/source/status/101",
+            "author_response_text": (
+                "Good question. Retention was the deciding factor."
+            ),
+        },
+    )
+
+    text = _approval_message_text(approval)
+    buttons = {
+        button.callback_data: button.text
+        for row in _approval_keyboard(approval).inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+
+    assert "@source replied:" in text
+    assert "Retention was the deciding factor" in text
+    assert "Suggested follow-up:" in text
+    assert buttons[f"automation:continue:{approval.id}"] == "Continue conversation"
+    assert buttons[f"automation:stop:{approval.id}"] == "Stop here"
+    assert f"automation:mobile:{approval.id}" not in buttons
+    assert f"automation:skip:{approval.id}" not in buttons
+
+
+def test_author_response_is_detected_between_metric_checkpoints(tmp_path) -> None:
+    learning_path = tmp_path / "learning.json"
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            reply_learning_path=str(learning_path),
+            reply_watch_path="",
+        )
+    )
+    posted_at = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+    original = bot.approvals.create(
+        kind="reply",
+        text="Which tradeoff mattered most?",
+        chat_id=123,
+        approver_user_id=123,
+        target_url="https://x.com/source/status/42",
+        metadata={
+            "reply_strategy": "author_specific_question",
+            "root_author": "source",
+            "root_views": 1_000,
+            "root_replies": 5,
+        },
+    )
+    bot.approvals.decide(
+        original.id,
+        approve=True,
+        chat_id=123,
+        user_id=123,
+        destination="mobile",
+    )
+    bot.reply_learning.register_approval(original)
+    posted = XSearchResult(
+        id=100,
+        username="owner",
+        display_name="Owner",
+        text=original.text,
+        created_at=posted_at.isoformat(),
+        created_at_timestamp=int(posted_at.timestamp()),
+        url="https://x.com/owner/status/100",
+        is_reply=True,
+        in_reply_to_tweet_id=42,
+    )
+    bot.reply_learning.mark_discovered(original.id, posted)
+    bot.reply_learning.add_snapshot(
+        original.id,
+        checkpoint_minutes=15,
+        reply=posted,
+        root=XSearchResult(
+            id=42,
+            username="source",
+            display_name="Source",
+            text="Launch details",
+            created_at=posted_at.isoformat(),
+            url="https://x.com/source/status/42",
+        ),
+        captured_at=posted_at + timedelta(minutes=15),
+    )
+    response = XSearchResult(
+        id=101,
+        username="source",
+        display_name="Source",
+        text="Retention was the deciding factor.",
+        created_at=(posted_at + timedelta(minutes=18)).isoformat(),
+        created_at_timestamp=int((posted_at + timedelta(minutes=18)).timestamp()),
+        url="https://x.com/source/status/101",
+        is_reply=True,
+        in_reply_to_tweet_id=100,
+    )
+
+    class FakeXSearch:
+        async def tweet_replies(self, tweet_id, *, limit):
+            assert tweet_id == 100
+            assert limit == 20
+            return [response]
+
+        async def tweet_by_id(self, _tweet_id):
+            raise AssertionError("No metric checkpoint is due at minute 20")
+
+    class FakeAI:
+        async def generate_reply_from_text(self, text):
+            assert text == response.text
+            return GeneratedContent(
+                text="That makes the rollout decision much clearer.",
+                image_prompt="",
+                topic="reply",
+            )
+
+    sent = []
+
+    class FakeTelegramBot:
+        async def send_message(self, **kwargs):
+            sent.append(kwargs)
+
+    bot.x_search = FakeXSearch()
+    bot.ai = FakeAI()
+    bot._application = SimpleNamespace(bot=FakeTelegramBot())
+
+    asyncio.run(
+        bot._process_reply_tracking_once(now=posted_at + timedelta(minutes=20))
+    )
+
+    record = bot.reply_learning.records("tracking")[0]
+    assert record["author_replied"] is True
+    assert record["followup_created"] is True
+    assert record["author_response_latency_minutes"] == 18
+    assert len(sent) == 1
+    assert "@source replied:" in sent[0]["text"]
+    callbacks = {
+        button.callback_data
+        for row in sent[0]["reply_markup"].inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert any(value.startswith("automation:continue:") for value in callbacks)
+    assert any(value.startswith("automation:stop:") for value in callbacks)
+
+
+def test_stop_here_marks_the_parent_conversation_stopped(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            reply_learning_path=str(tmp_path / "learning.json"),
+            reply_watch_path="",
+        )
+    )
+    parent = bot.approvals.create(
+        kind="reply",
+        text="Original reply",
+        chat_id=123,
+        approver_user_id=456,
+        target_url="https://x.com/source/status/42",
+        metadata={"reply_strategy": "specific_observation", "root_author": "source"},
+    )
+    bot.reply_learning.register_approval(parent)
+    followup = bot.approvals.create(
+        kind="reply",
+        text="Suggested follow-up",
+        chat_id=123,
+        approver_user_id=456,
+        target_url="https://x.com/source/status/101",
+        metadata={
+            "reply_strategy": "author_specific_question",
+            "relationship_followup": True,
+            "relationship_parent_approval_id": parent.id,
+            "root_author": "source",
+            "author_response_text": "Thanks for asking.",
+        },
+    )
+    edits = []
+
+    class FakeQuery:
+        data = f"automation:stop:{followup.id}"
+        from_user = SimpleNamespace(id=456)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=123),
+            text="Author follow-up card",
+        )
+
+        async def answer(self, *args, **kwargs):
+            del args, kwargs
+
+        async def edit_message_text(self, *args, **kwargs):
+            edits.append((args, kwargs))
+
+    update = SimpleNamespace(callback_query=FakeQuery())
+    asyncio.run(bot.automation_approval(update, SimpleNamespace()))
+
+    assert bot.approvals.get(followup.id).status == "rejected"
+    assert bot.reply_learning.data["records"][parent.id]["conversation_stopped"] is True
+    assert "Conversation stopped" in edits[0][0][0]
+
+
 def test_mobile_post_falls_back_to_a_short_composer_url_when_draft_is_long() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
     approval = bot.approvals.create(
@@ -732,6 +939,142 @@ def test_replytargets_auto_mode_compares_candidates_across_topics() -> None:
     assert "across current topics" in note
 
 
+def test_replytargets_auto_mode_refetches_persisted_watched_tweet(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            generate_images=False,
+            reply_watch_path=str(tmp_path / "watch.json"),
+            reply_target_metrics_path=str(tmp_path / "metrics.json"),
+        )
+    )
+    now = int(datetime.now(UTC).timestamp())
+    first = XSearchResult(
+        id=401,
+        username="watched",
+        display_name="Watched",
+        text="A fresh update with an open discussion",
+        created_at=datetime.now(UTC).isoformat(),
+        url="https://x.com/watched/status/401",
+        language="en",
+        created_at_timestamp=now - 5 * 60,
+        like_count=5,
+        reply_count=1,
+        view_count=600,
+        author_followers_count=5_000,
+    )
+    refreshed = XSearchResult(
+        id=401,
+        username="watched",
+        display_name="Watched",
+        text=first.text,
+        created_at=first.created_at,
+        url=first.url,
+        language="en",
+        created_at_timestamp=first.created_at_timestamp,
+        like_count=18,
+        reply_count=3,
+        view_count=1_800,
+        author_followers_count=5_000,
+    )
+    search_calls = 0
+    detail_calls = []
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    class XSearch:
+        async def tweet_by_id(self, tweet_id):
+            detail_calls.append(tweet_id)
+            return refreshed
+
+        async def tweet_replies(self, _tweet_id, *, limit):
+            assert limit == 12
+            return []
+
+    async def auto_queries(_languages=None, *, mode="balanced"):
+        del mode
+        return ["current topic"]
+
+    async def search(_query, *, max_age_minutes=360):
+        nonlocal search_calls
+        del max_age_minutes
+        search_calls += 1
+        return "current topic lang:en", [first] if search_calls == 1 else []
+
+    bot.x_search = XSearch()
+    bot._auto_reply_target_queries = auto_queries
+    bot._search_reply_target_pool = search
+
+    _query, first_results, _note = asyncio.run(
+        bot._get_reply_target_context("", Status(), languages=["en"])
+    )
+    ready, watching = bot.reply_watch.classify(first_results)
+    assert ready == []
+    assert watching
+
+    _query, second_results, _note = asyncio.run(
+        bot._get_reply_target_context("", Status(), languages=["en"])
+    )
+    ready, watching = bot.reply_watch.classify(second_results)
+
+    assert detail_calls == [401]
+    assert [result.id for result in ready] == [401]
+    assert watching == []
+    assert second_results[0].view_count == 1_800
+
+
+def test_scheduled_replytargets_reports_daily_cap_instead_of_confirmation(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            generate_images=False,
+            creator_daily_reply_cap=1,
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    bot.approval_chat_id = 123
+    candidate = XSearchResult(
+        id=402,
+        username="ready",
+        display_name="Ready",
+        text="A confirmed candidate",
+        created_at=datetime.now(UTC).isoformat(),
+        url="https://x.com/ready/status/402",
+    )
+    bot.approvals.create(
+        kind="reply",
+        text="Existing reply card",
+        chat_id=123,
+        approver_user_id=123,
+        target_url="https://x.com/already/status/1",
+    )
+    messages = []
+
+    class Status:
+        async def edit_text(self, text):
+            messages.append(text)
+
+    class TelegramBot:
+        async def send_message(self, **_kwargs):
+            return Status()
+
+    async def context(*_args, **_kwargs):
+        return "auto hot topics", [candidate], ""
+
+    bot._application = SimpleNamespace(bot=TelegramBot())
+    bot._get_reply_target_context = context
+    bot.reply_watch.classify = lambda _results: ([candidate], [])
+
+    asyncio.run(bot._run_scheduled_replytargets("", 360, ["en"]))
+
+    assert "reached today's reply-card cap" in messages[-1]
+    assert "Confirmed now: 1" in messages[-1]
+    assert "none is confirmed enough" not in messages[-1]
+
+
 def test_replytargets_explicit_topic_expands_languages_without_topic_drift() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
     attempts = []
@@ -900,8 +1243,9 @@ def test_replytargets_auto_topic_discovery_uses_one_bounded_trend_call() -> None
         "Market news (lang:en OR lang:ja)",
         "New game (lang:en OR lang:ja)",
     ]
-    assert queries[4].endswith("lang:en")
-    assert queries[5].endswith("lang:ja")
+    assert "経済 OR 日銀 OR 円相場" in queries[4]
+    assert queries[4].endswith("lang:ja")
+    assert queries[5].endswith("lang:en")
     assert bot.settings.creator_niche not in queries
 
 
@@ -916,8 +1260,9 @@ def test_replytargets_auto_fallback_round_robins_configured_languages() -> None:
     bot.x_search = XSearch()
     queries = asyncio.run(bot._auto_reply_target_queries(["en", "ja"], mode="reach"))
 
-    assert len(queries) == 6
+    assert len(queries) == 7
     assert [query.rsplit("lang:", 1)[-1] for query in queries] == [
+        "ja",
         "en",
         "ja",
         "en",
@@ -926,6 +1271,7 @@ def test_replytargets_auto_fallback_round_robins_configured_languages() -> None:
         "ja",
     ]
     assert queries[-2:] == ["AI lang:en", "AI lang:ja"]
+    assert "アニメ OR ゲーム OR テクノロジー" in queries[0]
 
 
 def test_reply_target_mode_penalizes_a_dominant_top_reply() -> None:

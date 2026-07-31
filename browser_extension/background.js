@@ -7,7 +7,9 @@ const DEFAULTS = {
   automationEnabled: false,
   activeStart: "08:00",
   activeEnd: "22:00",
-  replyTargetsMinutes: 30,
+  replyTargetsMinutes: 15,
+  replyTargetsMaxAgeMinutes: 360,
+  replyTargetsLanguages: "en,ja",
   replyTargetsQuery: "",
   trendTimes: "09:00,18:00",
   trendCategory: "auto",
@@ -50,7 +52,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
   if (
     changes.automationEnabled || changes.activeStart || changes.activeEnd ||
-    changes.replyTargetsMinutes || changes.trendTimes
+    changes.replyTargetsMinutes || changes.replyTargetsMaxAgeMinutes ||
+    changes.replyTargetsLanguages || changes.trendTimes
   ) {
     if (changes.replyTargetsMinutes) {
       const minutes = Math.max(5, Number(changes.replyTargetsMinutes.newValue || DEFAULTS.replyTargetsMinutes));
@@ -221,7 +224,9 @@ async function automationTick() {
       method: "POST",
       body: {
         query: config.replyTargetsQuery,
-        reply_targets_minutes: config.replyTargetsMinutes
+        reply_targets_minutes: config.replyTargetsMinutes,
+        reply_target_max_age_minutes: config.replyTargetsMaxAgeMinutes,
+        reply_target_languages: config.replyTargetsLanguages
       }
     });
     if (trigger.status === "accepted") {
@@ -2031,6 +2036,13 @@ async function loadConfig() {
     activeStart: String(saved.activeStart || DEFAULTS.activeStart),
     activeEnd: String(saved.activeEnd || DEFAULTS.activeEnd),
     replyTargetsMinutes: Math.max(5, Number(saved.replyTargetsMinutes || DEFAULTS.replyTargetsMinutes)),
+    replyTargetsMaxAgeMinutes: Math.min(1440, Math.max(
+      30,
+      Number(saved.replyTargetsMaxAgeMinutes || DEFAULTS.replyTargetsMaxAgeMinutes)
+    )),
+    replyTargetsLanguages: String(
+      saved.replyTargetsLanguages || DEFAULTS.replyTargetsLanguages
+    ),
     replyTargetsQuery: String(saved.replyTargetsQuery || ""),
     trendTimes: String(saved.trendTimes || DEFAULTS.trendTimes),
     trendCategory: String(saved.trendCategory || DEFAULTS.trendCategory),
@@ -2053,6 +2065,13 @@ async function saveConfig(config) {
     activeStart: String(config.activeStart || DEFAULTS.activeStart),
     activeEnd: String(config.activeEnd || DEFAULTS.activeEnd),
     replyTargetsMinutes: Math.max(5, Number(config.replyTargetsMinutes || DEFAULTS.replyTargetsMinutes)),
+    replyTargetsMaxAgeMinutes: Math.min(1440, Math.max(
+      30,
+      Number(config.replyTargetsMaxAgeMinutes || DEFAULTS.replyTargetsMaxAgeMinutes)
+    )),
+    replyTargetsLanguages: String(
+      config.replyTargetsLanguages || DEFAULTS.replyTargetsLanguages
+    ),
     replyTargetsQuery: String(config.replyTargetsQuery || ""),
     trendTimes: String(config.trendTimes || DEFAULTS.trendTimes),
     trendCategory: String(config.trendCategory || DEFAULTS.trendCategory),

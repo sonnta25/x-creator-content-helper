@@ -21,6 +21,8 @@ class AutomationApproval:
     target_label: str = ""
     status: str = "pending"
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    decided_at: datetime | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
     error: str = ""
 
     @property
@@ -55,6 +57,7 @@ class AutomationApprovalStore:
         approver_user_id: int | None = None,
         target_url: str = "",
         target_label: str = "",
+        metadata: dict[str, object] | None = None,
     ) -> AutomationApproval:
         if kind not in {"reply", "post"}:
             raise RuntimeError(f"Unsupported approval kind: {kind}")
@@ -71,6 +74,7 @@ class AutomationApprovalStore:
             ),
             target_url=str(target_url or "").strip(),
             target_label=str(target_label or "").strip(),
+            metadata=dict(metadata or {}),
         )
         self._items[approval.id] = approval
         self.prune()
@@ -119,6 +123,7 @@ class AutomationApprovalStore:
             approval.status = "mobile_approved" if destination == "mobile" else "approved"
         else:
             approval.status = "rejected"
+        approval.decided_at = datetime.now(UTC)
         self._save()
         return approval
 
@@ -133,6 +138,10 @@ class AutomationApprovalStore:
             in {"pending", "approved", "dispatching", "completed", "mobile_approved"}
             for approval in self._items.values()
         )
+
+    def items(self) -> list[AutomationApproval]:
+        self.prune()
+        return list(self._items.values())
 
     def claim_next(self) -> AutomationApproval | None:
         self.prune()
@@ -194,6 +203,16 @@ class AutomationApprovalStore:
                     target_label=str(row.get("target_label", "")),
                     status=str(row.get("status", "pending")),
                     created_at=datetime.fromisoformat(str(row["created_at"])),
+                    decided_at=(
+                        datetime.fromisoformat(str(row["decided_at"]))
+                        if row.get("decided_at")
+                        else None
+                    ),
+                    metadata=(
+                        dict(row.get("metadata", {}))
+                        if isinstance(row.get("metadata", {}), dict)
+                        else {}
+                    ),
                     error=str(row.get("error", "")),
                 )
             except (KeyError, TypeError, ValueError):
@@ -216,6 +235,10 @@ class AutomationApprovalStore:
                     "target_label": approval.target_label,
                     "status": approval.status,
                     "created_at": approval.created_at.isoformat(),
+                    "decided_at": (
+                        approval.decided_at.isoformat() if approval.decided_at else None
+                    ),
+                    "metadata": approval.metadata,
                     "error": approval.error,
                 }
                 for approval in self._items.values()

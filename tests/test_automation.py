@@ -103,6 +103,32 @@ def test_mobile_approval_and_target_dedupe_survive_restart(tmp_path) -> None:
     assert restored.has_active_target("https://x.com/user/status/42") is True
 
 
+def test_reply_tracking_metadata_and_decision_time_survive_restart(tmp_path) -> None:
+    path = tmp_path / "automation-approvals.json"
+    store = AutomationApprovalStore(path)
+    approval = store.create(
+        kind="reply",
+        text="Reply draft",
+        chat_id=123,
+        target_url="https://x.com/user/status/42",
+        metadata={"reply_strategy": "natural_humor", "root_views": 1200},
+    )
+    store.decide(
+        approval.id,
+        approve=True,
+        chat_id=123,
+        user_id=123,
+        destination="mobile",
+    )
+
+    restored = AutomationApprovalStore(path).get(approval.id)
+
+    assert restored is not None
+    assert restored.decided_at is not None
+    assert restored.metadata["reply_strategy"] == "natural_humor"
+    assert restored.metadata["root_views"] == 1200
+
+
 def test_mobile_approval_can_be_retried_after_a_failed_telegram_edit(tmp_path) -> None:
     store = AutomationApprovalStore(tmp_path / "approvals.json")
     approval = store.create(kind="post", text="Draft", chat_id=10, approver_user_id=20)

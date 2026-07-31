@@ -22,6 +22,29 @@ def test_popup_reads_extension_version_from_manifest() -> None:
     assert f"v{manifest['version']}" not in popup_html
 
 
+def test_replytargets_schedule_and_lookback_are_separate_multilingual_controls() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+    popup_js = (PROJECT_ROOT / "browser_extension" / "popup.js").read_text(
+        encoding="utf-8"
+    )
+    popup_html = (PROJECT_ROOT / "browser_extension" / "popup.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "replyTargetsMinutes: 15" in background_js
+    assert "replyTargetsMaxAgeMinutes: 360" in background_js
+    assert 'replyTargetsLanguages: "en,ja"' in background_js
+    assert "reply_target_max_age_minutes: config.replyTargetsMaxAgeMinutes" in background_js
+    assert "reply_target_languages: config.replyTargetsLanguages" in background_js
+    assert "replyTargetsMaxAgeMinutes" in popup_js
+    assert "replyTargetsLanguages" in popup_js
+    assert "/replytargets scan interval" in popup_html
+    assert "/replytargets maximum post age" in popup_html
+    assert "/replytargets languages" in popup_html
+
+
 def test_gemini_recovery_does_not_leave_the_only_tab_on_about_blank() -> None:
     background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
         encoding="utf-8"

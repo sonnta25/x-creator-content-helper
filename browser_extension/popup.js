@@ -7,7 +7,9 @@ const DEFAULTS = {
   automationEnabled: false,
   activeStart: "08:00",
   activeEnd: "22:00",
-  replyTargetsMinutes: 30,
+  replyTargetsMinutes: 15,
+  replyTargetsMaxAgeMinutes: 360,
+  replyTargetsLanguages: "en,ja",
   replyTargetsQuery: "",
   trendTimes: "09:00,18:00",
   trendCategory: "auto",
@@ -28,6 +30,8 @@ const els = {
   activeStart: document.getElementById("activeStart"),
   activeEnd: document.getElementById("activeEnd"),
   replyTargetsMinutes: document.getElementById("replyTargetsMinutes"),
+  replyTargetsMaxAgeMinutes: document.getElementById("replyTargetsMaxAgeMinutes"),
+  replyTargetsLanguages: document.getElementById("replyTargetsLanguages"),
   replyTargetsQuery: document.getElementById("replyTargetsQuery"),
   replyScheduleStatus: document.getElementById("replyScheduleStatus"),
   trendTimes: document.getElementById("trendTimes"),
@@ -149,6 +153,8 @@ function renderConfig(config) {
   els.activeStart.value = config.activeStart;
   els.activeEnd.value = config.activeEnd;
   els.replyTargetsMinutes.value = String(config.replyTargetsMinutes);
+  els.replyTargetsMaxAgeMinutes.value = String(config.replyTargetsMaxAgeMinutes);
+  els.replyTargetsLanguages.value = config.replyTargetsLanguages;
   els.replyTargetsQuery.value = config.replyTargetsQuery;
   els.trendTimes.value = config.trendTimes;
   els.trendCategory.value = config.trendCategory;
@@ -181,6 +187,13 @@ function readConfigFromForm() {
     activeStart: els.activeStart.value || DEFAULTS.activeStart,
     activeEnd: els.activeEnd.value || DEFAULTS.activeEnd,
     replyTargetsMinutes: Math.max(5, Number(els.replyTargetsMinutes.value || DEFAULTS.replyTargetsMinutes)),
+    replyTargetsMaxAgeMinutes: Math.min(1440, Math.max(
+      30,
+      Number(
+        els.replyTargetsMaxAgeMinutes.value || DEFAULTS.replyTargetsMaxAgeMinutes
+      )
+    )),
+    replyTargetsLanguages: els.replyTargetsLanguages.value.trim() || DEFAULTS.replyTargetsLanguages,
     replyTargetsQuery: els.replyTargetsQuery.value.trim(),
     trendTimes: els.trendTimes.value.trim() || DEFAULTS.trendTimes,
     trendCategory: els.trendCategory.value || DEFAULTS.trendCategory,

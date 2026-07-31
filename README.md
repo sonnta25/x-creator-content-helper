@@ -21,7 +21,7 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 - `/reply <tweet text or X post link>`: create one copy-ready text reply only.
 - `/automationhere`: use the current Telegram chat for scheduled approval requests.
 - `/replyevery <minutes>`: configure the scheduled `/replytargets` interval from Telegram (5-1440 minutes).
-- `/replytargets [query]`: scan broad current conversations for fresh high-distribution posts from large accounts, independently of `CREATOR_NICHE`; each result includes approval buttons.
+- `/replytargets [query]`: scan broad current conversations for emerging and late-breakout posts across configured languages, independently of `CREATOR_NICHE`; each result includes approval buttons.
 - `/importcookie [account_name] <auth_token=...; ct0=...>`: import an X cookie for search.
 - `/xaccounts`: list imported X cookie accounts without exposing cookies.
 - `/xremove <account_name>`: remove an imported X cookie account from the twscrape pool.
@@ -102,7 +102,7 @@ authorized to save.
 4. Use `/tweetx <topic>` when you want a post grounded in current X chatter.
 5. Use `/dailybrief news` when you need several ready-to-post ideas, with optional images when enabled.
 
-X search commands add `lang:en` automatically unless your query already includes a `lang:` filter.
+General X search commands add `lang:en` automatically unless the query already includes a `lang:` filter. `/replytargets` is separate: it expands auto and plain-topic searches across `REPLY_TARGET_LANGUAGES` (default `en,ja`) and writes each reply in the source post's language.
 
 `/tweettrend3` auto mode searches current Google News topics using `CREATOR_NICHE` first, then falls back to broader X/Google/RSS trends only if fewer than three niche topics are available. `CREATOR_NICHE` does not constrain `/replytargets`. `/tweettrend3` uses English/US trend context by default, but final post text is always written in natural Vietnamese. Image prompts remain English so Gemini image generation is more reliable.
 
@@ -110,9 +110,9 @@ X search commands add `lang:en` automatically unless your query already includes
 
 Manual `/tweettrend3` creates Gemini jobs one topic at a time. Its Telegram status shows the current topic number and explicitly says when the job is waiting for the Chrome extension. With extension **Auto Run** OFF, click **Run next job** once for each queued topic; with **Auto Run** ON, the extension picks them up automatically on its polling interval.
 
-Extension `0.3.9` waits for Gemini's composer to be visible before inserting a prompt. It inserts the full prompt atomically, verifies at least 98% of the normalized text is present, and automatically retries with a DOM-safe fallback if Gemini replaces its editor node. If a Gemini job fails, it reports the failure to the bot before recycling the provider tab. Recycling opens a new Gemini tab, waits until its composer is ready, and only then closes the old Gemini tabs; if the replacement fails, the old tab is preserved. Auto Run alarms are verified whenever the service worker starts and by a one-minute watchdog. The open Gemini tab also wakes the worker every 25 seconds, so Auto Run keeps polling even if Chrome loses all extension alarms. Claimed jobs send a heartbeat; if Chrome or the worker dies, the bridge returns the abandoned job to the queue after 75 seconds.
+Extension `0.4.0` waits for Gemini's composer to be visible before inserting a prompt. It inserts the full prompt atomically, verifies at least 98% of the normalized text is present, and automatically retries with a DOM-safe fallback if Gemini replaces its editor node. If a Gemini job fails, it reports the failure to the bot before recycling the provider tab. Recycling opens a new Gemini tab, waits until its composer is ready, and only then closes the old Gemini tabs; if the replacement fails, the old tab is preserved. Auto Run alarms are verified whenever the service worker starts and by a one-minute watchdog. The open Gemini tab also wakes the worker every 25 seconds, so Auto Run keeps polling even if Chrome loses all extension alarms. Claimed jobs send a heartbeat; if Chrome or the worker dies, the bridge returns the abandoned job to the queue after 75 seconds.
 
-Trend commands scan X trends, Google Trends RSS, built-in Google News RSS feeds, and any custom RSS feeds from `TREND_RSS_URLS`. RSS requests reuse a small connection pool instead of opening a new TLS connection for every feed. When X search is configured, each selected topic is enriched with recent X context from the last 24 hours. `/replytargets` uses the configured schedule interval as a hard recent-post ceiling and filters for stronger engagement/velocity when X exposes those metrics.
+Trend commands scan X trends, Google Trends RSS, built-in Google News RSS feeds, and any custom RSS feeds from `TREND_RSS_URLS`. RSS requests reuse a small connection pool instead of opening a new TLS connection for every feed. When X search is configured, each selected topic is enriched with recent X context from the last 24 hours. `/replytargets` runs on its own scan interval but uses the independent `REPLY_TARGET_MAX_AGE_MINUTES` lookback. Repeated scans persist metric snapshots so ranking can use recent deltas and acceleration rather than lifetime averages alone.
 
 ## Setup
 
@@ -173,6 +173,9 @@ X_SEARCH_LIMIT=8
 X_SEARCH_PRODUCT=Top
 REPLY_TARGET_MIN_AUTHOR_FOLLOWERS=50000
 REPLY_TARGET_MIN_VIEWS=500
+REPLY_TARGET_MAX_AGE_MINUTES=360
+REPLY_TARGET_LANGUAGES=en,ja
+REPLY_TARGET_METRICS_PATH=data/reply_target_metrics.json
 X_POST_CHAR_LIMIT=2000
 
 TREND_SOURCES=x,google_trends,rss
@@ -237,7 +240,9 @@ The extension can schedule content generation while keeping the final X action m
 2. Reload `browser_extension/` from `chrome://extensions` after updating the project.
 3. Open the extension popup and configure **Scheduled approvals**:
    - **Active from / Active until**: the daily activity window, using the computer's local time. Overnight windows such as `22:00` to `02:00` are supported.
-   - **/replytargets interval + max post age**: interval in minutes and the hard maximum age of accepted posts; the minimum is 5 and the default is 30.
+   - **/replytargets scan interval**: how often Chrome triggers a scan; the minimum is 5 and the default is 15 minutes.
+   - **/replytargets maximum post age**: independent lookback; the default is 360 minutes.
+   - **/replytargets languages**: comma-separated X language codes; the default is `en,ja`.
    - **/replytargets query**: optional; leave blank for automatic topic selection.
    - **/tweettrend3 fixed times**: comma-separated local times, for example `09:00, 13:30, 18:00`.
    - **/tweettrend3 category**: `auto`, `trending`, `news`, `sport`, or `entertainment`.
@@ -247,7 +252,45 @@ You can also change **/replytargets every** from the private Telegram approval c
 
 For both manual `/replytargets` and `/tweettrend3` commands and their scheduled runs, Telegram sends each draft with **Approve on mobile** and **Reject** buttons. Only the Telegram user who requested a manual draft can approve it.
 
-`/replytargets` approval messages contain only the target X link and the copy-ready reply. A scheduled run immediately sends a short started/progress message, so source discovery cannot look like a missed schedule. Auto mode starts from current X trends and broad news, politics, business, sports, entertainment, technology, and internet-culture lanes; it does not start from `CREATOR_NICHE`. To keep small VPS CPU and twscrape database I/O predictable, each run uses one bounded hot-trend lookup, checks up to 6 topics, and fetches at most 12 Top results per topic. Trend discovery has a 20-second timeout and each X topic search has a 30-second timeout. Every topic is fetched only once: if strict engagement filters find nothing, the bot re-ranks those same results locally with relaxed engagement and velocity thresholds instead of querying X again. By default, candidates must come from accounts with at least 50,000 followers, and the 500-view minimum remains a hard floor whenever X exposes view count. Ranking prioritizes view velocity, follower reach, and engagement velocity. It keeps changing topics, but never accepts a post older than the configured `/replytargets every` interval.
+`/replytargets` approval messages contain only the target X link and the copy-ready reply. A scheduled run immediately sends a short started/progress message, so source discovery cannot look like a missed schedule. Auto mode starts from the authenticated X account's current trends plus localized broad OR-queries covering news, politics, business, sports, entertainment, technology, internet culture, AI, and crypto; it does not start from `CREATOR_NICHE`. The trends timeline may reflect the logged-in account's locale/personalization and is not claimed to be a global or country-specific chart. Search itself applies no country filter. With the default six-query budget, up to four distinct X trends are searched once across every configured language; the remaining slots are assigned round-robin to localized broad discovery, normally one English and one Japanese query. If X trends are unavailable, all six slots rotate through the localized broad, breaking-news, and AI fallbacks.
+
+Every query searches both `Top` and `Latest`, with at most eight results from each product, so auto mode can compare up to 96 raw rows before deduplication and quality filters. `Top` supplies confirmed distribution while `Latest` supplies earlier breakout candidates. `-is:reply -is:retweet` is added at search time, and the parsed results are checked again; original posts and quote posts remain eligible. An explicit `/replytargets <topic>` stays inside that topic but expands it across the configured languages unless the user supplies a `lang:` operator.
+
+The first time a post is seen, ranking uses its lifetime-average momentum. Later scans read `data/reply_target_metrics.json` and use view, weighted-engagement, direct-reply, and reply/quote deltas from the previous observation, plus acceleration. Viral confidence and reply opportunity are separate: reply activity is retained as a capped viral signal, but no longer makes a crowded thread automatically attractive. Thread availability measures recent views per competing reply, lifetime views per reply, total reply load, and new-reply pressure. Reply opportunity uses 65% viral momentum, 25% thread availability, and 10% recency, then subtracts a soft saturation penalty; exceptional ongoing view velocity reduces—but does not erase—that penalty. Scores are normalized within each language, and the final selection keeps the strongest qualified candidate from every detected configured language before filling the remaining slots globally.
+
+This design favors a post that is still gaining distribution while its root reply section remains open, including two-to-six-hour late breakouts. The 500-view minimum remains a hard floor whenever X exposes view count. The configured 50,000-follower value is a small capped reach bonus rather than a hard gate. Replies match the source language and must add one source-grounded observation, tension, implication, or real question; when a question fits, it targets a concrete decision, assumption, consequence, or tradeoff the original author can answer. Generic agreement, recap, unsupported context, generic engagement questions, and forced sarcasm are rejected.
+
+### Automatic reply tracking and learning
+
+Reply tracking is enabled by default. Set the real posting account once with
+`/replylearn username @yourname` or `X_OWNER_USERNAME=yourname`. This value is
+not `X_ACCOUNT_NAME`: the latter is only the local twscrape cookie-account label.
+After an approval is opened and you manually submit the reply on X, the bot scans
+that account's tweets and replies and matches the new item by parent tweet, posting
+window, and draft similarity. You do not need to send the published reply URL back
+to Telegram.
+
+The tracker captures reply and root-post metrics at approximately 15 minutes,
+1 hour, 6 hours, and 24 hours. Its 24-hour outcome score combines:
+
+- reply views relative to new root-post views;
+- reply engagement per view, with replies, reposts, and quotes weighted above likes;
+- whether the original root author directly replied.
+
+The score is a strategy-comparison heuristic, not an X impression guarantee.
+Use `/replyreport 7d` or `/replyreport 30d` to inspect results. Use
+`/replylearn status`, `on`, `off`, or `rollback` to control it.
+
+The bot rotates among five fixed strategies: a specific observation, practical
+implication, respectful counterpoint, author-specific question, and natural humor.
+It tracks immediately, but waits for 60 completed 24-hour samples before the first
+automatic adjustment. Later revisions require new samples and are limited to once
+per seven days; every strategy weight can move by at most 10% relative to its prior
+value. Low-sample results are shrunk toward the global average. Weight versions are
+stored in `data/reply_learning.json`, and rollback restores the previous version.
+The bot does not rewrite source code or overwrite its base prompts.
+
+The project requires `twscrape>=0.19.2`. That release includes current X client-transaction-ID and GraphQL compatibility fixes; older `0.19.1` builds can fail before search and misleadingly produce an empty candidate pool.
 
 If Gemini returns an empty target array or changes common JSON field names, `/replytargets` normalizes the response and automatically queues one repair job using the same candidate URLs. Scheduled automation remains active while that repair job is pending, so the extension picks it up on the next automation check. If both attempts fail, the Telegram error includes short response previews for diagnosis.
 

@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from typing import Any
 from urllib.parse import urlencode
@@ -38,15 +38,26 @@ from src.media_download_service import (
     MediaDownloadService,
 )
 from src.models import GeneratedContent, ReplyTargetDraft, TrendPostVariant, XSearchResult
+from src.reply_target_metrics import ReplyTargetMetricStore
+from src.reply_learning import (
+    CHECKPOINT_MINUTES,
+    MIN_FINAL_SAMPLES_TO_TUNE,
+    STRATEGIES,
+    ReplyLearningStore,
+    match_posted_reply,
+)
 from src.trend_source_service import TrendSourceService, summarize_trend_signals
 from src.x_search_service import (
     MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
     MIN_REPLY_TARGET_VELOCITY_SCORE,
+    MIN_REPLY_TARGET_VIEW_VELOCITY_SCORE,
     TREND_FALLBACK_QUERIES,
     XSearchService,
     default_english_query,
     extract_tweet_id,
     format_x_results,
+    parse_reply_target_languages,
+    query_for_language,
     rank_fast_growing_posts,
     summarize_reply_target_context,
     summarize_x_context,
@@ -57,18 +68,22 @@ LOGGER = logging.getLogger(__name__)
 
 AUTO_TREND_CATEGORIES = ("trending", "news", "entertainment", "sport")
 AUTO_REPLY_TARGET_FALLBACK_QUERIES = (
+    '(breaking news OR politics OR business OR sports OR entertainment OR '
+    'technology OR "internet culture" OR crypto OR AI)',
     "breaking news",
-    "politics",
-    "business",
-    "sports",
-    "entertainment",
-    "technology",
-    "internet culture",
-    "crypto",
     "AI",
 )
+AUTO_REPLY_TARGET_FALLBACK_QUERIES_BY_LANGUAGE = {
+    "en": AUTO_REPLY_TARGET_FALLBACK_QUERIES,
+    "ja": (
+        "(話題 OR 速報 OR ニュース OR 政治 OR ビジネス OR スポーツ OR "
+        "エンタメ OR テクノロジー OR AI OR 暗号資産)",
+        "速報",
+        "AI",
+    ),
+}
 REPLY_TARGET_MAX_CANDIDATES = 6
-REPLY_TARGET_RESULT_LIMIT = 12
+REPLY_TARGET_RESULT_LIMIT = 8
 REPLY_TARGET_CONTEXT_ITEMS = 3
 REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
@@ -162,6 +177,8 @@ BOT_COMMANDS = [
     BotCommand("reply", "Generate a witty reply from tweet text or an X post link"),
     BotCommand("automationhere", "Send scheduled approval requests to this chat"),
     BotCommand("replyevery", "Set scheduled replytargets interval in minutes"),
+    BotCommand("replylearn", "Show or control automatic reply learning"),
+    BotCommand("replyreport", "Show tracked reply performance"),
     BotCommand("cancel", "Cancel the command currently waiting for input"),
 ]
 
@@ -176,11 +193,19 @@ class ContentBot:
         self._download_semaphore = asyncio.Semaphore(1)
         self._x_account_error_notices: dict[str, str] = {}
         self.approvals = AutomationApprovalStore(settings.automation_approvals_path)
+        self.reply_target_metrics = ReplyTargetMetricStore(
+            settings.reply_target_metrics_path
+        )
+        self.reply_learning = ReplyLearningStore(
+            settings.reply_learning_path,
+            enabled=settings.reply_learning_enabled,
+        )
         self.approval_chat_id = settings.telegram_approval_chat_id
         self._application: Application | None = None
         self._automation_running: set[str] = set()
         self._automation_tasks: set[asyncio.Task[None]] = set()
         self._pending_inputs: dict[tuple[int, int], _PendingCommandInput] = {}
+        self._reply_tracking_task: asyncio.Task[None] | None = None
 
     def build_application(self) -> Application:
         async def post_init(app: Application) -> None:
@@ -190,6 +215,12 @@ class ContentBot:
             if bridge is not None:
                 bridge.set_automation_handler(self)
                 await bridge.start()
+            self._reply_tracking_task = asyncio.create_task(
+                self._reply_tracking_loop(),
+                name="reply-tracking",
+            )
+            self._automation_tasks.add(self._reply_tracking_task)
+            self._reply_tracking_task.add_done_callback(self._automation_tasks.discard)
 
         async def post_shutdown(app: Application) -> None:
             del app
@@ -230,6 +261,8 @@ class ContentBot:
         app.add_handler(CommandHandler("reply", self.reply))
         app.add_handler(CommandHandler("automationhere", self.automationhere))
         app.add_handler(CommandHandler("replyevery", self.replyevery))
+        app.add_handler(CommandHandler("replylearn", self.replylearn))
+        app.add_handler(CommandHandler("replyreport", self.replyreport))
         app.add_handler(CommandHandler("cancel", self.cancel))
         app.add_handler(
             CallbackQueryHandler(self.automation_approval, pattern=r"^automation:")
@@ -260,6 +293,8 @@ class ContentBot:
             "/reply <tweet text or X post link> - generate a copy-ready reply\n"
             "/automationhere - send scheduled approval requests to this chat\n"
             "/replyevery <minutes> - set the scheduled /replytargets interval\n"
+            "/replylearn [status|on|off|rollback|username @name] - control learning\n"
+            "/replyreport [7d|30d] - show tracked reply performance\n"
             "/cancel - cancel a command that is waiting for input\n"
             "\n"
             "Tip: select a command without parameters and the bot will ask for "
@@ -482,6 +517,174 @@ class ContentBot:
             "automation_running": bool(self._automation_running),
         }
 
+    async def replylearn(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        raw = " ".join(context.args).strip()
+        action = raw.lower() or "status"
+        if action == "on":
+            self.reply_learning.set_enabled(True)
+            update_env_value("REPLY_LEARNING_ENABLED", "true")
+            await message.reply_text(
+                "Automatic reply tracking and bounded learning are ON."
+            )
+            return
+        if action == "off":
+            self.reply_learning.set_enabled(False)
+            update_env_value("REPLY_LEARNING_ENABLED", "false")
+            await message.reply_text(
+                "Automatic reply tracking and learning are OFF. Existing history was kept."
+            )
+            return
+        if action == "rollback":
+            rolled_back = self.reply_learning.rollback()
+            await message.reply_text(
+                "Rolled back to the previous strategy-weight version."
+                if rolled_back
+                else "No earlier strategy-weight version is available."
+            )
+            return
+        if action.startswith("username "):
+            username = raw.split(maxsplit=1)[1].strip().lstrip("@")
+            if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", username):
+                await message.reply_text("Invalid X username.")
+                return
+            update_env_value("X_OWNER_USERNAME", username)
+            self.settings = replace(self.settings, x_owner_username=username)
+            await message.reply_text(
+                f"Tracking account set to @{username}. The bot will discover posted replies automatically."
+            )
+            return
+        if action != "status":
+            await message.reply_text(
+                "Usage: /replylearn status|on|off|rollback|username @name"
+            )
+            return
+        status = self.reply_learning.status()
+        owner = (
+            f"@{self.settings.x_owner_username}"
+            if self.settings.x_owner_username
+            else "not configured"
+        )
+        weights = "\n".join(
+            f"- {name}: {status.weights[name] * 100:.1f}%"
+            for name in STRATEGIES
+        )
+        last_tuned = status.last_tuned_at or "not yet"
+        await message.reply_text(
+            "Automatic reply learning\n"
+            f"State: {'ON' if status.enabled else 'OFF'}\n"
+            f"Tracking account: {owner}\n"
+            f"Waiting/discovered/measured/unmatched: "
+            f"{status.waiting}/{status.tracking}/{status.measured}/{status.unmatched}\n"
+            f"Weight version: {status.version}\n"
+            f"Last tuned: {last_tuned}\n"
+            f"Auto-tuning starts after {MIN_FINAL_SAMPLES_TO_TUNE} measured 24h replies.\n\n"
+            f"Strategy weights:\n{weights}"
+        )
+
+    async def replyreport(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        raw = " ".join(context.args).strip().lower() or "30d"
+        if raw not in {"7d", "30d"}:
+            await message.reply_text("Usage: /replyreport [7d|30d]")
+            return
+        days = int(raw[:-1])
+        report = self.reply_learning.report(days)
+        strategy_lines = "\n".join(
+            f"- {name}: {values['count']} measured, avg {values['average_score']:.1f}/100"
+            for name, values in report["by_strategy"].items()
+        )
+        await message.reply_text(
+            f"Reply performance - last {days} days\n"
+            f"Posted/tracked: {report['posted']}\n"
+            f"Completed 24h measurement: {report['measured']}\n"
+            f"Author replies detected: {report['author_replies']}\n"
+            f"Average outcome score: {report['average_score']:.1f}/100\n\n"
+            f"By strategy:\n{strategy_lines}"
+        )
+
+    async def _reply_tracking_loop(self) -> None:
+        while True:
+            try:
+                await self._process_reply_tracking_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Automatic reply tracking pass failed")
+            await asyncio.sleep(max(60, self.settings.reply_tracking_poll_minutes * 60))
+
+    async def _process_reply_tracking_once(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        if not self.reply_learning.enabled:
+            return
+        current = now or datetime.now(UTC)
+        for approval in self.approvals.items():
+            if (
+                approval.kind == "reply"
+                and approval.status in {"mobile_approved", "completed"}
+            ):
+                self.reply_learning.register_approval(approval)
+
+        waiting = self.reply_learning.records("waiting")
+        owner = self.settings.x_owner_username.strip().lstrip("@")
+        if waiting and owner:
+            timeline = await self.x_search.user_tweets_and_replies(owner, limit=60)
+            for record in waiting:
+                match = match_posted_reply(record, timeline)
+                if match is not None:
+                    self.reply_learning.mark_discovered(record["approval_id"], match)
+                    continue
+                approved_at = datetime.fromisoformat(str(record["approved_at"]))
+                if current - approved_at > timedelta(minutes=90):
+                    self.reply_learning.mark_unmatched(record["approval_id"])
+
+        for record in self.reply_learning.records("tracking"):
+            checkpoint = self.reply_learning.due_checkpoint(record, now=current)
+            if checkpoint is None:
+                continue
+            reply = await self.x_search.tweet_by_id(int(record["reply_id"]))
+            if reply is None:
+                continue
+            root = await self.x_search.tweet_by_id(int(record["target_id"]))
+            author_replied = False
+            if checkpoint >= CHECKPOINT_MINUTES[-1]:
+                direct_replies = await self.x_search.tweet_replies(reply.id, limit=20)
+                root_author = str(record.get("root_author") or "").casefold()
+                author_replied = any(
+                    item.in_reply_to_tweet_id == reply.id
+                    and item.username.casefold() == root_author
+                    for item in direct_replies
+                )
+            self.reply_learning.add_snapshot(
+                record["approval_id"],
+                checkpoint_minutes=checkpoint,
+                reply=reply,
+                root=root,
+                author_replied=author_replied,
+                captured_at=current,
+            )
+        tuned = self.reply_learning.maybe_tune(now=current)
+        if tuned and self._application is not None and self.approval_chat_id is not None:
+            status = self.reply_learning.status()
+            await self._application.bot.send_message(
+                chat_id=self.approval_chat_id,
+                text=(
+                    "Reply learning updated strategy weights after enough 24h samples. "
+                    f"Version: {status.version}. Use /replylearn rollback to undo."
+                ),
+            )
+
     async def automation_approval(
         self,
         update: Update,
@@ -508,6 +711,8 @@ class ContentBot:
                 user_id=query.from_user.id,
                 destination="mobile",
             )
+            if approval.status == "mobile_approved" and approval.kind == "reply":
+                self.reply_learning.register_approval(approval)
             await query.answer()
             answered = True
             original = str(query.message.text or "").strip()
@@ -536,13 +741,21 @@ class ContentBot:
 
     async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]:
         query = str(payload.get("query", "")).strip()
-        interval_minutes = _reply_target_interval_minutes(
-            payload.get("reply_targets_minutes"),
-            default=self.settings.telegram_reply_targets_minutes or 30,
+        max_age_minutes = _reply_target_max_age_minutes(
+            payload.get("reply_target_max_age_minutes"),
+            default=self.settings.reply_target_max_age_minutes,
+        )
+        languages = parse_reply_target_languages(
+            payload.get("reply_target_languages"),
+            default=self.settings.reply_target_languages,
         )
         return self._spawn_automation(
             "replytargets",
-            lambda: self._run_scheduled_replytargets(query, interval_minutes),
+            lambda: self._run_scheduled_replytargets(
+                query,
+                max_age_minutes,
+                languages,
+            ),
         )
 
     async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -573,6 +786,8 @@ class ContentBot:
         if self._application is None:
             return
         if success:
+            if approval.kind == "reply":
+                self.reply_learning.register_approval(approval)
             detail = "Reply draft" if approval.kind == "reply" else "Post draft"
             text = f"{detail} opened and filled in X. Review it, then click the final X button."
         else:
@@ -618,7 +833,8 @@ class ContentBot:
     async def _run_scheduled_replytargets(
         self,
         query: str,
-        interval_minutes: int,
+        max_age_minutes: int,
+        languages: list[str],
     ) -> None:
         if self._application is None or self.approval_chat_id is None:
             raise RuntimeError("Automation chat is not ready.")
@@ -626,28 +842,32 @@ class ContentBot:
             chat_id=self.approval_chat_id,
             text=(
                 "Scheduled /replytargets started.\n"
-                f"Freshness limit: {interval_minutes} minutes."
+                f"Lookback: {max_age_minutes} minutes.\n"
+                f"Languages: {', '.join(languages)}."
             ),
         )
         try:
             search_query, results, _auto_note = await self._get_reply_target_context(
                 query,
                 status,
-                interval_minutes=interval_minutes,
+                max_age_minutes=max_age_minutes,
+                languages=languages,
             )
             if not results:
                 await status.edit_text(_no_reply_targets_message(
                     search_query,
                     auto=not query,
-                    interval_minutes=interval_minutes,
+                    max_age_minutes=max_age_minutes,
                 ))
                 return
             await status.edit_text(
                 f"Found {len(results)} fresh candidate(s). Generating reply drafts..."
             )
+            strategy = self.reply_learning.choose_strategy()
             drafts = await self.ai.generate_reply_targets(
                 search_query,
                 summarize_reply_target_context(results, max_items=REPLY_TARGET_CONTEXT_ITEMS),
+                strategy=strategy,
             )
             sent = 0
             for draft in drafts:
@@ -661,6 +881,10 @@ class ContentBot:
                     approver_user_id=self.approval_chat_id,
                     target_url=target_url,
                     target_label=draft.target,
+                    metadata=_reply_tracking_metadata(
+                        _result_for_url(results, target_url),
+                        strategy,
+                    ),
                 )
                 await self._send_approval(approval, reason=draft.reason)
                 sent += 1
@@ -929,38 +1153,45 @@ class ContentBot:
             query = ""
 
         await message.chat.send_action(ChatAction.TYPING)
-        interval_minutes = self.settings.telegram_reply_targets_minutes or 30
+        max_age_minutes = self.settings.reply_target_max_age_minutes
+        languages = parse_reply_target_languages(
+            self.settings.reply_target_languages
+        )
         status = await message.reply_text(
-            f"Finding fast-moving reply targets from the last {interval_minutes} minutes..."
+            f"Finding fast-moving reply targets from the last {max_age_minutes} minutes "
+            f"in {', '.join(languages)}..."
             if query
             else (
-                "Auto-picking a hot topic, then finding reply targets from the last "
-                f"{interval_minutes} minutes..."
+                "Comparing hot topics and late breakouts from the last "
+                f"{max_age_minutes} minutes in {', '.join(languages)}..."
             )
         )
         try:
             search_query, results, auto_note = await self._get_reply_target_context(
                 query,
                 status,
-                interval_minutes=interval_minutes,
+                max_age_minutes=max_age_minutes,
+                languages=languages,
             )
             if not results:
                 await status.edit_text(
                     _no_reply_targets_message(
                         search_query,
                         auto=not query,
-                        interval_minutes=interval_minutes,
+                        max_age_minutes=max_age_minutes,
                     )
                 )
                 return
 
             await status.edit_text("Drafting high-signal replies...")
+            strategy = self.reply_learning.choose_strategy()
             drafts = await self.ai.generate_reply_targets(
                 search_query,
                 summarize_reply_target_context(
                     results,
                     max_items=REPLY_TARGET_CONTEXT_ITEMS,
                 ),
+                strategy=strategy,
             )
             del auto_note
             await status.delete()
@@ -978,6 +1209,10 @@ class ContentBot:
                     approver_user_id=approver_user_id,
                     target_url=target_url,
                     target_label=draft.target,
+                    metadata=_reply_tracking_metadata(
+                        _result_for_url(results, target_url),
+                        strategy,
+                    ),
                 )
                 await self._send_approval(approval, reason=draft.reason)
         except Exception as exc:
@@ -1330,25 +1565,33 @@ class ContentBot:
         query: str,
         status,
         *,
-        interval_minutes: int = 30,
+        max_age_minutes: int = 360,
+        languages: list[str] | tuple[str, ...] | str | None = None,
     ) -> tuple[str, list[XSearchResult], str]:
-        candidates = _dedupe_queries(
-            ([query] if query else []) + await self._auto_reply_target_queries()
-        )[:REPLY_TARGET_MAX_CANDIDATES]
+        selected_languages = parse_reply_target_languages(
+            languages,
+            default=self.settings.reply_target_languages,
+        )
+        if query:
+            candidates = _expand_reply_target_query(query, selected_languages)
+        else:
+            candidates = await self._auto_reply_target_queries(selected_languages)
+        candidates = _dedupe_queries(candidates)[:REPLY_TARGET_MAX_CANDIDATES]
         last_search_query = query or "auto hot topics"
 
         searched: list[tuple[str, str, list[XSearchResult]]] = []
         for candidate in candidates:
             await status.edit_text(
-                "Finding a high-reach post from a large account...\n"
+                "Comparing fresh conversation momentum...\n"
                 f"Trying: {candidate}\n"
-                f"Freshness limit: {interval_minutes} minutes"
+                f"Lookback: {max_age_minutes} minutes\n"
+                f"Languages: {', '.join(selected_languages)}"
             )
             try:
                 search_query, recent_results = await asyncio.wait_for(
                     self._search_reply_target_pool(
                         candidate,
-                        interval_minutes=interval_minutes,
+                        max_age_minutes=max_age_minutes,
                     ),
                     timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
                 )
@@ -1356,30 +1599,35 @@ class ContentBot:
                 continue
             last_search_query = search_query
             searched.append((candidate, search_query, recent_results))
-            results = self._rank_reply_target_pool(
-                recent_results,
-                interval_minutes=interval_minutes,
-                relaxed=False,
+
+        # Compare every configured language/topic in one pool. Snapshot deltas
+        # replace lifetime averages once the same post has been observed twice.
+        combined_results, search_query_by_url = _combine_reply_target_results(searched)
+        combined_results = self.reply_target_metrics.observe(combined_results)
+        results = self._rank_reply_target_pool(
+            combined_results,
+            max_age_minutes=max_age_minutes,
+            relaxed=False,
+        )
+        if results:
+            selected_query = search_query_by_url.get(results[0].url, last_search_query)
+            note = (
+                "Selected by momentum across the requested topic and languages.\n"
+                if query
+                else "Selected by momentum across current topics and languages.\n"
             )
-            if results:
-                note = (
-                    "Auto-selected a different fresh topic.\n"
-                    if query and candidate != query
-                    else "Auto-selected topic.\n"
-                )
-                return search_query, results, note
+            return selected_query, results, note
 
         # Re-rank the same fetched posts with relaxed quality thresholds instead
-        # of repeating every X request. The configured interval remains a hard
-        # freshness ceiling even when engagement metadata is sparse.
-        for candidate, search_query, recent_results in searched:
-            results = self._rank_reply_target_pool(
-                recent_results,
-                interval_minutes=interval_minutes,
-                relaxed=True,
-            )
-            if results:
-                return search_query, results, "Auto-selected a fresh fallback topic.\n"
+        # of repeating every X request. Freshness and visible-signal floors remain.
+        results = self._rank_reply_target_pool(
+            combined_results,
+            max_age_minutes=max_age_minutes,
+            relaxed=True,
+        )
+        if results:
+            selected_query = search_query_by_url.get(results[0].url, last_search_query)
+            return selected_query, results, "Selected the strongest fresh fallback.\n"
 
         return last_search_query, [], ""
 
@@ -1387,39 +1635,73 @@ class ContentBot:
         self,
         query: str,
         *,
-        interval_minutes: int,
+        max_age_minutes: int,
     ) -> tuple[str, list[XSearchResult]]:
-        freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
-        return await self.x_search.search_recent(
-            query,
-            since_minutes=freshness_minutes,
-            limit=min(
-                REPLY_TARGET_RESULT_LIMIT,
-                max(self.settings.x_search_limit, 8),
-            ),
-            # Top + since_time lets X surface the strongest fresh distribution
-            # instead of returning a purely chronological stream of small posts.
-            product="Top",
+        freshness_minutes = _reply_target_max_age_minutes(
+            max_age_minutes,
+            default=self.settings.reply_target_max_age_minutes,
         )
+        root_query = _reply_target_root_query(query)
+        result_limit = min(
+            REPLY_TARGET_RESULT_LIMIT,
+            max(self.settings.x_search_limit, 8),
+        )
+        searches = await asyncio.gather(
+            self.x_search.search_recent(
+                root_query,
+                since_minutes=freshness_minutes,
+                limit=result_limit,
+                product="Top",
+            ),
+            self.x_search.search_recent(
+                root_query,
+                since_minutes=freshness_minutes,
+                limit=result_limit,
+                product="Latest",
+            ),
+            return_exceptions=True,
+        )
+        successful = [
+            item
+            for item in searches
+            if isinstance(item, tuple) and len(item) == 2
+        ]
+        if not successful:
+            first_error = next(
+                (item for item in searches if isinstance(item, Exception)),
+                RuntimeError("X search returned no response."),
+            )
+            raise first_error
+        search_query = str(successful[0][0])
+        pools = [list(item[1]) for item in successful]
+        return search_query, _merge_reply_target_search_products(pools)
 
     def _rank_reply_target_pool(
         self,
         recent_results: list[XSearchResult],
         *,
         relaxed: bool = False,
-        interval_minutes: int = 30,
+        max_age_minutes: int = 360,
     ) -> list[XSearchResult]:
-        freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
+        freshness_minutes = _reply_target_max_age_minutes(
+            max_age_minutes,
+            default=self.settings.reply_target_max_age_minutes,
+        )
         ranked = rank_fast_growing_posts(
             recent_results,
             max_items=5,
             max_age_minutes=freshness_minutes,
             min_engagement_score=0 if relaxed else MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
             min_velocity_score=0 if relaxed else MIN_REPLY_TARGET_VELOCITY_SCORE,
+            min_view_velocity_score=(
+                0 if relaxed else MIN_REPLY_TARGET_VIEW_VELOCITY_SCORE
+            ),
             # View count is a hard quality floor whenever X exposes it. Topic
             # rotation may relax engagement and velocity, but must not promote
             # a nearly unseen post merely because it is very new.
             min_view_count=self.settings.reply_target_min_views,
+            # This is a capped reach bonus, not a hard gate. A smaller account
+            # with clear post-level breakout should outrank a large but idle one.
             min_author_followers=self.settings.reply_target_min_author_followers,
         )
         unseen = [
@@ -1429,11 +1711,17 @@ class ContentBot:
         ]
         return unseen
 
-    async def _auto_reply_target_queries(self) -> list[str]:
+    async def _auto_reply_target_queries(
+        self,
+        languages: list[str] | tuple[str, ...] | str | None = None,
+    ) -> list[str]:
         # /replytargets is deliberately independent from CREATOR_NICHE. Its job
         # is reach discovery across today's largest conversations; niche-led
         # discovery remains the responsibility of /tweettrend3.
-        queries: list[str] = []
+        selected_languages = parse_reply_target_languages(
+            languages,
+            default=self.settings.reply_target_languages,
+        )
         try:
             trends = await asyncio.wait_for(
                 self.x_search.trends("trending", limit=4),
@@ -1441,9 +1729,34 @@ class ContentBot:
             )
         except Exception:
             trends = []
-        queries.extend(trend.name for trend in trends if trend.name)
+        trend_names = _dedupe_queries([trend.name for trend in trends if trend.name])[:4]
+        queries = [
+            _query_for_languages(trend_name, selected_languages)
+            for trend_name in trend_names
+        ]
+        lanes: dict[str, list[str]] = {}
+        for language in selected_languages:
+            fallback = AUTO_REPLY_TARGET_FALLBACK_QUERIES_BY_LANGUAGE.get(
+                language,
+                ("AI", "news", "sports", "technology"),
+            )
+            lanes[language] = _dedupe_queries(
+                [query_for_language(topic, language) for topic in fallback]
+            )
 
-        queries.extend(AUTO_REPLY_TARGET_FALLBACK_QUERIES)
+        # Search each trend once across every configured language, then spend the
+        # remaining budget round-robin on localized broad discovery.
+        lane_index = 0
+        while len(queries) < 12:
+            added = False
+            for language in selected_languages:
+                lane = lanes.get(language, [])
+                if lane_index < len(lane):
+                    queries.append(lane[lane_index])
+                    added = True
+            if not added:
+                break
+            lane_index += 1
         return _dedupe_queries(queries)[:12]
 
     async def _notify_x_account_errors(
@@ -1556,6 +1869,41 @@ def _format_reply_target_reply(draft: ReplyTargetDraft) -> str:
 
 def _format_reply_target_link(draft: ReplyTargetDraft) -> str:
     return draft.url.strip()
+
+
+def _result_for_url(
+    results: list[XSearchResult],
+    target_url: str,
+) -> XSearchResult | None:
+    target_id = extract_tweet_id(target_url)
+    return next(
+        (
+            result
+            for result in results
+            if result.url == target_url or (target_id is not None and result.id == target_id)
+        ),
+        None,
+    )
+
+
+def _reply_tracking_metadata(
+    result: XSearchResult | None,
+    strategy: str,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {"reply_strategy": strategy}
+    if result is None:
+        return metadata
+    metadata.update(
+        {
+            "language": result.language,
+            "root_author": result.username,
+            "root_author_id": result.author_id,
+            "root_views": result.view_count,
+            "root_replies": result.reply_count,
+            "reply_opportunity_score": result.reply_opportunity_score,
+        }
+    )
+    return metadata
 
 
 def _mobile_x_intent_url(approval: AutomationApproval) -> str:
@@ -1676,6 +2024,76 @@ def _dedupe_queries(queries: list[str]) -> list[str]:
     return deduped
 
 
+def _query_for_languages(query: str, languages: list[str]) -> str:
+    clean_query = " ".join(str(query or "").strip().split())
+    if not clean_query:
+        raise RuntimeError("Search query was empty.")
+    if re.search(r"\blang:[\w-]+\b", clean_query, flags=re.IGNORECASE):
+        return clean_query
+    language_terms = " OR ".join(f"lang:{language}" for language in languages)
+    return f"{clean_query} ({language_terms})"
+
+
+def _reply_target_root_query(query: str) -> str:
+    clean_query = " ".join(str(query or "").strip().split())
+    clean_query = re.sub(
+        r"(?<![-\w])is:(?:reply|retweet)\b",
+        "",
+        clean_query,
+        flags=re.IGNORECASE,
+    )
+    clean_query = " ".join(clean_query.split())
+    for operator in ("-is:reply", "-is:retweet"):
+        if operator not in clean_query.lower():
+            clean_query = f"{clean_query} {operator}".strip()
+    return clean_query
+
+
+def _merge_reply_target_search_products(
+    pools: list[list[XSearchResult]],
+) -> list[XSearchResult]:
+    merged: dict[str, XSearchResult] = {}
+    order: list[str] = []
+    for pool in pools:
+        for result in pool:
+            identity = result.url or str(result.id)
+            existing = merged.get(identity)
+            if existing is None:
+                merged[identity] = result
+                order.append(identity)
+                continue
+            if _visible_metric_total(result) > _visible_metric_total(existing):
+                merged[identity] = result
+    return [merged[identity] for identity in order]
+
+
+def _visible_metric_total(result: XSearchResult) -> int:
+    return (
+        (result.view_count or 0)
+        + result.like_count
+        + result.retweet_count
+        + result.quote_count
+        + result.reply_count
+    )
+
+
+def _combine_reply_target_results(
+    searched: list[tuple[str, str, list[XSearchResult]]],
+) -> tuple[list[XSearchResult], dict[str, str]]:
+    combined: list[XSearchResult] = []
+    seen: set[str] = set()
+    search_query_by_url: dict[str, str] = {}
+    for _candidate, search_query, results in searched:
+        for result in results:
+            key = result.url or str(result.id)
+            search_query_by_url.setdefault(result.url, search_query)
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(result)
+    return combined, search_query_by_url
+
+
 def _trend_topic_key(topic: str) -> str:
     return " ".join(
         part for part in "".join(char.lower() if char.isalnum() else " " for char in topic).split()
@@ -1691,12 +2109,29 @@ def _reply_target_interval_minutes(value: Any, *, default: int) -> int:
     return min(1440, max(5, minutes))
 
 
+def _reply_target_max_age_minutes(value: Any, *, default: int) -> int:
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        minutes = default
+    return min(1440, max(30, minutes))
+
+
+def _expand_reply_target_query(query: str, languages: list[str]) -> list[str]:
+    if re.search(r"\blang:[\w-]+\b", query, flags=re.IGNORECASE):
+        return [query]
+    return [query_for_language(query, language) for language in languages]
+
+
 def _no_reply_targets_message(
     search_query: str,
     auto: bool,
-    interval_minutes: int = 30,
+    max_age_minutes: int = 360,
 ) -> str:
-    freshness_minutes = _reply_target_interval_minutes(interval_minutes, default=30)
+    freshness_minutes = _reply_target_max_age_minutes(
+        max_age_minutes,
+        default=360,
+    )
     intro = (
         "No reply-ready posts found in the last "
         f"{freshness_minutes} minutes after trying several topics."
@@ -1709,9 +2144,9 @@ def _no_reply_targets_message(
     )
     return (
         f"{intro}\n\n"
-        "The bot already changed topics and relaxed engagement thresholds without "
-        "accepting older posts. Check X cookies/account limits, then try again later "
-        "or use a specific topic such as `/replytargets crypto`."
+        "The bot compared the configured languages and relaxed momentum thresholds "
+        "without accepting older posts. Check X cookies/account limits, try again "
+        "later, or use a specific topic such as `/replytargets crypto`."
     )
 
 

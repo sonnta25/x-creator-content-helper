@@ -16,12 +16,19 @@ class Settings:
     telegram_caption_limit: int = 1024
     x_cookie: str = ""
     x_account_name: str = "telegram_bot"
+    x_owner_username: str = ""
     x_accounts_db: str = "data/twscrape_accounts.db"
     x_search_limit: int = 8
     x_search_product: str = "Top"
     x_post_char_limit: int = 2000
     reply_target_min_author_followers: int = 50_000
     reply_target_min_views: int = 500
+    reply_target_max_age_minutes: int = 360
+    reply_target_languages: str = "en,ja"
+    reply_target_metrics_path: str = ""
+    reply_learning_enabled: bool = True
+    reply_learning_path: str = "data/reply_learning.json"
+    reply_tracking_poll_minutes: int = 5
     trend_sources: str = "x,google_trends,rss"
     google_trends_geo: str = "US"
     trend_rss_urls: str = ""
@@ -66,6 +73,7 @@ class Settings:
             x_cookie=os.getenv("X_COOKIE", "").strip(),
             x_account_name=os.getenv("X_ACCOUNT_NAME", "telegram_bot").strip()
             or "telegram_bot",
+            x_owner_username=os.getenv("X_OWNER_USERNAME", "").strip().lstrip("@"),
             x_accounts_db=os.getenv(
                 "X_ACCOUNTS_DB", "data/twscrape_accounts.db"
             ).strip()
@@ -77,6 +85,28 @@ class Settings:
                 0, _int_env("REPLY_TARGET_MIN_AUTHOR_FOLLOWERS", 50_000)
             ),
             reply_target_min_views=max(0, _int_env("REPLY_TARGET_MIN_VIEWS", 500)),
+            reply_target_max_age_minutes=min(
+                1440,
+                max(30, _int_env("REPLY_TARGET_MAX_AGE_MINUTES", 360)),
+            ),
+            reply_target_languages=os.getenv(
+                "REPLY_TARGET_LANGUAGES",
+                "en,ja",
+            ).strip()
+            or "en,ja",
+            reply_target_metrics_path=os.getenv(
+                "REPLY_TARGET_METRICS_PATH",
+                "data/reply_target_metrics.json",
+            ).strip()
+            or "data/reply_target_metrics.json",
+            reply_learning_enabled=_bool_env("REPLY_LEARNING_ENABLED", True),
+            reply_learning_path=os.getenv(
+                "REPLY_LEARNING_PATH", "data/reply_learning.json"
+            ).strip()
+            or "data/reply_learning.json",
+            reply_tracking_poll_minutes=max(
+                1, _int_env("REPLY_TRACKING_POLL_MINUTES", 5)
+            ),
             trend_sources=os.getenv("TREND_SOURCES", "x,google_trends,rss").strip()
             or "x,google_trends,rss",
             google_trends_geo=os.getenv("GOOGLE_TRENDS_GEO", "US").strip() or "US",

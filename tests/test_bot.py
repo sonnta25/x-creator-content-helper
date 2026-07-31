@@ -30,6 +30,7 @@ from src.bot import (
     _parse_retweet_args,
     _parse_tweettrend3_args,
     _reply_target_interval_minutes,
+    _reply_target_max_age_minutes,
     _x_account_error_notifications,
 )
 from src.config import Settings
@@ -109,6 +110,7 @@ def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
     assert {"vntweet", "angles", "xsearch"}.isdisjoint(commands)
     assert {"tweet", "tweettrend3", "tweetx", "dailybrief", "retweet", "reply"}.issubset(commands)
     assert "replyevery" in commands
+    assert {"replylearn", "replyreport"}.issubset(commands)
     assert "download" in commands
     assert "cancel" in commands
 
@@ -531,6 +533,9 @@ def test_reply_target_interval_is_clamped_to_supported_schedule_range() -> None:
     assert _reply_target_interval_minutes("bad", default=30) == 30
     assert _reply_target_interval_minutes(1, default=30) == 5
     assert _reply_target_interval_minutes(9999, default=30) == 1440
+    assert _reply_target_max_age_minutes(360, default=360) == 360
+    assert _reply_target_max_age_minutes(15, default=360) == 30
+    assert _reply_target_max_age_minutes("bad", default=360) == 360
 
 
 def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
@@ -552,11 +557,11 @@ def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
         async def edit_text(self, _text):
             return None
 
-    async def auto_queries():
+    async def auto_queries(_languages=None):
         return ["empty topic", "working topic"]
 
-    async def search(query, *, interval_minutes=30):
-        attempts.append((query, interval_minutes))
+    async def search(query, *, max_age_minutes=360):
+        attempts.append((query, max_age_minutes))
         if query == "working topic":
             return "working topic lang:en", [expected]
         return f"{query} lang:en", []
@@ -573,9 +578,114 @@ def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
     assert search_query == "working topic lang:en"
     assert "fresh fallback" in note
     assert attempts == [
-        ("empty topic", 30),
-        ("working topic", 30),
+        ("empty topic", 360),
+        ("working topic", 360),
     ]
+
+
+def test_replytargets_auto_mode_compares_candidates_across_topics() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    now = int(datetime.now(UTC).timestamp())
+    first_topic_slow = XSearchResult(
+        id=40,
+        username="large",
+        display_name="Large",
+        text="Qualified, but moving slowly",
+        created_at="",
+        url="https://x.com/large/status/40",
+        created_at_timestamp=now - 10 * 60,
+        like_count=20,
+        reply_count=2,
+        view_count=1_000,
+        author_followers_count=500_000,
+    )
+    second_topic_breakout = XSearchResult(
+        id=41,
+        username="breakout",
+        display_name="Breakout",
+        text="A smaller account with much stronger current momentum",
+        created_at="",
+        url="https://x.com/breakout/status/41",
+        created_at_timestamp=now - 5 * 60,
+        like_count=100,
+        reply_count=20,
+        quote_count=5,
+        view_count=10_000,
+        author_followers_count=10_000,
+    )
+    attempts = []
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    async def auto_queries(_languages=None):
+        return ["first topic", "second topic"]
+
+    async def search(query, *, max_age_minutes=360):
+        del max_age_minutes
+        attempts.append(query)
+        if query == "first topic":
+            return "first topic lang:en", [first_topic_slow]
+        return "second topic lang:en", [second_topic_breakout]
+
+    bot._auto_reply_target_queries = auto_queries
+    bot._search_reply_target_pool = search
+
+    search_query, results, note = asyncio.run(
+        bot._get_reply_target_context("", Status())
+    )
+
+    assert attempts == ["first topic", "second topic"]
+    assert results[0].id == second_topic_breakout.id
+    assert search_query == "second topic lang:en"
+    assert "across current topics" in note
+
+
+def test_replytargets_explicit_topic_expands_languages_without_topic_drift() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    attempts = []
+    japanese = XSearchResult(
+        id=42,
+        username="jpuser",
+        display_name="JP User",
+        text="AIについての話題",
+        created_at="",
+        url="https://x.com/jpuser/status/42",
+        language="ja",
+        created_at_timestamp=int(datetime.now(UTC).timestamp()) - 5 * 60,
+        like_count=80,
+        reply_count=12,
+        quote_count=4,
+        view_count=8_000,
+        author_followers_count=20_000,
+    )
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    async def search(query, *, max_age_minutes=360):
+        attempts.append((query, max_age_minutes))
+        if query.endswith("lang:ja"):
+            return f"{query} since_time:1", [japanese]
+        return f"{query} since_time:1", []
+
+    bot._search_reply_target_pool = search
+
+    search_query, results, note = asyncio.run(
+        bot._get_reply_target_context(
+            "AI",
+            Status(),
+            max_age_minutes=360,
+            languages=["en", "ja"],
+        )
+    )
+
+    assert attempts == [("AI lang:en", 360), ("AI lang:ja", 360)]
+    assert [result.id for result in results] == [42]
+    assert search_query.startswith("AI lang:ja")
+    assert "requested topic and languages" in note
 
 
 def test_replytargets_relaxed_ranking_keeps_view_count_as_a_hard_floor() -> None:
@@ -609,7 +719,7 @@ def test_replytargets_relaxed_ranking_keeps_view_count_as_a_hard_floor() -> None
     ranked = bot._rank_reply_target_pool(
         [low_view, qualified],
         relaxed=True,
-        interval_minutes=15,
+        max_age_minutes=360,
     )
 
     assert [result.id for result in ranked] == [10]
@@ -632,13 +742,13 @@ def test_replytargets_relaxed_ranking_rejects_fresh_posts_without_signal() -> No
     ranked = bot._rank_reply_target_pool(
         [no_signal],
         relaxed=True,
-        interval_minutes=15,
+        max_age_minutes=360,
     )
 
     assert ranked == []
 
 
-def test_replytargets_never_accepts_posts_older_than_interval() -> None:
+def test_replytargets_never_accepts_posts_older_than_lookback() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
     expected = XSearchResult(
         id=3,
@@ -654,10 +764,11 @@ def test_replytargets_never_accepts_posts_older_than_interval() -> None:
         async def edit_text(self, _text):
             return None
 
-    async def auto_queries():
+    async def auto_queries(_languages=None):
         return ["first topic", "second topic"]
 
-    async def search(query, *, interval_minutes=30):
+    async def search(query, *, max_age_minutes=30):
+        del max_age_minutes
         if query == "second topic":
             return "second topic since_time:1", [expected]
         return "first topic since_time:1", []
@@ -666,7 +777,7 @@ def test_replytargets_never_accepts_posts_older_than_interval() -> None:
     bot._search_reply_target_pool = search
 
     search_query, results, note = asyncio.run(
-        bot._get_reply_target_context("", Status())
+        bot._get_reply_target_context("", Status(), max_age_minutes=30)
     )
 
     assert search_query == "second topic since_time:1"
@@ -681,17 +792,52 @@ def test_replytargets_auto_topic_discovery_uses_one_bounded_trend_call() -> None
     class XSearch:
         async def trends(self, category, limit):
             calls.append((category, limit))
-            return [XTrend(name="AI launch", rank="1", description="")]
+            return [
+                XTrend(name="AI launch", rank="1", description=""),
+                XTrend(name="#OpenSource", rank="2", description=""),
+                XTrend(name="Market news", rank="3", description=""),
+                XTrend(name="New game", rank="4", description=""),
+            ]
 
     bot.x_search = XSearch()
     queries = asyncio.run(bot._auto_reply_target_queries())
 
     assert calls == [("trending", 4)]
-    assert queries[0] == "AI launch"
+    assert queries[:4] == [
+        "AI launch (lang:en OR lang:ja)",
+        "#OpenSource (lang:en OR lang:ja)",
+        "Market news (lang:en OR lang:ja)",
+        "New game (lang:en OR lang:ja)",
+    ]
+    assert queries[4].endswith("lang:en")
+    assert queries[5].endswith("lang:ja")
     assert bot.settings.creator_niche not in queries
 
 
-def test_replytargets_searches_top_posts_within_the_freshness_window() -> None:
+def test_replytargets_auto_fallback_round_robins_configured_languages() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+
+    class XSearch:
+        async def trends(self, category, limit):
+            del category, limit
+            return []
+
+    bot.x_search = XSearch()
+    queries = asyncio.run(bot._auto_reply_target_queries(["en", "ja"]))
+
+    assert len(queries) == 6
+    assert [query.rsplit("lang:", 1)[-1] for query in queries] == [
+        "en",
+        "ja",
+        "en",
+        "ja",
+        "en",
+        "ja",
+    ]
+    assert queries[-2:] == ["AI lang:en", "AI lang:ja"]
+
+
+def test_replytargets_searches_top_and_latest_root_posts_within_freshness_window() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
     calls = []
 
@@ -701,11 +847,66 @@ def test_replytargets_searches_top_posts_within_the_freshness_window() -> None:
             return "news lang:en since_time:1", []
 
     bot.x_search = XSearch()
-    asyncio.run(bot._search_reply_target_pool("news", interval_minutes=15))
+    asyncio.run(bot._search_reply_target_pool("news lang:ja", max_age_minutes=360))
 
-    assert calls[0][0] == "news"
-    assert calls[0][1]["since_minutes"] == 15
-    assert calls[0][1]["product"] == "Top"
+    assert len(calls) == 2
+    assert all(
+        call[0] == "news lang:ja -is:reply -is:retweet"
+        for call in calls
+    )
+    assert all(call[1]["since_minutes"] == 360 for call in calls)
+    assert {call[1]["product"] for call in calls} == {"Top", "Latest"}
+    assert all(call[1]["limit"] == 8 for call in calls)
+
+
+def test_replytargets_merges_top_and_latest_and_keeps_fresher_metrics() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    duplicate_top = XSearchResult(
+        id=50,
+        username="same",
+        display_name="Same",
+        text="Same post",
+        created_at="",
+        url="https://x.com/same/status/50",
+        view_count=1_000,
+        like_count=10,
+    )
+    duplicate_latest = XSearchResult(
+        id=50,
+        username="same",
+        display_name="Same",
+        text="Same post",
+        created_at="",
+        url="https://x.com/same/status/50",
+        view_count=1_500,
+        like_count=20,
+    )
+    latest_only = XSearchResult(
+        id=51,
+        username="latest",
+        display_name="Latest",
+        text="Early candidate",
+        created_at="",
+        url="https://x.com/latest/status/51",
+        view_count=700,
+        like_count=8,
+    )
+
+    class XSearch:
+        async def search_recent(self, query, **kwargs):
+            assert "-is:reply -is:retweet" in query
+            if kwargs["product"] == "Top":
+                return f"{query} since_time:1", [duplicate_top]
+            return f"{query} since_time:1", [duplicate_latest, latest_only]
+
+    bot.x_search = XSearch()
+    _query, results = asyncio.run(
+        bot._search_reply_target_pool("AI lang:en", max_age_minutes=360)
+    )
+
+    assert [result.id for result in results] == [50, 51]
+    assert results[0].view_count == 1_500
+    assert results[0].like_count == 20
 
 
 def test_tweettrend3_collects_three_distinct_topics() -> None:
@@ -782,7 +983,7 @@ def test_tweettrend3_auto_prefers_creator_niche_topics() -> None:
 def test_no_reply_targets_message_allows_auto_mode() -> None:
     message = _no_reply_targets_message("auto hot topics", auto=True)
 
-    assert "last 30 minutes" in message
+    assert "last 360 minutes" in message
     assert "without accepting older posts" in message
     assert "/replytargets crypto" in message
 

@@ -91,7 +91,8 @@ def test_reply_engine_is_text_only() -> None:
     )
     assert "Return only ONE final reply" in prompt
     assert "Shared reply-family rules" in prompt
-    assert "dry, snarky, or lightly sarcastic" in prompt
+    assert "Humor and sarcasm are optional tools, never the default" in prompt
+    assert "one distinctive" in prompt
 
 
 def test_tweet_engine_prompt_is_shared_for_tweet_family() -> None:
@@ -359,8 +360,8 @@ def test_reply_prompt_requires_source_matched_natural_voice() -> None:
     )
 
     assert "match the source post's language" in prompt
-    assert "Do not force a clever jab" in prompt
-    assert "one narrow reaction" in prompt
+    assert "Humor and sarcasm are optional tools, never the default" in prompt
+    assert "source-grounded contribution" in prompt
 
 
 def test_replytargets_prompt_does_not_force_creator_niche() -> None:
@@ -391,8 +392,13 @@ def test_replytargets_prompt_does_not_force_creator_niche() -> None:
         )
     )
 
-    assert "large accounts" in service.last_prompt
-    assert "Do not force the creator's content niche" in service.last_prompt
+    assert "posts with real current momentum" in service.last_prompt
+    assert "fully supported by the visible post" in service.last_prompt
+    assert "background assumptions that are not explicitly present" in service.last_prompt
+    assert "creator's content niche into an unrelated conversation" in service.last_prompt
+    assert "natural Japanese for a Japanese post" in service.last_prompt
+    assert "same language as its candidate post" in service.last_prompt
+    assert "original author can actually answer" in service.last_prompt
     assert "gold and crypto only" not in service.last_prompt
     assert "gold investors only" not in service.last_prompt
     assert "readers already participating in the source post's conversation" in service.last_prompt
@@ -624,6 +630,32 @@ def test_generate_reply_targets_repairs_an_empty_first_response() -> None:
     assert len(service.prompts) == 2
     assert "repairing an unusable reply-target response" in service.prompts[1]
     assert targets[0].url == "https://x.com/large/status/999"
+
+
+def test_generate_reply_targets_includes_selected_learning_strategy() -> None:
+    class StrategyService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/88",'
+                '"target":"@source","reason":"Early opening",'
+                '"reply":"Which tradeoff mattered most here?"}]}'
+            )
+
+    service = StrategyService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "product launch",
+            "URL: https://x.com/source/status/88\nPost: We changed the rollout plan.",
+            strategy="author_specific_question",
+        )
+    )
+
+    assert "ask the author one precise" in service.last_prompt
 
 
 def test_parse_reply_targets_recovers_all_items_from_unescaped_reply_quotes() -> None:

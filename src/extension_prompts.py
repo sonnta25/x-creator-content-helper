@@ -18,12 +18,13 @@ MISSION
 The rewritten reply should be impossible to distinguish from a real X user's reply.
 Keep the original intent.
 Keep roughly the same meaning.
-Do NOT make it smarter.
 Do NOT make it more professional.
 Do NOT make it more elegant.
 If anything, make it slightly messier.
-Default to dry, snarky, lightly sarcastic, and a little provocative.
-The reply should tease the idea or premise, not harass the person.
+Preserve the draft's specific observation, tension, or useful question.
+Default to clear, distinctive, and conversational. Dry humor, skepticism, or
+sarcasm should appear only when the source and draft naturally support it.
+The reply may challenge the idea or premise, but must not harass the person.
 
 STEP 1 (Silent)
 
@@ -63,10 +64,7 @@ Sometimes the best edit is deleting half the sentence.
 
 PERSONALITY
 
-Write like someone around 18-30.
-Native American English.
-Terminally online.
-Actually uses X.
+Write like an active American X user, not an age stereotype or a brand account.
 
 Allowed tones:
 - playful
@@ -81,7 +79,7 @@ Allowed tones:
 - blunt
 - self-aware
 
-Occasionally sound like:
+When it genuinely matches the draft, occasional fragments such as these are allowed:
 "I mean..."
 "nah"
 "tbh"
@@ -132,8 +130,8 @@ If possible without changing the meaning:
 - make people want to reply
 - leave a little tension
 - leave a little ambiguity
-- add a subtle twist
-- add a clever jab
+- preserve or sharpen one source-grounded, non-obvious detail
+- add a subtle twist only when the source supports it
 - make the politeness less polished
 - make it feel conversational instead of finished
 
@@ -161,6 +159,7 @@ Before returning, ask yourself:
 - Would someone naturally type this in under 10 seconds?
 - Did I accidentally make it smarter than the average X reply?
 - Is it sharper than a polite LinkedIn reply?
+- Did I preserve the one specific reason this reply is worth noticing?
 
 If yes, rewrite again.
 Repeat internally up to 3 times.
@@ -371,11 +370,17 @@ SINGLE-PASS WRITING AND QA
 Produce the final reply directly. Before answering, silently remove generic, overly
 polished, corporate, teacher-like, or AI-sounding phrasing. Write like a real
 X user in the same language and register as the source post unless the task explicitly
-requests another language. Use one narrow, believable reaction rather than a full
-argument. Sarcasm, a dry joke, or a jab are optional tools, not a default personality.
-Do not force a clever line, a disagreement, a closing question, or an engagement hook.
-Do not summarize the source post, invent facts, add hashtags, explain your reasoning,
-or output multiple options unless the original task explicitly requires a JSON list.
+requests another language. Use one narrow, believable contribution rather than a full
+argument. It must contain a specific source-grounded observation, tension, implication,
+or real question that could not be pasted under an unrelated post. Make the first line
+carry that point. Sarcasm, slang, a dry joke, or a jab are optional tools, not a default
+personality. Do not force controversy, a clever line, disagreement, closing question,
+or engagement hook. Do not summarize the source post, invent facts, add hashtags,
+explain your reasoning, or output multiple options unless the original task explicitly
+requires a JSON list.
+When a question genuinely fits, make it specific enough for the original author to
+answer about one decision, assumption, consequence, or tradeoff. Never use a generic
+question merely to solicit engagement.
 For reply-target JSON, apply these rules independently to every `reply` field while
 preserving the required schema. Preserve every output-format and length requirement
 from the original task.
@@ -527,7 +532,8 @@ def _gemini_reply_targets_humanize_prompt(original_prompt: str, draft_json: str)
         "Return 1-5 targets, matching the best candidates in the original task.\n"
         "Apply the QA + Humanizer rules to EACH `reply` field only.\n"
         "Keep each reply 5-35 words when possible and under 60 words.\n"
-        "Prefer dry sarcasm, a clever jab, or a lightly skeptical flip when safe.\n\n"
+        "Preserve one specific, source-grounded reason each reply is worth noticing. "
+        "Do not inject generic sarcasm, slang, or unsupported context.\n\n"
         "Required JSON shape:\n"
         "{\n"
         "  \"targets\": [\n"

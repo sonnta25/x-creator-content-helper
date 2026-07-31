@@ -55,9 +55,20 @@
         </div>
 
         <label>
-          /replytargets interval + max post age (minutes)
+          /replytargets scan interval (minutes)
           <input id="replyTargetsMinutes" type="number" min="5" step="1">
         </label>
+
+        <label>
+          /replytargets maximum post age (minutes)
+          <input id="replyTargetsMaxAgeMinutes" type="number" min="30" max="1440" step="15">
+        </label>
+
+        <label>
+          /replytargets languages
+          <input id="replyTargetsLanguages" spellcheck="false" placeholder="en,ja">
+        </label>
+        <p class="hint">Comma-separated X language codes. No country filter is applied.</p>
         <p id="replyScheduleStatus" class="hint"></p>
 
         <label>

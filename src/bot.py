@@ -40,7 +40,13 @@ from src.media_download_service import (
     MediaDownloadError,
     MediaDownloadService,
 )
-from src.models import GeneratedContent, ReplyTargetDraft, TrendPostVariant, XSearchResult
+from src.models import (
+    GeneratedContent,
+    ImageAttachment,
+    ReplyTargetDraft,
+    TrendPostVariant,
+    XSearchResult,
+)
 from src.reply_target_metrics import ReplyTargetMetricStore
 from src.reply_learning import (
     CHECKPOINT_MINUTES,
@@ -51,6 +57,7 @@ from src.reply_learning import (
     match_posted_content,
 )
 from src.trend_source_service import TrendSourceService, summarize_trend_signals
+from src.video_frame_service import VideoFrameExtractor
 from src.x_search_service import (
     MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
     MIN_REPLY_TARGET_VELOCITY_SCORE,
@@ -65,7 +72,9 @@ from src.x_search_service import (
     parse_reply_target_languages,
     query_for_language,
     rank_fast_growing_posts,
+    rank_viral_video_posts,
     summarize_reply_target_context,
+    summarize_reply_video_context,
     summarize_x_context,
 )
 
@@ -95,6 +104,13 @@ JAPANESE_HIGH_VALUE_REPLY_QUERY = (
 REPLY_TARGET_MAX_CANDIDATES = 6
 REPLY_TARGET_RESULT_LIMIT = 8
 REPLY_TARGET_CONTEXT_ITEMS = 3
+MIN_REPLY_TARGET_BATCH_ITEMS = 2
+MIN_REPLY_TARGET_VOLUME_FALLBACK_VIEWS = 100
+REPLY_VIDEO_RESULT_LIMIT = 16
+REPLY_VIDEO_CONTEXT_ITEMS = 3
+REPLY_VIDEO_MIN_BATCH_ITEMS = 2
+REPLY_VIDEO_GLOBAL_LANGUAGES = ("en", "ja", "ko", "es", "pt", "zh-cn")
+BOT_RUNTIME_REVISION = "configurable-reply-batch-v4"
 REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
 REPLY_TARGET_REFRESH_TIMEOUT_SECONDS = 12
@@ -123,6 +139,10 @@ COMMAND_INPUT_PROMPTS = {
         "Send a topic to search, or send `auto` to let the bot choose.",
         "Topic or auto",
     ),
+    "replyvideo": (
+        "Send an optional topic, or send `auto` to hunt fresh viral videos globally.",
+        "Topic or auto",
+    ),
     "persona": (
         "Send `show`, or update values with:\n"
         "`niche=...; voice=...; audience=...`",
@@ -145,6 +165,14 @@ COMMAND_INPUT_PROMPTS = {
     "replyevery": (
         "Send an interval from 5 to 1440 minutes, or send `show`.",
         "Minutes or show",
+    ),
+    "videoevery": (
+        "Send an interval from 3 to 1440 minutes, or send `show`.",
+        "Minutes or show",
+    ),
+    "replybatch": (
+        "Send `show`, `targets 2-5`, or `video 2-5`.",
+        "show, targets 3, or video 2",
     ),
 }
 TWEETTREND_LANGUAGE_ALIASES = {
@@ -182,6 +210,7 @@ BOT_COMMANDS = [
     BotCommand("dailybrief", "Generate daily tweet options with optional images"),
     BotCommand("retweet", "Remix an X post with an optional image"),
     BotCommand("replytargets", "Auto-pick or search X posts to reply to"),
+    BotCommand("replyvideo", "Find fresh viral videos with low reply competition"),
     BotCommand("persona", "Show or set creator niche, voice, and audience"),
     BotCommand("importcookie", "Save X auth_token and ct0 cookie for X search"),
     BotCommand("xaccounts", "Show imported X cookie accounts"),
@@ -189,6 +218,8 @@ BOT_COMMANDS = [
     BotCommand("reply", "Generate a witty reply from tweet text or an X post link"),
     BotCommand("automationhere", "Send scheduled approval requests to this chat"),
     BotCommand("replyevery", "Set scheduled replytargets interval in minutes"),
+    BotCommand("videoevery", "Set scheduled replyvideo interval in minutes"),
+    BotCommand("replybatch", "Set replytargets or replyvideo cards per run"),
     BotCommand("replylangs", "Show, add, or remove reply-target languages"),
     BotCommand("replylearn", "Show or control automatic reply learning"),
     BotCommand("replyreport", "Show tracked post and reply performance"),
@@ -205,6 +236,7 @@ class ContentBot:
         self.x_search = XSearchService(settings)
         self.trend_sources = TrendSourceService(settings, self.x_search)
         self.media_downloader = MediaDownloadService(settings)
+        self.video_frame_extractor = VideoFrameExtractor()
         self._download_semaphore = asyncio.Semaphore(1)
         self._x_account_error_notices: dict[str, str] = {}
         self.approvals = AutomationApprovalStore(settings.automation_approvals_path)
@@ -270,6 +302,7 @@ class ContentBot:
         app.add_handler(CommandHandler("dailybrief", self.dailybrief))
         app.add_handler(CommandHandler("retweet", self.retweet))
         app.add_handler(CommandHandler("replytargets", self.replytargets))
+        app.add_handler(CommandHandler("replyvideo", self.replyvideo))
         app.add_handler(CommandHandler("persona", self.persona))
         app.add_handler(CommandHandler("importcookie", self.importcookie))
         app.add_handler(CommandHandler("xaccounts", self.xaccounts))
@@ -277,6 +310,8 @@ class ContentBot:
         app.add_handler(CommandHandler("reply", self.reply))
         app.add_handler(CommandHandler("automationhere", self.automationhere))
         app.add_handler(CommandHandler("replyevery", self.replyevery))
+        app.add_handler(CommandHandler("videoevery", self.videoevery))
+        app.add_handler(CommandHandler("replybatch", self.replybatch))
         app.add_handler(CommandHandler("replylangs", self.replylangs))
         app.add_handler(CommandHandler("replylearn", self.replylearn))
         app.add_handler(CommandHandler("replyreport", self.replyreport))
@@ -305,6 +340,7 @@ class ContentBot:
             "/dailybrief [trending|news|sport|entertainment] - generate daily tweets with optional images\n"
             "/retweet <X post link> - remix an X post with an optional image\n"
             "/replytargets [query] - auto-pick or search posts to reply to\n"
+            "/replyvideo [topic] - find fresh viral videos with low reply competition\n"
             "/persona - show or set niche, voice, and target audience\n"
             "/importcookie <auth_token=...; ct0=...> - save X cookie for search\n"
             "/xaccounts - show imported X cookie accounts\n"
@@ -312,6 +348,8 @@ class ContentBot:
             "/reply <tweet text or X post link> - generate a copy-ready reply\n"
             "/automationhere - send scheduled approval requests to this chat\n"
             "/replyevery <minutes> - set the scheduled /replytargets interval\n"
+            "/videoevery <minutes> - set the scheduled /replyvideo interval\n"
+            "/replybatch show|targets <2-5>|video <2-5> - set cards per run\n"
             "/replylangs [show|add|remove|set] - manage reply-target languages\n"
             "/replylearn [status|on|off|rollback|username @name] - control learning\n"
             "/replyreport [7d|30d] - show tracked reply performance\n"
@@ -481,7 +519,7 @@ class ContentBot:
         update_env_value("TELEGRAM_APPROVAL_CHAT_ID", str(self.approval_chat_id))
         await message.reply_text(
             "Automation approvals will be sent to this chat.\n"
-            "Use /replyevery <minutes> to configure /replytargets from Telegram."
+            "Use /replyevery for /replytargets and /videoevery for /replyvideo."
         )
 
     async def replyevery(
@@ -592,13 +630,139 @@ class ContentBot:
             "Saved to .env and will sync to scheduled Chrome scans within about 30 seconds."
         )
 
+    async def replybatch(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text("Use /replybatch in a private chat with this bot.")
+            return
+        if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
+            await message.reply_text(
+                "Only the chat configured with /automationhere can change reply batch sizes."
+            )
+            return
+        raw = " ".join(context.args).strip().lower()
+        if not raw:
+            await self._request_command_input(update, "replybatch")
+            return
+        if raw in {"show", "current", "status"}:
+            await message.reply_text(
+                "Reply cards per run\n"
+                f"- /replytargets: {self.settings.reply_target_batch_size}\n"
+                f"- /replyvideo: {self.settings.reply_video_batch_size}\n\n"
+                "Change with /replybatch targets 2 or /replybatch video 2."
+            )
+            return
+
+        scope, separator, raw_size = raw.partition(" ")
+        aliases = {
+            "target": "targets",
+            "targets": "targets",
+            "replytarget": "targets",
+            "replytargets": "targets",
+            "video": "video",
+            "replyvideo": "video",
+        }
+        selected_scope = aliases.get(scope)
+        if selected_scope is None or not separator or not raw_size.strip():
+            await message.reply_text(
+                "Usage: /replybatch show|targets <2-5>|video <2-5>"
+            )
+            return
+        try:
+            batch_size = int(raw_size.strip())
+        except (TypeError, ValueError):
+            await message.reply_text("Batch size must be a whole number from 2 to 5.")
+            return
+        if batch_size < 2 or batch_size > 5:
+            await message.reply_text("Batch size must be between 2 and 5 replies.")
+            return
+
+        if selected_scope == "targets":
+            update_env_value("REPLY_TARGET_BATCH_SIZE", str(batch_size))
+            self.settings = replace(
+                self.settings,
+                reply_target_batch_size=batch_size,
+            )
+            label = "/replytargets"
+        else:
+            update_env_value("REPLY_VIDEO_BATCH_SIZE", str(batch_size))
+            self.settings = replace(
+                self.settings,
+                reply_video_batch_size=batch_size,
+            )
+            label = "/replyvideo"
+        await message.reply_text(
+            f"{label} will request {batch_size} reply card(s) per run. "
+            "Saved to .env and applied immediately to manual and scheduled runs."
+        )
+
+    async def videoevery(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text("Use /videoevery in a private chat with this bot.")
+            return
+        if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
+            await message.reply_text(
+                "Only the chat configured with /automationhere can change this schedule."
+            )
+            return
+        if not context.args:
+            await self._request_command_input(update, "videoevery")
+            return
+        if str(context.args[0]).strip().lower() in {"show", "current"}:
+            current = self.settings.telegram_reply_video_minutes
+            value = f"{current} minutes" if current is not None else "Chrome extension setting"
+            await message.reply_text(f"Current /replyvideo interval: {value}.")
+            return
+        try:
+            minutes = int(context.args[0])
+        except (TypeError, ValueError):
+            await message.reply_text("Use a whole number, for example: /videoevery 5")
+            return
+        if minutes < 3 or minutes > 1440:
+            await message.reply_text("Interval must be between 3 and 1440 minutes.")
+            return
+        self.settings = replace(
+            self.settings,
+            telegram_reply_video_minutes=minutes,
+            telegram_reply_video_updated_at=int(datetime.now(UTC).timestamp() * 1000),
+        )
+        update_env_value("TELEGRAM_REPLY_VIDEO_MINUTES", str(minutes))
+        update_env_value(
+            "TELEGRAM_REPLY_VIDEO_UPDATED_AT",
+            str(self.settings.telegram_reply_video_updated_at),
+        )
+        await message.reply_text(
+            f"Scheduled /replyvideo interval set to {minutes} minutes. "
+            "Chrome will sync it within about 30 seconds."
+        )
+
     async def get_automation_config(self) -> dict[str, Any]:
         return {
             "reply_targets_minutes": self.settings.telegram_reply_targets_minutes,
             "reply_targets_updated_at": self.settings.telegram_reply_targets_updated_at,
+            "reply_video_minutes": self.settings.telegram_reply_video_minutes,
+            "reply_video_updated_at": self.settings.telegram_reply_video_updated_at,
             "automation_running": bool(self._automation_running),
             "creator_timezone": self.settings.creator_timezone,
             "reply_target_languages": self.settings.reply_target_languages,
+            "extension_bridge_timeout_seconds": (
+                self.settings.extension_bridge_timeout_seconds
+            ),
         }
 
     async def replylearn(
@@ -737,12 +901,16 @@ class ContentBot:
         detail = "\n".join(f"- {item}" for item in blockers) or "- No blocking setup issue found."
         await message.reply_text(
             f"Creator bot health: {state}\n\n"
+            f"Runtime revision: {BOT_RUNTIME_REVISION}\n"
             f"X account records/healthy: {len(accounts)}/{len(healthy_accounts)}\n"
             f"Tracking username: "
             f"{('@' + self.settings.x_owner_username) if self.settings.x_owner_username else 'missing'}\n"
             f"Learning: {'ON' if learning.enabled else 'OFF'}; "
             f"{learning.measured} measured, {learning.waiting} waiting\n"
             f"Reply schedule: {self.settings.telegram_reply_targets_minutes or 'extension default'} minutes\n"
+            f"Video-reply schedule: {self.settings.telegram_reply_video_minutes or 'extension default (5)'} minutes\n"
+            f"Reply cards per run: targets {self.settings.reply_target_batch_size}; "
+            f"video {self.settings.reply_video_batch_size}\n"
             f"Timezone: {self.settings.creator_timezone}\n"
             f"Stale mobile approvals: {stale_mobile}\n"
             f"Mode/languages: {self.settings.reply_target_mode}; "
@@ -775,7 +943,7 @@ class ContentBot:
             languages = parse_reply_target_languages(
                 self.settings.reply_target_languages
             )
-            search_query, results, _note = await self._get_reply_target_context(
+            search_query, results, selection_note = await self._get_reply_target_context(
                 "",
                 status,
                 max_age_minutes=max_age,
@@ -798,12 +966,19 @@ class ContentBot:
                     timezone_name=self.settings.creator_timezone,
                 ),
             )
-            ready = ready[: min(2, remaining_cap)]
+            reply_batch, promoted_count = _select_reply_draft_batch(
+                ready,
+                watching,
+                capacity=remaining_cap,
+                max_items=2,
+            )
             await status.edit_text(
                 "Today's queue\n"
-                f"Reply now: {len(ready)}\n"
+                f"Reply batch: {len(reply_batch)} "
+                f"({promoted_count} early qualified)\n"
                 f"Watching now/total: {len(watching)}/{watching_total}\n"
                 f"Daily reply capacity remaining: {remaining_cap}\n"
+                f"Selection: {selection_note.strip() or 'standard thresholds'}\n"
                 "Preparing one original post and any reply-now drafts..."
             )
             approver_user_id = (
@@ -812,7 +987,7 @@ class ContentBot:
                 else message.chat.id
             )
             sent_replies = await self._create_reply_approvals(
-                ready,
+                reply_batch,
                 query=search_query,
                 chat_id=message.chat.id,
                 approver_user_id=approver_user_id,
@@ -868,21 +1043,42 @@ class ContentBot:
         query: str,
         chat_id: int,
         approver_user_id: int,
+        video_mode: bool = False,
+        visual_attachments: list[ImageAttachment] | None = None,
     ) -> int:
         if not results:
             return 0
-        selected = results[:REPLY_TARGET_CONTEXT_ITEMS]
+        requested_batch_size = (
+            self.settings.reply_video_batch_size
+            if video_mode
+            else self.settings.reply_target_batch_size
+        )
+        selected = results[:requested_batch_size]
         strategy_by_url = {
             result.url: self.reply_learning.choose_strategy()
             for result in selected
         }
+        reply_context = (
+            summarize_reply_video_context(
+                selected,
+                max_items=requested_batch_size,
+            )
+            if video_mode
+            else summarize_reply_target_context(
+                selected,
+                max_items=requested_batch_size,
+            )
+        )
+        generation_options: dict[str, Any] = {
+            "strategy_by_url": strategy_by_url,
+        }
+        if video_mode:
+            generation_options["video_mode"] = True
+            generation_options["visual_attachments"] = visual_attachments or []
         drafts = await self.ai.generate_reply_targets(
             query,
-            summarize_reply_target_context(
-                selected,
-                max_items=REPLY_TARGET_CONTEXT_ITEMS,
-            ),
-            strategy_by_url=strategy_by_url,
+            reply_context,
+            **generation_options,
         )
         sent = 0
         for draft in drafts:
@@ -898,10 +1094,15 @@ class ContentBot:
                 approver_user_id=approver_user_id,
                 target_url=target_url,
                 target_label=draft.target,
-                metadata=_reply_tracking_metadata(result, strategy),
+                metadata=_reply_tracking_metadata(
+                    result,
+                    strategy,
+                    source_type="replyvideo" if video_mode else "replytargets",
+                ),
             )
             await self._send_approval(approval, reason=draft.reason)
-            self.reply_watch.mark_drafted(target_url)
+            if not video_mode:
+                self.reply_watch.mark_drafted(target_url)
             sent += 1
         return sent
 
@@ -1210,6 +1411,13 @@ class ContentBot:
             ),
         )
 
+    async def trigger_replyvideo(self, payload: dict[str, Any]) -> dict[str, Any]:
+        query = str(payload.get("query", "")).strip()
+        return self._spawn_automation(
+            "replyvideo",
+            lambda: self._run_scheduled_replyvideo(query),
+        )
+
     async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]:
         category = str(payload.get("category", "auto")).strip().lower() or "auto"
         if category not in {"auto", "best", *AUTO_TREND_CATEGORIES}:
@@ -1294,12 +1502,13 @@ class ContentBot:
             chat_id=self.approval_chat_id,
             text=(
                 "Scheduled /replytargets started.\n"
+                f"Engine: {BOT_RUNTIME_REVISION}.\n"
                 f"Lookback: {max_age_minutes} minutes.\n"
                 f"Languages: {', '.join(languages)}."
             ),
         )
         try:
-            search_query, results, _auto_note = await self._get_reply_target_context(
+            search_query, results, selection_note = await self._get_reply_target_context(
                 query,
                 status,
                 max_age_minutes=max_age_minutes,
@@ -1310,6 +1519,7 @@ class ContentBot:
                     search_query,
                     auto=not query,
                     max_age_minutes=max_age_minutes,
+                    diagnostic=selection_note,
                 ))
                 return
             ready, watching = self.reply_watch.classify(results)
@@ -1341,22 +1551,36 @@ class ContentBot:
                     f"{self.settings.creator_timezone}."
                 )
                 return
-            ready = ready[:remaining_cap]
-            if not ready:
+            reply_batch, promoted_count = _select_reply_draft_batch(
+                ready,
+                watching,
+                capacity=remaining_cap,
+                max_items=self.settings.reply_target_batch_size,
+            )
+            if not reply_batch:
+                if remaining_cap < MIN_REPLY_TARGET_BATCH_ITEMS:
+                    await status.edit_text(
+                        "Scheduled /replytargets has only one reply-card slot left today. "
+                        "No Gemini job was spent because reply batches require at least two "
+                        f"slots. The cap resets in {self.settings.creator_timezone}."
+                    )
+                    return
                 await status.edit_text(
-                    "Scheduled scan found candidates, but none is confirmed enough to "
-                    f"spend a Gemini job yet. Watching now/total: "
-                    f"{len(watching)}/{watching_total}. The next scan will re-fetch "
-                    "those tweet IDs and measure their latest acceleration."
+                    "Scheduled scan has fewer than two eligible candidates, so no Gemini "
+                    f"job was spent. Eligible now: {len(ready) + len(watching)}. "
+                    f"Watching now/total: {len(watching)}/{watching_total}. The next scan "
+                    "will re-fetch those tweet IDs and fill a two-reply batch."
                 )
                 return
             await status.edit_text(
-                f"Found {len(ready)} reply-now candidate(s); "
+                f"Found a {len(reply_batch)}-reply batch "
+                f"({promoted_count} early qualified); "
                 f"watching now/total {len(watching)}/{watching_total}. "
+                f"Selection: {selection_note.strip() or 'standard thresholds'}. "
                 "Generating one batch..."
             )
             sent = await self._create_reply_approvals(
-                ready,
+                reply_batch,
                 query=search_query,
                 chat_id=self.approval_chat_id,
                 approver_user_id=self.approval_chat_id,
@@ -1367,6 +1591,76 @@ class ContentBot:
                 await status.edit_text(
                     "Scheduled /replytargets finished, but every returned target already "
                     "has an active approval card."
+                )
+        except Exception:
+            await _delete_message_safely(status)
+            raise
+
+    async def _run_scheduled_replyvideo(self, query: str = "") -> None:
+        if self._application is None or self.approval_chat_id is None:
+            raise RuntimeError("Automation chat is not ready.")
+        status = await self._application.bot.send_message(
+            chat_id=self.approval_chat_id,
+            text=(
+                "Scheduled /replyvideo started. Hunting fresh global and Vietnamese "
+                "videos with low reply competition..."
+            ),
+        )
+        try:
+            search_label, results, selection_note = await self._get_reply_video_context(
+                query,
+                status,
+            )
+            remaining_cap = max(
+                0,
+                self.settings.creator_daily_reply_cap
+                - _reply_approvals_created_today(
+                    self.approvals.items(),
+                    timezone_name=self.settings.creator_timezone,
+                ),
+            )
+            if remaining_cap < REPLY_VIDEO_MIN_BATCH_ITEMS:
+                await status.edit_text(
+                    "Scheduled /replyvideo needs two remaining reply-card slots. "
+                    f"The daily cap resets in {self.settings.creator_timezone}."
+                )
+                return
+            batch, visual_attachments, skipped_ungrounded = (
+                await self._prepare_reply_video_evidence(
+                    results,
+                    status,
+                    max_items=min(
+                        self.settings.reply_video_batch_size,
+                        remaining_cap,
+                    ),
+                )
+            )
+            if len(batch) < REPLY_VIDEO_MIN_BATCH_ITEMS:
+                await status.edit_text(
+                    "Scheduled /replyvideo searched strict, warm and fill tiers but found "
+                    f"only {len(batch)} distinct eligible video(s). No Gemini job was spent; "
+                    f"{skipped_ungrounded} ungrounded video(s) could not be analyzed. "
+                    "The next 3-5 minute scan will try fresh results."
+                )
+                return
+            await status.edit_text(
+                f"Found {len(batch)} video reply targets. {selection_note} "
+                "Generating one grounded reply batch..."
+            )
+            sent = await self._create_reply_approvals(
+                batch,
+                query=search_label,
+                chat_id=self.approval_chat_id,
+                approver_user_id=self.approval_chat_id,
+                video_mode=True,
+                visual_attachments=visual_attachments,
+            )
+            if sent:
+                await _delete_message_safely(status)
+            else:
+                await status.edit_text(
+                    "Scheduled /replyvideo finished, but all returned videos already have "
+                    "active approval cards."
                 )
         except Exception:
             await _delete_message_safely(status)
@@ -1712,6 +2006,7 @@ class ContentBot:
                         search_query,
                         auto=not query,
                         max_age_minutes=max_age_minutes,
+                        diagnostic=auto_note,
                     )
                 )
                 return
@@ -1744,24 +2039,36 @@ class ContentBot:
                     f"{self.settings.creator_timezone}."
                 )
                 return
-            ready = ready[:remaining_cap]
-            if not ready:
+            reply_batch, promoted_count = _select_reply_draft_batch(
+                ready,
+                watching,
+                capacity=remaining_cap,
+                max_items=self.settings.reply_target_batch_size,
+            )
+            if not reply_batch:
+                if remaining_cap < MIN_REPLY_TARGET_BATCH_ITEMS:
+                    await status.edit_text(
+                        "Only one reply-card slot remains today. No Gemini job was spent "
+                        "because reply batches require at least two slots."
+                    )
+                    return
                 await status.edit_text(
-                    f"Watching now/total: {len(watching)}/{watching_total}. None has "
-                    "enough confirmation yet, so no Gemini job was spent. The next scan "
-                    "will re-fetch those tweet IDs instead of waiting for them to reappear "
-                    "in search."
+                    "Fewer than two eligible candidates are available, so no Gemini job "
+                    f"was spent. Eligible now: {len(ready) + len(watching)}. Watching "
+                    f"now/total: {len(watching)}/{watching_total}."
                 )
                 return
             await status.edit_text(
-                f"Drafting {len(ready)} confirmed reply-now candidate(s); "
-                f"watching now/total {len(watching)}/{watching_total}..."
+                f"Drafting a {len(reply_batch)}-reply batch "
+                f"({promoted_count} early qualified); "
+                f"watching now/total {len(watching)}/{watching_total}. "
+                f"Selection: {auto_note.strip() or 'standard thresholds'}..."
             )
             approver_user_id = (
                 update.effective_user.id if update.effective_user is not None else message.chat.id
             )
             sent = await self._create_reply_approvals(
-                ready,
+                reply_batch,
                 query=search_query,
                 chat_id=message.chat.id,
                 approver_user_id=approver_user_id,
@@ -1769,6 +2076,76 @@ class ContentBot:
             await status.edit_text(
                 f"Sent {sent} reply card(s). Watching total: {watching_total}."
             )
+        except Exception as exc:
+            await status.edit_text(_friendly_error(exc))
+        finally:
+            await self._notify_x_account_errors(message)
+
+    async def replyvideo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        query = " ".join(context.args).strip()
+        if query.lower() == "auto":
+            query = ""
+        await message.chat.send_action(ChatAction.TYPING)
+        status = await message.reply_text(
+            "Hunting fresh global and Vietnamese videos, prioritizing view velocity "
+            "and low reply competition..."
+        )
+        try:
+            search_label, results, selection_note = await self._get_reply_video_context(
+                query,
+                status,
+            )
+            remaining_cap = max(
+                0,
+                self.settings.creator_daily_reply_cap
+                - _reply_approvals_created_today(
+                    self.approvals.items(),
+                    timezone_name=self.settings.creator_timezone,
+                ),
+            )
+            if remaining_cap < REPLY_VIDEO_MIN_BATCH_ITEMS:
+                await status.edit_text(
+                    "At least two daily reply-card slots are required for /replyvideo. "
+                    f"The cap resets in {self.settings.creator_timezone}."
+                )
+                return
+            batch, visual_attachments, skipped_ungrounded = (
+                await self._prepare_reply_video_evidence(
+                    results,
+                    status,
+                    max_items=min(
+                        self.settings.reply_video_batch_size,
+                        remaining_cap,
+                    ),
+                )
+            )
+            if len(batch) < REPLY_VIDEO_MIN_BATCH_ITEMS:
+                await status.edit_text(
+                    "Only "
+                    f"{len(batch)} distinct eligible video(s) remained after strict, warm "
+                    "and fill searches. "
+                    f"{skipped_ungrounded} ungrounded video(s) could not be analyzed. "
+                    "No Gemini job was spent; try again in 3-5 minutes."
+                )
+                return
+            await status.edit_text(
+                f"Drafting {len(batch)} video replies. {selection_note}"
+            )
+            approver_user_id = (
+                update.effective_user.id
+                if update.effective_user is not None
+                else message.chat.id
+            )
+            sent = await self._create_reply_approvals(
+                batch,
+                query=search_label,
+                chat_id=message.chat.id,
+                approver_user_id=approver_user_id,
+                video_mode=True,
+                visual_attachments=visual_attachments,
+            )
+            await status.edit_text(f"Sent {sent} viral-video reply card(s).")
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -2155,13 +2532,18 @@ class ContentBot:
 
         await status.edit_text(
             "Comparing fresh conversation momentum...\n"
-            f"Queries: {len(candidates)} (up to 3 concurrently)\n"
+            f"Queries: {len(candidates)} (serialized to protect the X session pool)\n"
             f"Mode: {selected_mode}\n"
             f"Lookback: {max_age_minutes} minutes\n"
             f"Languages: {', '.join(selected_languages)}\n"
             f"Previously watched to recheck: {len(watched_rows)}"
         )
-        semaphore = asyncio.Semaphore(3)
+        # A single logical lane still checks Top and Latest. Serializing lanes
+        # prevents a small cookie pool from being exhausted by simultaneous
+        # SearchTimeline leases, which twscrape otherwise reports as if no
+        # account existed.
+        semaphore = asyncio.Semaphore(1)
+        search_failures: list[str] = []
 
         async def search_one(
             candidate: str,
@@ -2175,7 +2557,10 @@ class ContentBot:
                         ),
                         timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
                     )
-            except Exception:
+            except Exception as exc:
+                search_failures.append(
+                    f"{_truncate_text(candidate, 80)}: {_truncate_text(_friendly_error(exc), 180)}"
+                )
                 return None
             return candidate, search_query, recent_results
 
@@ -2183,6 +2568,13 @@ class ContentBot:
             *(search_one(candidate) for candidate in candidates)
         )
         searched = [item for item in responses if item is not None]
+        if not searched and search_failures:
+            samples = " | ".join(search_failures[:3])
+            raise RuntimeError(
+                f"All {len(candidates)} reply-target search lanes failed. "
+                f"This is an X/twscrape account or transport problem, not a lack of viral "
+                f"tweets. First errors: {samples}"
+            )
         if searched:
             last_search_query = searched[-1][1]
 
@@ -2201,15 +2593,82 @@ class ContentBot:
             for result in refreshed:
                 search_query_by_url.setdefault(result.url, "persisted watchlist refresh")
         combined_results = self.reply_target_metrics.observe(combined_results)
-        results = self._rank_reply_target_pool(
+        strict_results = self._rank_reply_target_pool(
             combined_results,
             max_age_minutes=max_age_minutes,
             relaxed=False,
         )
+        results = list(strict_results)
+        fallback_level = ""
+        if len(results) < MIN_REPLY_TARGET_BATCH_ITEMS:
+            # Re-rank the same fetched posts with relaxed momentum thresholds
+            # before lowering the configured view floor.
+            relaxed_results = self._rank_reply_target_pool(
+                combined_results,
+                max_age_minutes=max_age_minutes,
+                relaxed=True,
+            )
+            previous_count = len(results)
+            results = _merge_reply_target_search_products(
+                [results, relaxed_results]
+            )[:5]
+            if len(results) > previous_count:
+                fallback_level = "relaxed momentum"
+
+        if len(results) < MIN_REPLY_TARGET_BATCH_ITEMS:
+            configured_views = max(0, self.settings.reply_target_min_views)
+            volume_view_floor = min(
+                configured_views,
+                max(
+                    MIN_REPLY_TARGET_VOLUME_FALLBACK_VIEWS,
+                    configured_views // 4,
+                ),
+            )
+            volume_results = self._rank_reply_target_pool(
+                combined_results,
+                max_age_minutes=max_age_minutes,
+                relaxed=True,
+                min_view_count=volume_view_floor,
+                allow_view_only_signal=True,
+            )
+            previous_count = len(results)
+            results = _merge_reply_target_search_products(
+                [results, volume_results]
+            )[:5]
+            if len(results) > previous_count:
+                fallback_level = (
+                    f"volume fallback ({volume_view_floor}+ views when visible)"
+                )
+
+        if len(results) < MIN_REPLY_TARGET_BATCH_ITEMS:
+            # The user explicitly prefers receiving a real two-reply batch on
+            # every healthy scan. Exhaust the already fetched, still-fresh root
+            # posts before returning empty. This tier accepts any visible view
+            # signal, but keeps age, root-post, active-approval and dedupe gates.
+            minimum_batch_results = self._rank_reply_target_pool(
+                combined_results,
+                max_age_minutes=max_age_minutes,
+                relaxed=True,
+                min_view_count=0,
+                allow_view_only_signal=True,
+            )
+            previous_count = len(results)
+            results = _merge_reply_target_search_products(
+                [results, minimum_batch_results]
+            )[:5]
+            if len(results) > previous_count:
+                fallback_level = "minimum-batch fallback (any visible view signal)"
+
         results = await self._enrich_reply_thread_context(results)
         results = self._apply_reply_target_mode(results, selected_mode)
         if results:
             selected_query = search_query_by_url.get(results[0].url, last_search_query)
+            if fallback_level:
+                return (
+                    selected_query,
+                    results,
+                    f"Selected with {fallback_level} to fill a two-reply batch.\n",
+                )
             note = (
                 "Selected by momentum across the requested topic and languages.\n"
                 if query
@@ -2217,20 +2676,209 @@ class ContentBot:
             )
             return selected_query, results, note
 
-        # Re-rank the same fetched posts with relaxed quality thresholds instead
-        # of repeating every X request. Freshness and visible-signal floors remain.
-        results = self._rank_reply_target_pool(
-            combined_results,
-            max_age_minutes=max_age_minutes,
-            relaxed=True,
+        diagnostic = (
+            f"Fetched {len(combined_results)} unique root posts from "
+            f"{len(searched)} successful search responses; {len(search_failures)} "
+            "search lane(s) failed. Fewer than two posts remained after the age, "
+            "root-post, active-approval, deduplication, and visible-signal gates."
         )
-        results = await self._enrich_reply_thread_context(results)
-        results = self._apply_reply_target_mode(results, selected_mode)
-        if results:
-            selected_query = search_query_by_url.get(results[0].url, last_search_query)
-            return selected_query, results, "Selected the strongest fresh fallback.\n"
+        return last_search_query, [], diagnostic
 
-        return last_search_query, [], ""
+    async def _get_reply_video_context(
+        self,
+        query: str,
+        status,
+    ) -> tuple[str, list[XSearchResult], str]:
+        strict_age = self.settings.reply_video_max_age_minutes
+        fill_age = min(90, max(strict_age, strict_age * 2))
+        lanes = _reply_video_search_queries(query)
+        await status.edit_text(
+            "Scanning fresh X video lanes...\n"
+            f"Lanes: {', '.join(label for label, _query in lanes)}\n"
+            f"Strict window: {strict_age} minutes; emergency fill window: {fill_age} minutes\n"
+            "Target mix: two global videos plus one Vietnamese video when available."
+        )
+        semaphore = asyncio.Semaphore(4)
+
+        async def search_one(
+            label: str,
+            lane_query: str,
+            product: str,
+        ) -> tuple[str, str, list[XSearchResult]] | None:
+            try:
+                async with semaphore:
+                    search_query, results = await asyncio.wait_for(
+                        self.x_search.search_recent(
+                            _reply_target_root_query(lane_query),
+                            since_minutes=fill_age,
+                            limit=REPLY_VIDEO_RESULT_LIMIT,
+                            product=product,
+                        ),
+                        timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
+                    )
+                return label, search_query, results
+            except Exception:
+                return None
+
+        responses = await asyncio.gather(
+            *(
+                search_one(label, lane_query, product)
+                for label, lane_query in lanes
+                for product in ("Top", "Latest")
+            )
+        )
+        searched = [item for item in responses if item is not None]
+        if not searched:
+            raise RuntimeError(
+                "Every /replyvideo X search lane failed. Check the twscrape account/cookie."
+            )
+        combined, search_query_by_url = _combine_reply_target_results(searched)
+        combined = self.reply_target_metrics.observe(combined)
+        configured_floor = max(0, self.settings.reply_video_min_views)
+        strict = rank_viral_video_posts(
+            combined,
+            max_items=24,
+            max_age_minutes=strict_age,
+            min_view_count=configured_floor,
+            min_like_count_when_views_missing=150,
+            min_view_velocity=300.0,
+        )
+        warm_floor = min(configured_floor, max(2_000, configured_floor // 5))
+        warm = rank_viral_video_posts(
+            combined,
+            max_items=24,
+            max_age_minutes=strict_age,
+            min_view_count=warm_floor,
+            min_like_count_when_views_missing=60,
+            min_view_velocity=60.0,
+        )
+        fill_floor = min(warm_floor, max(500, configured_floor // 30))
+        fill = rank_viral_video_posts(
+            combined,
+            max_items=24,
+            max_age_minutes=fill_age,
+            min_view_count=fill_floor,
+            min_like_count_when_views_missing=20,
+            min_view_velocity=0.0,
+        )
+        candidates = _merge_reply_target_search_products([strict, warm, fill])
+        candidates = [
+            result
+            for result in candidates
+            if not self.approvals.has_active_target(result.url)
+        ]
+        selected = _select_reply_video_mix(
+            candidates,
+            max_items=8,
+        )
+        strict_urls = {item.url for item in strict}
+        warm_urls = {item.url for item in warm}
+        if selected and all(item.url in strict_urls for item in selected):
+            tier = f"Strict: <= {strict_age}m, {configured_floor:,}+ views, 300+ views/min."
+        elif selected and all(item.url in warm_urls for item in selected):
+            tier = f"Warm fallback: <= {strict_age}m, {warm_floor:,}+ views."
+        else:
+            tier = f"Fill fallback: <= {fill_age}m, {fill_floor:,}+ views."
+        search_label = (
+            search_query_by_url.get(selected[0].url, "viral video lanes")
+            if selected
+            else "viral video lanes"
+        )
+        return search_label, selected, tier
+
+    async def _prepare_reply_video_evidence(
+        self,
+        results: list[XSearchResult],
+        status,
+        *,
+        max_items: int = REPLY_VIDEO_CONTEXT_ITEMS,
+    ) -> tuple[list[XSearchResult], list[ImageAttachment], int]:
+        prepared: list[XSearchResult] = []
+        attachments: list[ImageAttachment] = []
+        skipped = 0
+        for result in results:
+            quality = _video_context_quality(result)
+            if quality != "visual_required":
+                reliable_caption = _is_reliable_video_context_text(result.text)
+                reliable_descriptions = [
+                    description
+                    for description in (result.media_descriptions or [])
+                    if _is_reliable_video_context_text(
+                        description,
+                        media_description=True,
+                    )
+                ]
+                prepared.append(
+                    replace(
+                        result,
+                        text=result.text if reliable_caption else "",
+                        video_context_quality=quality,
+                        media_descriptions=(
+                            reliable_descriptions
+                            if quality == "grounded_text"
+                            else []
+                        ),
+                    )
+                )
+            elif not self.settings.reply_video_frame_analysis:
+                skipped += 1
+                continue
+            else:
+                remaining_attachment_slots = 5 - len(attachments)
+                if remaining_attachment_slots < 2:
+                    skipped += 1
+                    continue
+                reserve_for_second_visual = (
+                    2
+                    if not prepared and max_items >= REPLY_VIDEO_MIN_BATCH_ITEMS
+                    else 0
+                )
+                frame_count = min(
+                    self.settings.reply_video_frame_count,
+                    max(2, remaining_attachment_slots - reserve_for_second_visual),
+                )
+                await status.edit_text(
+                    "A selected video has no reliable caption or media description. "
+                    f"Downloading it and extracting {frame_count} representative frames..."
+                )
+                downloaded: DownloadedMedia | None = None
+                try:
+                    async with self._download_semaphore:
+                        downloaded = await asyncio.to_thread(
+                            self.media_downloader.download,
+                            result.url,
+                        )
+                    prefix = f"candidate-{len(prepared) + 1}-{result.id}"
+                    frames = await asyncio.to_thread(
+                        self.video_frame_extractor.extract,
+                        downloaded.path,
+                        prefix=prefix,
+                        max_frames=frame_count,
+                    )
+                except Exception as exc:
+                    LOGGER.info(
+                        "Skipping ungrounded replyvideo candidate %s: %s",
+                        result.url,
+                        exc,
+                    )
+                    skipped += 1
+                    continue
+                finally:
+                    if downloaded is not None:
+                        await asyncio.to_thread(downloaded.cleanup)
+                attachments.extend(frames)
+                prepared.append(
+                    replace(
+                        result,
+                        text="",
+                        video_context_quality="visual_frames",
+                        media_descriptions=[],
+                        visual_frame_names=[frame.name for frame in frames],
+                    )
+                )
+            if len(prepared) >= max_items:
+                break
+        return prepared[:max_items], attachments, skipped
 
     async def _refresh_watched_reply_targets(
         self,
@@ -2373,21 +3021,22 @@ class ContentBot:
             REPLY_TARGET_RESULT_LIMIT,
             max(self.settings.x_search_limit, 8),
         )
-        searches = await asyncio.gather(
-            self.x_search.search_recent(
-                root_query,
-                since_minutes=freshness_minutes,
-                limit=result_limit,
-                product="Top",
-            ),
-            self.x_search.search_recent(
-                root_query,
-                since_minutes=freshness_minutes,
-                limit=result_limit,
-                product="Latest",
-            ),
-            return_exceptions=True,
-        )
+        searches: list[tuple[str, list[XSearchResult]] | Exception] = []
+        # Keep Top + Latest coverage, but do not lease two SearchTimeline
+        # accounts at once. Cookie-only deployments commonly have just one
+        # currently usable account after X rate-limits another session.
+        for product in ("Top", "Latest"):
+            try:
+                searches.append(
+                    await self.x_search.search_recent(
+                        root_query,
+                        since_minutes=freshness_minutes,
+                        limit=result_limit,
+                        product=product,
+                    )
+                )
+            except Exception as exc:
+                searches.append(exc)
         successful = [
             item
             for item in searches
@@ -2409,6 +3058,8 @@ class ContentBot:
         *,
         relaxed: bool = False,
         max_age_minutes: int = 360,
+        min_view_count: int | None = None,
+        allow_view_only_signal: bool = False,
     ) -> list[XSearchResult]:
         freshness_minutes = _reply_target_max_age_minutes(
             max_age_minutes,
@@ -2423,13 +3074,18 @@ class ContentBot:
             min_view_velocity_score=(
                 0 if relaxed else MIN_REPLY_TARGET_VIEW_VELOCITY_SCORE
             ),
-            # View count is a hard quality floor whenever X exposes it. Topic
-            # rotation may relax engagement and velocity, but must not promote
-            # a nearly unseen post merely because it is very new.
-            min_view_count=self.settings.reply_target_min_views,
+            # Standard scans use the configured floor. The final volume
+            # fallback may explicitly lower it after exhausting the same
+            # fetched pool with normal and relaxed momentum thresholds.
+            min_view_count=(
+                self.settings.reply_target_min_views
+                if min_view_count is None
+                else max(0, min_view_count)
+            ),
             # This is a capped reach bonus, not a hard gate. A smaller account
             # with clear post-level breakout should outrank a large but idle one.
             min_author_followers=self.settings.reply_target_min_author_followers,
+            allow_view_only_signal=allow_view_only_signal,
         )
         unseen = [
             result
@@ -2633,11 +3289,55 @@ def _result_for_url(
     )
 
 
+def _select_reply_draft_batch(
+    ready: list[XSearchResult],
+    watching: list[XSearchResult],
+    *,
+    capacity: int,
+    max_items: int = REPLY_TARGET_CONTEXT_ITEMS,
+    minimum_items: int = MIN_REPLY_TARGET_BATCH_ITEMS,
+) -> tuple[list[XSearchResult], int]:
+    """Build a quality-ranked batch and use top watching candidates only as fillers."""
+    available_slots = min(max(0, capacity), max(0, max_items))
+    if available_slots < minimum_items:
+        return [], 0
+
+    selected: list[XSearchResult] = []
+    seen: set[str] = set()
+    for result in ready[:available_slots]:
+        key = result.url or str(result.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(result)
+
+    promoted_count = 0
+    if len(selected) < minimum_items:
+        for result in watching:
+            key = result.url or str(result.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(result)
+            promoted_count += 1
+            if len(selected) >= minimum_items:
+                break
+
+    if len(selected) < minimum_items:
+        return [], 0
+    return selected[:available_slots], promoted_count
+
+
 def _reply_tracking_metadata(
     result: XSearchResult | None,
     strategy: str,
+    *,
+    source_type: str = "replytargets",
 ) -> dict[str, object]:
-    metadata: dict[str, object] = {"reply_strategy": strategy}
+    metadata: dict[str, object] = {
+        "reply_strategy": strategy,
+        "source_type": source_type,
+    }
     if result is None:
         return metadata
     metadata.update(
@@ -2652,6 +3352,9 @@ def _reply_tracking_metadata(
             "viral_score": result.viral_score,
             "top_reply_like_count": result.top_reply_like_count,
             "root_author_has_replied": result.root_author_has_replied,
+            "has_video": result.has_video,
+            "video_context_quality": result.video_context_quality,
+            "visual_frame_count": len(result.visual_frame_names or []),
         }
     )
     return metadata
@@ -2716,6 +3419,16 @@ def _approval_message_text(
                 f"Suggested follow-up:\n{approval.text}"
             ).strip()
         signal_parts = []
+        if metadata.get("source_type") == "replyvideo":
+            evidence_mode = str(metadata.get("video_context_quality") or "")
+            if evidence_mode == "visual_frames":
+                signal_parts.append(
+                    f"{int(metadata.get('visual_frame_count') or 0)} frames analyzed"
+                )
+            elif evidence_mode == "caption_only":
+                signal_parts.append("caption only")
+            elif evidence_mode == "grounded_text":
+                signal_parts.append("caption/media grounded")
         if metadata.get("root_views") is not None:
             signal_parts.append(f"{int(metadata['root_views']):,} views")
         if metadata.get("root_replies") is not None:
@@ -2861,6 +3574,135 @@ def _query_for_languages(query: str, languages: list[str]) -> str:
     return f"{clean_query} ({language_terms})"
 
 
+def _reply_video_search_queries(topic: str = "") -> list[tuple[str, str]]:
+    clean_topic = " ".join(str(topic or "").strip().split())
+
+    def with_topic(filters: str) -> str:
+        return f"({clean_topic}) {filters}" if clean_topic else filters
+
+    global_languages = " OR ".join(
+        f"lang:{language}" for language in REPLY_VIDEO_GLOBAL_LANGUAGES
+    )
+    return [
+        (
+            "global",
+            with_topic(
+                f"filter:videos min_faves:200 ({global_languages})"
+            ),
+        ),
+        ("English", with_topic("filter:videos min_faves:300 lang:en")),
+        ("Japanese", with_topic("filter:videos min_faves:150 lang:ja")),
+        ("Vietnamese", with_topic("filter:videos min_faves:80 lang:vi")),
+    ]
+
+
+VIDEO_CONTEXT_GARBAGE = {
+    "video",
+    "image",
+    "embedded video",
+    "attached video",
+    "watch",
+    "watch this",
+    "must watch",
+    "wow",
+    "lol",
+    "lmao",
+    "omg",
+    "crazy",
+    "insane",
+    "viral",
+    "fyp",
+    "xem di",
+    "xem nay",
+    "hay qua",
+    "dinh",
+    "動画",
+    "見て",
+    "やばい",
+    "すごい",
+}
+
+
+def _video_context_quality(result: XSearchResult) -> str:
+    reliable_caption = _is_reliable_video_context_text(result.text)
+    reliable_description = any(
+        _is_reliable_video_context_text(description, media_description=True)
+        for description in (result.media_descriptions or [])
+    )
+    if reliable_description:
+        return "grounded_text"
+    if reliable_caption:
+        return "caption_only"
+    return "visual_required"
+
+
+def _is_reliable_video_context_text(
+    value: str,
+    *,
+    media_description: bool = False,
+) -> bool:
+    text = re.sub(r"https?://\S+", " ", str(value or ""), flags=re.IGNORECASE)
+    text = text.replace("#", " ").replace("@", " ")
+    normalized = " ".join(text.casefold().split()).strip(" .,!?:;_-|/\\")
+    if not normalized:
+        return False
+    ascii_folded = (
+        normalized.replace("đ", "d")
+        .replace("á", "a").replace("à", "a").replace("ả", "a")
+        .replace("ã", "a").replace("ạ", "a")
+        .replace("í", "i").replace("ì", "i")
+        .replace("ó", "o").replace("ò", "o")
+        .replace("ú", "u").replace("ù", "u")
+        .replace("ý", "y").replace("ỳ", "y")
+    )
+    if normalized in VIDEO_CONTEXT_GARBAGE or ascii_folded in VIDEO_CONTEXT_GARBAGE:
+        return False
+    boilerplate = (
+        "video attached",
+        "video is attached",
+        "video included",
+        "media unavailable",
+        "no description",
+        "click to watch",
+        "tap to watch",
+    )
+    if media_description and any(phrase in ascii_folded for phrase in boilerplate):
+        return False
+    alphanumeric = [char for char in normalized if char.isalnum()]
+    if len(alphanumeric) < (8 if media_description else 5):
+        return False
+    if len(set(alphanumeric)) < 4:
+        return False
+    words = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+    contains_cjk = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", normalized))
+    if not contains_cjk and len(words) < 2:
+        return False
+    return True
+
+
+def _select_reply_video_mix(
+    results: list[XSearchResult],
+    *,
+    max_items: int = REPLY_VIDEO_CONTEXT_ITEMS,
+) -> list[XSearchResult]:
+    """Aim for 2 global + 1 Vietnamese while preserving score order within lanes."""
+    vietnamese = [item for item in results if item.language.casefold() == "vi"]
+    global_items = [item for item in results if item.language.casefold() != "vi"]
+    selected = global_items[:2]
+    if vietnamese and len(selected) < max_items:
+        selected.append(vietnamese[0])
+    seen = {item.url or str(item.id) for item in selected}
+    for item in results:
+        key = item.url or str(item.id)
+        if key in seen:
+            continue
+        selected.append(item)
+        seen.add(key)
+        if len(selected) >= max_items:
+            break
+    return selected[:max_items]
+
+
 def _reply_target_root_query(query: str) -> str:
     clean_query = " ".join(str(query or "").strip().split())
     clean_query = re.sub(
@@ -2954,6 +3796,7 @@ def _no_reply_targets_message(
     search_query: str,
     auto: bool,
     max_age_minutes: int = 360,
+    diagnostic: str = "",
 ) -> str:
     freshness_minutes = _reply_target_max_age_minutes(
         max_age_minutes,
@@ -2969,8 +3812,10 @@ def _no_reply_targets_message(
             f"for: {search_query}"
         )
     )
+    detail = " ".join(str(diagnostic or "").strip().split())
+    diagnostic_text = f"\n\nScan diagnostics: {detail}" if detail else ""
     return (
-        f"{intro}\n\n"
+        f"{intro}{diagnostic_text}\n\n"
         "The bot compared the configured languages and relaxed momentum thresholds "
         "without accepting older posts. Check X cookies/account limits, try again "
         "later, or use a specific topic such as `/replytargets crypto`."
@@ -3274,9 +4119,10 @@ def _friendly_error(exc: Exception) -> str:
             "`/importcookie account2 auth_token=...; ct0=...`, or wait if all "
             "accounts are temporarily rate-limited."
         )
-    if text.startswith("X search failed"):
+    if "X search failed" in text or "reply-target search lanes failed" in text:
         return (
-            "Could not search X. Check X_COOKIE, account rate limits, and network access. "
+            "Could not search X. No Gemini or Chrome bridge job was started. Check the "
+            "imported X cookies, account rate limits, and network access. "
             f"Details: {text}"
         )
     if "browser session error" in text.lower():
@@ -3286,6 +4132,16 @@ def _friendly_error(exc: Exception) -> str:
             "The AI returned prompt/instruction text instead of final content, so I blocked it. "
             "Try the command again. If this came from an X link, use another post or paste only "
             "the real tweet text."
+        )
+    if "extension bridge timed out waiting for chrome" in text.lower():
+        return _strip_exception_prefix(text).removesuffix(" <- TimeoutError")
+    if "gemini image file input was not found" in text.lower():
+        return (
+            "Gemini's attachment control was not detected. Reload Chrome extension "
+            "version 0.8.1 or newer, keep one signed-in Gemini tab open, and retry "
+            "/replyvideo. The bridge endpoint itself is working because Chrome already "
+            "claimed this job. "
+            f"Details: {text}"
         )
     if (
         "readtimeout" in text.lower()

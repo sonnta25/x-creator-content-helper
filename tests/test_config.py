@@ -31,6 +31,8 @@ def test_settings_defaults() -> None:
     assert settings.reply_watch_path == "data/reply_watchlist.json"
     assert settings.reply_target_mode == "balanced"
     assert settings.creator_daily_reply_cap == 40
+    assert settings.reply_target_batch_size == 3
+    assert settings.reply_video_batch_size == 3
     assert settings.creator_timezone == "Asia/Ho_Chi_Minh"
     assert settings.content_language == "Vietnamese"
     assert settings.trend_language == "en"
@@ -47,6 +49,12 @@ def test_settings_defaults() -> None:
     assert settings.telegram_approval_chat_id is None
     assert settings.telegram_reply_targets_minutes is None
     assert settings.telegram_reply_targets_updated_at is None
+    assert settings.reply_video_min_views == 15_000
+    assert settings.reply_video_max_age_minutes == 45
+    assert settings.reply_video_frame_analysis is True
+    assert settings.reply_video_frame_count == 2
+    assert settings.telegram_reply_video_minutes is None
+    assert settings.telegram_reply_video_updated_at is None
     assert settings.automation_approvals_path == ""
     assert settings.download_max_file_mb == 45
     assert settings.download_timeout_seconds == 180
@@ -63,6 +71,12 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
         "TELEGRAM_BOT_TOKEN=123:ABC\nGENERATE_IMAGES=true\n"
         "X_POST_CHAR_LIMIT=1800\nTELEGRAM_REPLY_TARGETS_MINUTES=45\n"
         "TELEGRAM_REPLY_TARGETS_UPDATED_AT=123456789\n"
+        "TELEGRAM_REPLY_VIDEO_MINUTES=5\n"
+        "TELEGRAM_REPLY_VIDEO_UPDATED_AT=987654321\n"
+        "REPLY_VIDEO_MIN_VIEWS=12000\n"
+        "REPLY_VIDEO_MAX_AGE_MINUTES=40\n"
+        "REPLY_VIDEO_FRAME_ANALYSIS=false\n"
+        "REPLY_VIDEO_FRAME_COUNT=3\n"
         "REPLY_TARGET_MAX_AGE_MINUTES=480\n"
         "REPLY_TARGET_LANGUAGES=en,ja,ko\n"
         "REPLY_TARGET_METRICS_PATH=data/test-reply-metrics.json\n"
@@ -73,6 +87,8 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
         "REPLY_WATCH_PATH=data/test-reply-watch.json\n"
         "REPLY_TARGET_MODE=relationship\n"
         "CREATOR_DAILY_REPLY_CAP=6\n"
+        "REPLY_TARGET_BATCH_SIZE=5\n"
+        "REPLY_VIDEO_BATCH_SIZE=2\n"
         "CREATOR_TIMEZONE=Asia/Tokyo\n"
         "CONTENT_LANGUAGE=Japanese\n"
         "TREND_LANGUAGE=ja\n"
@@ -95,6 +111,12 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
     assert settings.x_post_char_limit == 1800
     assert settings.telegram_reply_targets_minutes == 45
     assert settings.telegram_reply_targets_updated_at == 123456789
+    assert settings.telegram_reply_video_minutes == 5
+    assert settings.telegram_reply_video_updated_at == 987654321
+    assert settings.reply_video_min_views == 12_000
+    assert settings.reply_video_max_age_minutes == 40
+    assert settings.reply_video_frame_analysis is False
+    assert settings.reply_video_frame_count == 3
     assert settings.reply_target_max_age_minutes == 480
     assert settings.reply_target_languages == "en,ja,ko"
     assert settings.reply_target_metrics_path == "data/test-reply-metrics.json"
@@ -105,6 +127,8 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
     assert settings.reply_watch_path == "data/test-reply-watch.json"
     assert settings.reply_target_mode == "relationship"
     assert settings.creator_daily_reply_cap == 6
+    assert settings.reply_target_batch_size == 5
+    assert settings.reply_video_batch_size == 2
     assert settings.creator_timezone == "Asia/Tokyo"
     assert settings.content_language == "Japanese"
     assert settings.trend_language == "ja"

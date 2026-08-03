@@ -31,6 +31,11 @@ from src.bot import (
     _parse_tweettrend3_args,
     _reply_target_interval_minutes,
     _reply_target_max_age_minutes,
+    _reply_video_search_queries,
+    _video_context_quality,
+    _is_reliable_video_context_text,
+    _select_reply_draft_batch,
+    _select_reply_video_mix,
     _updated_reply_target_languages,
     _x_account_error_notifications,
 )
@@ -38,6 +43,7 @@ from src.config import Settings
 from src.media_download_service import DownloadedMedia
 from src.models import (
     GeneratedContent,
+    ImageAttachment,
     ReplyTargetDraft,
     TrendPostVariant,
     TrendSignal,
@@ -111,7 +117,7 @@ def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
     assert {"vntweet", "angles", "xsearch"}.isdisjoint(commands)
     assert {"tweet", "tweettrend3", "tweetx", "dailybrief", "retweet", "reply"}.issubset(commands)
     assert "replyevery" in commands
-    assert {"replylearn", "replyreport", "replylangs"}.issubset(commands)
+    assert {"replylearn", "replyreport", "replylangs", "replybatch"}.issubset(commands)
     assert {"today", "setupcheck"}.issubset(commands)
     assert "download" in commands
     assert "cancel" in commands
@@ -303,14 +309,173 @@ def test_automation_config_exposes_telegram_reply_interval() -> None:
     assert asyncio.run(bot.get_automation_config()) == {
         "reply_targets_minutes": 45,
         "reply_targets_updated_at": None,
+        "reply_video_minutes": None,
+        "reply_video_updated_at": None,
         "automation_running": False,
         "creator_timezone": "Asia/Ho_Chi_Minh",
         "reply_target_languages": "en,ja",
+        "extension_bridge_timeout_seconds": 360,
     }
-
     bot._automation_running.add("replytargets")
     assert asyncio.run(bot.get_automation_config())["automation_running"] is True
 
+
+def test_replyvideo_queries_cover_global_english_japanese_and_vietnamese() -> None:
+    lanes = dict(_reply_video_search_queries())
+
+    assert list(lanes) == ["global", "English", "Japanese", "Vietnamese"]
+    assert "filter:videos min_faves:200" in lanes["global"]
+    assert "min_faves:300 lang:en" in lanes["English"]
+    assert "min_faves:150 lang:ja" in lanes["Japanese"]
+    assert "min_faves:80 lang:vi" in lanes["Vietnamese"]
+
+
+def test_replyvideo_mix_prefers_two_global_and_one_vietnamese() -> None:
+    results = [
+        XSearchResult(id=1, username="a", display_name="", text="a", created_at="", url="1", language="en"),
+        XSearchResult(id=2, username="b", display_name="", text="b", created_at="", url="2", language="ja"),
+        XSearchResult(id=3, username="c", display_name="", text="c", created_at="", url="3", language="ko"),
+        XSearchResult(id=4, username="d", display_name="", text="d", created_at="", url="4", language="vi"),
+    ]
+
+    selected = _select_reply_video_mix(results)
+
+    assert [item.language for item in selected] == ["en", "ja", "vi"]
+
+
+def test_replyvideo_context_quality_rejects_empty_emoji_and_boilerplate() -> None:
+    assert _is_reliable_video_context_text("ðŸ˜‚ðŸ˜‚ðŸ˜‚") is False
+    assert _is_reliable_video_context_text("Watch this") is False
+    assert _is_reliable_video_context_text(
+        "Video attached to this post",
+        media_description=True,
+    ) is False
+    assert _is_reliable_video_context_text(
+        "A goalkeeper reaches the ball beside the left post",
+        media_description=True,
+    ) is True
+
+    no_context = XSearchResult(
+        id=8,
+        username="clip",
+        display_name="",
+        text="ðŸ˜‚",
+        created_at="",
+        url="https://x.com/clip/status/8",
+        has_video=True,
+        media_descriptions=["Video attached"],
+    )
+    caption_only = XSearchResult(
+        id=9,
+        username="clip",
+        display_name="",
+        text="The goalkeeper recovered after slipping at the near post",
+        created_at="",
+        url="https://x.com/clip/status/9",
+        has_video=True,
+    )
+
+    assert _video_context_quality(no_context) == "visual_required"
+    assert _video_context_quality(caption_only) == "caption_only"
+
+
+def test_replyvideo_extracts_frames_only_for_ungrounded_candidate(tmp_path) -> None:
+    cleaned: list[str] = []
+
+    class FakeDownloader:
+        def download(self, url):
+            return SimpleNamespace(
+                path=tmp_path / "clip.mp4",
+                cleanup=lambda: cleaned.append(url),
+            )
+
+    class FakeExtractor:
+        def extract(self, path, *, prefix, max_frames):
+            assert path == tmp_path / "clip.mp4"
+            assert max_frames == 2
+            return [
+                ImageAttachment(f"{prefix}-frame-01.jpg", "image/jpeg", b"a" * 200),
+                ImageAttachment(f"{prefix}-frame-02.jpg", "image/jpeg", b"b" * 200),
+            ]
+
+    class Status:
+        async def edit_text(self, text):
+            self.text = text
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    bot.media_downloader = FakeDownloader()
+    bot.video_frame_extractor = FakeExtractor()
+    ungrounded = XSearchResult(
+        id=10,
+        username="clip",
+        display_name="",
+        text="",
+        created_at="",
+        url="https://x.com/clip/status/10",
+        has_video=True,
+    )
+    captioned = XSearchResult(
+        id=11,
+        username="clip",
+        display_name="",
+        text="A dog catches the ball before it hits the ground",
+        created_at="",
+        url="https://x.com/clip/status/11",
+        has_video=True,
+    )
+
+    prepared, attachments, skipped = asyncio.run(
+        bot._prepare_reply_video_evidence([ungrounded, captioned], Status(), max_items=2)
+    )
+
+    assert [item.video_context_quality for item in prepared] == [
+        "visual_frames",
+        "caption_only",
+    ]
+    assert len(attachments) == 2
+    assert skipped == 0
+    assert cleaned == [ungrounded.url]
+
+
+def test_replyvideo_cleans_download_when_frame_extraction_fails(tmp_path) -> None:
+    cleaned: list[bool] = []
+
+    class FakeDownloader:
+        def download(self, _url):
+            return SimpleNamespace(
+                path=tmp_path / "clip.mp4",
+                cleanup=lambda: cleaned.append(True),
+            )
+
+    class FailingExtractor:
+        def extract(self, _path, **_kwargs):
+            raise RuntimeError("broken video")
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    bot.media_downloader = FakeDownloader()
+    bot.video_frame_extractor = FailingExtractor()
+    ungrounded = XSearchResult(
+        id=12,
+        username="clip",
+        display_name="",
+        text="",
+        created_at="",
+        url="https://x.com/clip/status/12",
+        has_video=True,
+    )
+
+    prepared, attachments, skipped = asyncio.run(
+        bot._prepare_reply_video_evidence([ungrounded], Status(), max_items=2)
+    )
+
+    assert prepared == []
+    assert attachments == []
+    assert skipped == 1
+    assert cleaned == [True]
 
 def test_parse_tweettrend3_args_accepts_vietnamese_shortcut() -> None:
     assert _parse_tweettrend3_args(["vi"]) == ("auto", "Vietnamese")
@@ -366,6 +531,53 @@ def test_replylangs_command_updates_runtime_settings_and_env(monkeypatch) -> Non
     assert bot.settings.reply_target_languages == "en,ja,ko,es"
     assert saved == [("REPLY_TARGET_LANGUAGES", "en,ja,ko,es")]
     assert "Saved to .env" in replies[0]
+
+
+def test_replybatch_command_updates_each_runtime_setting_and_env(monkeypatch) -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    saved = []
+    replies = []
+
+    async def reply_text(text):
+        replies.append(text)
+
+    monkeypatch.setattr(
+        "src.bot.update_env_value",
+        lambda name, value: saved.append((name, value)),
+    )
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_message=SimpleNamespace(reply_text=reply_text),
+    )
+
+    asyncio.run(bot.replybatch(update, SimpleNamespace(args=["targets", "5"])))
+    asyncio.run(bot.replybatch(update, SimpleNamespace(args=["video", "2"])))
+
+    assert bot.settings.reply_target_batch_size == 5
+    assert bot.settings.reply_video_batch_size == 2
+    assert saved == [
+        ("REPLY_TARGET_BATCH_SIZE", "5"),
+        ("REPLY_VIDEO_BATCH_SIZE", "2"),
+    ]
+    assert all("applied immediately" in reply for reply in replies)
+
+
+def test_replybatch_command_rejects_values_outside_two_to_five() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    replies = []
+
+    async def reply_text(text):
+        replies.append(text)
+
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_message=SimpleNamespace(reply_text=reply_text),
+    )
+
+    asyncio.run(bot.replybatch(update, SimpleNamespace(args=["targets", "6"])))
+
+    assert bot.settings.reply_target_batch_size == 3
+    assert replies == ["Batch size must be between 2 and 5 replies."]
 
 
 def test_format_reply_target_messages_are_copy_focused() -> None:
@@ -872,7 +1084,7 @@ def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
     assert [result.id for result in results] == [expected.id]
     assert results[0].velocity_score > 0
     assert search_query == "working topic lang:en"
-    assert "fresh fallback" in note
+    assert "relaxed momentum" in note
     assert attempts == [
         ("empty topic", 360),
         ("working topic", 360),
@@ -958,8 +1170,8 @@ def test_replytargets_auto_mode_refetches_persisted_watched_tweet(tmp_path) -> N
         url="https://x.com/watched/status/401",
         language="en",
         created_at_timestamp=now - 5 * 60,
-        like_count=5,
-        reply_count=1,
+        like_count=0,
+        reply_count=0,
         view_count=600,
         author_followers_count=5_000,
     )
@@ -1158,6 +1370,157 @@ def test_replytargets_relaxed_ranking_keeps_view_count_as_a_hard_floor() -> None
     assert [result.id for result in ranked] == [10]
 
 
+def test_replytargets_volume_fallback_lowers_view_floor_to_fill_batch(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            generate_images=False,
+            reply_watch_path=str(tmp_path / "watch.json"),
+            reply_target_metrics_path=str(tmp_path / "metrics.json"),
+            reply_target_min_views=500,
+        )
+    )
+    now = int(datetime.now(UTC).timestamp())
+    standard = XSearchResult(
+        id=801,
+        username="standard",
+        display_name="Standard",
+        text="Strong current discussion",
+        created_at=datetime.now(UTC).isoformat(),
+        url="https://x.com/standard/status/801",
+        language="en",
+        created_at_timestamp=now - 5 * 60,
+        like_count=20,
+        reply_count=2,
+        view_count=2_000,
+    )
+    lower_view = XSearchResult(
+        id=802,
+        username="fallback",
+        display_name="Fallback",
+        text="Smaller but real current discussion",
+        created_at=datetime.now(UTC).isoformat(),
+        url="https://x.com/fallback/status/802",
+        language="en",
+        created_at_timestamp=now - 3 * 60,
+        like_count=5,
+        reply_count=1,
+        view_count=125,
+    )
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    class XSearch:
+        async def tweet_replies(self, _tweet_id, *, limit):
+            assert limit == 12
+            return []
+
+    async def auto_queries(_languages=None, *, mode="balanced"):
+        del mode
+        return ["current topic"]
+
+    async def search(_query, *, max_age_minutes=360):
+        del max_age_minutes
+        return "current topic lang:en", [standard, lower_view]
+
+    bot.x_search = XSearch()
+    bot._auto_reply_target_queries = auto_queries
+    bot._search_reply_target_pool = search
+
+    _query, results, note = asyncio.run(
+        bot._get_reply_target_context("", Status(), languages=["en"])
+    )
+
+    assert {result.id for result in results} == {801, 802}
+    assert "volume fallback (125+ views" in note
+
+
+def test_replytargets_minimum_batch_fallback_accepts_any_visible_views(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            generate_images=False,
+            reply_watch_path=str(tmp_path / "watch.json"),
+            reply_target_metrics_path=str(tmp_path / "metrics.json"),
+            reply_target_min_views=500,
+        )
+    )
+    now = int(datetime.now(UTC).timestamp())
+    candidates = [
+        XSearchResult(
+            id=811 + index,
+            username=f"small{index}",
+            display_name=f"Small {index}",
+            text=f"Fresh visible post {index}",
+            created_at=datetime.now(UTC).isoformat(),
+            url=f"https://x.com/small{index}/status/{811 + index}",
+            language="en",
+            created_at_timestamp=now - ((index + 1) * 60),
+            view_count=20 + index,
+        )
+        for index in range(2)
+    ]
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    class XSearch:
+        async def tweet_replies(self, _tweet_id, *, limit):
+            assert limit == 12
+            return []
+
+    async def auto_queries(_languages=None, *, mode="balanced"):
+        del mode
+        return ["current topic"]
+
+    async def search(_query, *, max_age_minutes=360):
+        del max_age_minutes
+        return "current topic lang:en", candidates
+
+    bot.x_search = XSearch()
+    bot._auto_reply_target_queries = auto_queries
+    bot._search_reply_target_pool = search
+
+    _query, results, note = asyncio.run(
+        bot._get_reply_target_context("", Status(), languages=["en"])
+    )
+
+    assert {result.id for result in results} == {811, 812}
+    assert "minimum-batch fallback" in note
+
+
+def test_replytargets_reports_search_outage_instead_of_empty_market(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            generate_images=False,
+            reply_watch_path=str(tmp_path / "watch.json"),
+            reply_target_metrics_path=str(tmp_path / "metrics.json"),
+        )
+    )
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    async def auto_queries(_languages=None, *, mode="balanced"):
+        del mode
+        return ["current topic", "breaking news"]
+
+    async def search(query, *, max_age_minutes=360):
+        del max_age_minutes
+        raise RuntimeError(f"Logged-out X web app for {query}")
+
+    bot._auto_reply_target_queries = auto_queries
+    bot._search_reply_target_pool = search
+
+    with pytest.raises(RuntimeError, match="not a lack of viral tweets"):
+        asyncio.run(bot._get_reply_target_context("", Status(), languages=["en"]))
+
+
 def test_replytargets_relaxed_ranking_rejects_fresh_posts_without_signal() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
     no_signal = XSearchResult(
@@ -1216,7 +1579,8 @@ def test_replytargets_never_accepts_posts_older_than_lookback() -> None:
 
     assert search_query == "second topic since_time:1"
     assert results == []
-    assert note == ""
+    assert "Fetched 1 unique root posts" in note
+    assert "age" in note
 
 
 def test_replytargets_auto_topic_discovery_uses_one_bounded_trend_call() -> None:
@@ -1314,6 +1678,58 @@ def test_reply_target_mode_penalizes_a_dominant_top_reply() -> None:
 
     assert ranked[0].id == open_thread.id
     assert ranked[0].audience_affinity_score > 0
+
+
+def test_reply_batch_promotes_top_watching_candidate_to_reach_two() -> None:
+    ready = [
+        XSearchResult(
+            id=701,
+            username="ready",
+            display_name="Ready",
+            text="Confirmed",
+            created_at="",
+            url="https://x.com/ready/status/701",
+        )
+    ]
+    watching = [
+        XSearchResult(
+            id=702,
+            username="watching",
+            display_name="Watching",
+            text="Qualified first observation",
+            created_at="",
+            url="https://x.com/watching/status/702",
+        )
+    ]
+
+    selected, promoted = _select_reply_draft_batch(
+        ready,
+        watching,
+        capacity=3,
+    )
+
+    assert [result.id for result in selected] == [701, 702]
+    assert promoted == 1
+
+
+def test_reply_batch_waits_when_fewer_than_two_candidates_exist() -> None:
+    only_candidate = XSearchResult(
+        id=703,
+        username="only",
+        display_name="Only",
+        text="Only candidate",
+        created_at="",
+        url="https://x.com/only/status/703",
+    )
+
+    selected, promoted = _select_reply_draft_batch(
+        [],
+        [only_candidate],
+        capacity=3,
+    )
+
+    assert selected == []
+    assert promoted == 0
 
 
 def test_replytargets_searches_top_and_latest_root_posts_within_freshness_window() -> None:
@@ -1460,11 +1876,29 @@ def test_tweettrend3_auto_prefers_creator_niche_topics() -> None:
 
 
 def test_no_reply_targets_message_allows_auto_mode() -> None:
-    message = _no_reply_targets_message("auto hot topics", auto=True)
+    message = _no_reply_targets_message(
+        "auto hot topics",
+        auto=True,
+        diagnostic="Fetched 3 unique root posts; 2 search lanes failed.",
+    )
 
     assert "last 360 minutes" in message
+    assert "Scan diagnostics: Fetched 3 unique root posts" in message
     assert "without accepting older posts" in message
     assert "/replytargets crypto" in message
+
+
+def test_replytargets_connection_error_is_not_reported_as_extension_bridge() -> None:
+    error = RuntimeError(
+        "All 6 reply-target search lanes failed. First error: "
+        "RuntimeError: X search failed: All connection attempts failed"
+    )
+
+    message = _friendly_error(error)
+
+    assert "Could not search X" in message
+    assert "No Gemini or Chrome bridge job was started" in message
+    assert "Could not connect to the local Chrome extension bridge" not in message
 
 
 def test_x_account_error_notifications_only_report_new_errors() -> None:
@@ -1510,6 +1944,18 @@ def test_friendly_error_does_not_return_empty_detail() -> None:
     assert "The request timed out." in _friendly_error(TimeoutError())
 
 
+def test_friendly_error_preserves_bridge_timeout_diagnosis() -> None:
+    message = _friendly_error(
+        RuntimeError(
+            "Extension bridge timed out waiting for Chrome after 600s. "
+            "Chrome never claimed the queued job."
+        )
+    )
+
+    assert "Chrome never claimed the queued job" in message
+    assert "This usually means" not in message
+
+
 def test_friendly_error_guides_extension_bridge_connection() -> None:
     message = _friendly_error(
         RuntimeError("Connection refused")
@@ -1517,6 +1963,20 @@ def test_friendly_error_guides_extension_bridge_connection() -> None:
 
     assert "local Chrome extension bridge" in message
     assert "Bridge URL/token" in message
+
+
+def test_friendly_error_distinguishes_gemini_upload_dom_from_bridge_endpoint() -> None:
+    message = _friendly_error(
+        RuntimeError(
+            "Gemini image file input was not found. "
+            "url=https://gemini.google.com/app; fileInputs=0"
+        )
+    )
+
+    assert "attachment control was not detected" in message
+    assert "version 0.8.1" in message
+    assert "bridge endpoint itself is working" in message
+    assert "endpoint was not found" not in message
 
 
 class _FakeMessage:

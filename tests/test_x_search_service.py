@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from src.models import XSearchResult, XTrend
@@ -14,6 +15,7 @@ from src.x_search_service import (
     parse_reply_target_languages,
     query_for_language,
     rank_fast_growing_posts,
+    rank_viral_video_posts,
     recent_search_query,
     summarize_trends_context,
 )
@@ -45,6 +47,45 @@ def test_default_english_query() -> None:
     assert default_english_query("AI agents lang:vi") == "AI agents lang:vi"
     with pytest.raises(RuntimeError):
         default_english_query(" ")
+
+
+def test_viral_video_ranking_prioritizes_low_reply_competition() -> None:
+    created = int((datetime.now(timezone.utc) - timedelta(minutes=20)).timestamp())
+    crowded = XSearchResult(
+        id=1,
+        username="crowded",
+        display_name="",
+        text="video",
+        created_at="",
+        created_at_timestamp=created,
+        url="https://x.com/crowded/status/1",
+        has_video=True,
+        view_count=100_000,
+        like_count=500,
+        reply_count=500,
+    )
+    open_thread = XSearchResult(
+        id=2,
+        username="open",
+        display_name="",
+        text="video",
+        created_at="",
+        created_at_timestamp=created,
+        url="https://x.com/open/status/2",
+        has_video=True,
+        view_count=80_000,
+        like_count=400,
+        reply_count=5,
+    )
+
+    ranked = rank_viral_video_posts(
+        [crowded, open_thread],
+        min_view_count=15_000,
+        min_view_velocity=300,
+    )
+
+    assert [item.id for item in ranked] == [2, 1]
+    assert ranked[0].views_per_reply > ranked[1].views_per_reply
 
 
 def test_reply_target_languages_support_japanese_and_bound_the_scan() -> None:
@@ -154,6 +195,41 @@ def test_rank_fast_growing_posts_filters_weak_low_view_posts() -> None:
     ranked = rank_fast_growing_posts([weak, good], max_items=5, max_age_minutes=30)
 
     assert [result.username for result in ranked] == ["good"]
+
+
+def test_rank_fast_growing_posts_allows_view_only_volume_fallback() -> None:
+    now = datetime.now(timezone.utc)
+    view_only = XSearchResult(
+        id=9,
+        username="viewonly",
+        display_name="View Only",
+        text="Views arrived before reactions",
+        created_at=str(now - timedelta(minutes=3)),
+        created_at_timestamp=int((now - timedelta(minutes=3)).timestamp()),
+        url="https://x.com/viewonly/status/9",
+        view_count=125,
+    )
+
+    standard = rank_fast_growing_posts(
+        [view_only],
+        max_age_minutes=30,
+        min_engagement_score=0,
+        min_velocity_score=0,
+        min_view_velocity_score=0,
+        min_view_count=125,
+    )
+    fallback = rank_fast_growing_posts(
+        [view_only],
+        max_age_minutes=30,
+        min_engagement_score=0,
+        min_velocity_score=0,
+        min_view_velocity_score=0,
+        min_view_count=125,
+        allow_view_only_signal=True,
+    )
+
+    assert standard == []
+    assert [result.id for result in fallback] == [9]
 
 
 def test_rank_fast_growing_posts_excludes_replies_and_retweet_wrappers() -> None:
@@ -379,6 +455,78 @@ def test_to_search_result_captures_author_reach() -> None:
     assert result.author_id == 7
     assert result.conversation_id == 22
     assert result.in_reply_to_tweet_id == 11
+
+
+def test_to_search_result_marks_video_and_keeps_exposed_alt_text() -> None:
+    class User:
+        id = 8
+        username = "video"
+        displayname = "Video"
+
+    class Video:
+        thumbnailUrl = "https://pbs.twimg.com/video_thumb/1.jpg"
+        altText = "A goalkeeper makes a last-second save"
+
+    class Media:
+        photos = []
+        videos = [Video()]
+        animated = []
+
+    class Tweet:
+        id = 23
+        user = User()
+        rawContent = "Perfect timing"
+        date = datetime.now(timezone.utc)
+        replyCount = 1
+        retweetCount = 2
+        quoteCount = 0
+        likeCount = 100
+        viewCount = 20_000
+        media = Media()
+
+    result = _to_search_result(Tweet())
+
+    assert result.has_video is True
+    assert result.media_urls == ["https://pbs.twimg.com/video_thumb/1.jpg"]
+    assert result.media_descriptions == ["A goalkeeper makes a last-second save"]
+
+
+def test_search_keeps_captionless_video_candidates() -> None:
+    class User:
+        id = 8
+        username = "video"
+        displayname = "Video"
+
+    class Video:
+        thumbnailUrl = "https://pbs.twimg.com/video_thumb/2.jpg"
+
+    class Media:
+        photos = []
+        videos = [Video()]
+        animated = []
+
+    class Tweet:
+        id = 24
+        user = User()
+        rawContent = ""
+        text = ""
+        date = datetime.now(timezone.utc)
+        media = Media()
+
+    class FakeApi:
+        async def search(self, query, limit, kv):
+            yield Tweet()
+
+    service = XSearchService(Settings(telegram_bot_token="123:ABC"))
+    service._api = FakeApi()
+
+    results = asyncio.run(
+        service.search("filter:videos lang:en", limit=1, product="Latest")
+    )
+
+    assert len(results) == 1
+    assert results[0].text == ""
+    assert results[0].has_video is True
 
 
 def test_owner_timeline_and_direct_replies_use_twscrape_api() -> None:

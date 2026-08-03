@@ -31,6 +31,12 @@
       </label>
 
       <div class="toggle-row">
+        <span>Low-resource mode</span>
+        <button id="lowResourceMode" class="toggle" type="button" aria-pressed="true">ON</button>
+      </div>
+      <p class="hint">Uses 60-second idle polling and fewer DOM/heartbeat checks for small VPS instances.</p>
+
+      <div class="toggle-row">
         <span>Auto Run</span>
         <button id="autoRun" class="toggle" type="button" aria-pressed="false">OFF</button>
       </div>
@@ -81,6 +87,21 @@
           /replytargets query (optional)
           <input id="replyTargetsQuery" spellcheck="false" placeholder="blank = auto">
         </label>
+
+        <label>
+          /replyvideo scan interval (minutes)
+          <input id="replyVideoMinutes" type="number" min="3" step="1">
+        </label>
+
+        <label>
+          /replyvideo topic (optional)
+          <input id="replyVideoQuery" spellcheck="false" placeholder="blank = global + Vietnamese">
+        </label>
+        <label>
+          /replyvideo active windows
+          <input id="replyVideoWindows" spellcheck="false" placeholder="08:00-11:00,12:00-14:00,19:00-22:00">
+        </label>
+        <p id="replyVideoScheduleStatus" class="hint"></p>
 
         <label>
           /tweettrend3 fixed times

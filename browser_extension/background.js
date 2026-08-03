@@ -3,7 +3,8 @@ const DEFAULTS = {
   token: "local-bridge-change-me",
   timeoutSeconds: 360,
   autoRun: false,
-  pollSeconds: 30,
+  pollSeconds: 60,
+  lowResourceMode: true,
   automationEnabled: false,
   activeStart: "08:00",
   activeEnd: "22:00",
@@ -12,11 +13,17 @@ const DEFAULTS = {
   replyTargetsMaxAgeMinutes: 360,
   replyTargetsLanguages: "en,ja",
   replyTargetsQuery: "",
+  replyVideoMinutes: 5,
+  replyVideoQuery: "",
+  replyVideoWindows: "08:00-11:00,12:00-14:00,19:00-22:00",
   trendTimes: "09:00,18:00",
   trendCategory: "auto",
   nextReplyTargetsAt: 0,
   lastReplyTargetsTriggeredAt: 0,
   replyTargetsConfigUpdatedAt: 0,
+  nextReplyVideoAt: 0,
+  lastReplyVideoTriggeredAt: 0,
+  replyVideoConfigUpdatedAt: 0,
   trendRunKeys: [],
   lastStatus: "Ready."
 };
@@ -30,8 +37,11 @@ const FINAL_PROVIDER_URL = "https://gemini.google.com/app";
 const FINAL_PROVIDER_NAME = "Gemini";
 const PROVIDER_RECYCLE_AFTER_JOBS = 10;
 const PROVIDER_JOB_COUNT_KEY = "providerSuccessfulJobs";
+const PROVIDER_TAB_ID_KEY = "managedProviderTabId";
+const HEARTBEAT_INJECTION_MIN_INTERVAL_MS = 5 * 60 * 1000;
 let running = false;
 let lastStatusCache = "";
+let lastRuntimeBootstrapAt = 0;
 
 chrome.runtime.onInstalled.addListener(() => {
   initializeRuntime().catch((error) => setStatus(`Startup repair error: ${error.message || error}`));
@@ -48,18 +58,24 @@ initializeRuntime().catch((error) => setStatus(`Startup repair error: ${error.me
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
-  if (changes.autoRun || changes.pollSeconds) {
+  if (changes.autoRun || changes.pollSeconds || changes.lowResourceMode) {
     ensureAutoAlarm();
   }
   if (
-    changes.automationEnabled || changes.activeStart || changes.activeEnd ||
+    changes.automationEnabled || changes.lowResourceMode ||
+    changes.activeStart || changes.activeEnd ||
     changes.creatorTimezone ||
     changes.replyTargetsMinutes || changes.replyTargetsMaxAgeMinutes ||
-    changes.replyTargetsLanguages || changes.trendTimes
+    changes.replyTargetsLanguages || changes.replyVideoMinutes ||
+    changes.replyVideoWindows || changes.trendTimes
   ) {
     if (changes.replyTargetsMinutes) {
       const minutes = Math.max(5, Number(changes.replyTargetsMinutes.newValue || DEFAULTS.replyTargetsMinutes));
       chromeStorageSet({ nextReplyTargetsAt: Date.now() + minutes * 60 * 1000 })
+        .then(() => ensureAutomationAlarm());
+    } else if (changes.replyVideoMinutes) {
+      const minutes = Math.max(3, Number(changes.replyVideoMinutes.newValue || DEFAULTS.replyVideoMinutes));
+      chromeStorageSet({ nextReplyVideoAt: Date.now() + minutes * 60 * 1000 })
         .then(() => ensureAutomationAlarm());
     } else {
       ensureAutomationAlarm();
@@ -117,7 +133,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.action === "runtime-heartbeat") {
     chromeStorageSessionSet({ lastRuntimeHeartbeatAt: Date.now() })
-      .then(() => bootstrapRuntime())
+      .then(() => (
+        Date.now() - lastRuntimeBootstrapAt >= 120000
+          ? bootstrapRuntime()
+          : null
+      ))
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
     return true;
@@ -133,73 +153,99 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
-async function bootstrapRuntime() {
-  await ensureWatchdogAlarm();
-  await Promise.all([ensureAutoAlarm(), ensureAutomationAlarm()]);
+async function bootstrapRuntime(config = null) {
+  const runtimeConfig = config || await loadConfig();
+  await Promise.all([
+    ensureWatchdogAlarm(runtimeConfig),
+    ensureAutoAlarm(runtimeConfig),
+    ensureAutomationAlarm(runtimeConfig)
+  ]);
+  lastRuntimeBootstrapAt = Date.now();
 }
 
 async function initializeRuntime() {
   await ensureGeminiHeartbeatInjected();
-  await bootstrapRuntime();
+  const config = await loadConfig();
+  await bootstrapRuntime(config);
 }
 
 async function ensureGeminiHeartbeatInjected() {
-  const tabs = await chromeTabsQuery({ url: "https://gemini.google.com/*" });
-  for (const tab of tabs) {
-    if (!tab.id) continue;
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["gemini_heartbeat.js"]
-      });
-    } catch (_error) {
-      // A tab can navigate or close between query and injection. The manifest
-      // content script or the next worker startup will retry automatically.
+  const now = Date.now();
+  const session = await chromeStorageSessionGet({ lastHeartbeatInjectionAt: 0 });
+  if (now - Number(session.lastHeartbeatInjectionAt || 0) < HEARTBEAT_INJECTION_MIN_INTERVAL_MS) {
+    return;
+  }
+  let tab = await getManagedProviderTab(FINAL_PROVIDER_URL);
+  if (!tab) {
+    const tabs = await chromeTabsQuery({ url: "https://gemini.google.com/*" });
+    // A sole tab is safe to adopt. With several normal-Chrome Gemini tabs,
+    // wait for the first real job to create a dedicated automation tab.
+    tab = tabs.length === 1 ? tabs[0] : null;
+    if (tab && tab.id) {
+      await setManagedProviderTab(tab.id);
     }
   }
+  if (tab && tab.id) {
+    await injectGeminiHeartbeat(tab.id);
+  }
+  await chromeStorageSessionSet({ lastHeartbeatInjectionAt: now });
 }
 
-async function ensureWatchdogAlarm() {
-  const existing = await chromeAlarmsGet(RUNTIME_WATCHDOG_ALARM);
-  if (!existing || Number(existing.periodInMinutes || 0) !== 1) {
-    chrome.alarms.create(RUNTIME_WATCHDOG_ALARM, { periodInMinutes: 1 });
+async function injectGeminiHeartbeat(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["gemini_heartbeat.js"]
+    });
+  } catch (_error) {
+    // The managed tab can navigate or close between lookup and injection. The
+    // next provider job or recovery pass will select one tab and retry.
   }
 }
 
-async function ensureAutoAlarm() {
-  const config = await loadConfig();
-  if (!config.autoRun) {
+async function ensureWatchdogAlarm(config = null) {
+  const runtimeConfig = config || await loadConfig();
+  const periodInMinutes = runtimeConfig.lowResourceMode ? 2 : 1;
+  const existing = await chromeAlarmsGet(RUNTIME_WATCHDOG_ALARM);
+  if (!existing || Number(existing.periodInMinutes || 0) !== periodInMinutes) {
+    chrome.alarms.create(RUNTIME_WATCHDOG_ALARM, { periodInMinutes });
+  }
+}
+
+async function ensureAutoAlarm(config = null) {
+  const runtimeConfig = config || await loadConfig();
+  if (!runtimeConfig.autoRun) {
     await chromeAlarmsClear(AUTO_ALARM);
     return;
   }
-  const periodInMinutes = Math.max(0.5, config.pollSeconds / 60);
+  const minimumMinutes = runtimeConfig.lowResourceMode ? 1 : 0.5;
+  const periodInMinutes = Math.max(minimumMinutes, runtimeConfig.pollSeconds / 60);
   const existing = await chromeAlarmsGet(AUTO_ALARM);
   if (!existing || Number(existing.periodInMinutes || 0) !== periodInMinutes) {
     chrome.alarms.create(AUTO_ALARM, { periodInMinutes });
   }
-  runJobs({ force: false, maxJobs: 1 })
-    .catch((error) => setStatus(`Auto Run error: ${error.message || error}`));
 }
 
-async function ensureAutomationAlarm() {
-  const config = await loadConfig();
-  if (!config.automationEnabled) {
+async function ensureAutomationAlarm(config = null) {
+  const runtimeConfig = config || await loadConfig();
+  if (!runtimeConfig.automationEnabled) {
     await chromeAlarmsClear(AUTOMATION_ALARM);
     return;
   }
-  if (!config.nextReplyTargetsAt) {
+  if (!runtimeConfig.nextReplyTargetsAt) {
     await chromeStorageSet({
-      nextReplyTargetsAt: Date.now() + config.replyTargetsMinutes * 60 * 1000
+      nextReplyTargetsAt: Date.now() + runtimeConfig.replyTargetsMinutes * 60 * 1000
     });
   }
-  const existing = await chromeAlarmsGet(AUTOMATION_ALARM);
-  if (!existing || Number(existing.periodInMinutes || 0) !== 0.5) {
-    chrome.alarms.create(AUTOMATION_ALARM, { periodInMinutes: 0.5 });
+  if (!runtimeConfig.nextReplyVideoAt) {
+    await chromeStorageSet({
+      nextReplyVideoAt: Date.now() + runtimeConfig.replyVideoMinutes * 60 * 1000
+    });
   }
-  const result = await automationTick();
-  if (result && result.runJobs) {
-    runJobs({ force: true, maxJobs: 1 })
-      .catch((error) => setStatus(`Automation error: ${error.message || error}`));
+  const periodInMinutes = runtimeConfig.lowResourceMode ? 1 : 0.5;
+  const existing = await chromeAlarmsGet(AUTOMATION_ALARM);
+  if (!existing || Number(existing.periodInMinutes || 0) !== periodInMinutes) {
+    chrome.alarms.create(AUTOMATION_ALARM, { periodInMinutes });
   }
 }
 
@@ -246,6 +292,31 @@ async function automationTick() {
     }
   }
 
+  if (!config.nextReplyVideoAt) {
+    await chromeStorageSet({
+      nextReplyVideoAt: nowMs + config.replyVideoMinutes * 60 * 1000
+    });
+  } else if (
+    nowMs >= config.nextReplyVideoAt &&
+    isInsideScheduleWindows(now, config.replyVideoWindows, config.creatorTimezone)
+  ) {
+    await setStatus("Starting scheduled /replyvideo...");
+    const trigger = await bridgeFetch(config, "/automation/triggers/replyvideo", {
+      method: "POST",
+      body: {
+        query: config.replyVideoQuery,
+        reply_video_minutes: config.replyVideoMinutes
+      }
+    });
+    if (trigger.status === "accepted") {
+      await chromeStorageSet({
+        nextReplyVideoAt: nowMs + config.replyVideoMinutes * 60 * 1000,
+        lastReplyVideoTriggeredAt: nowMs
+      });
+      return { runJobs: true };
+    }
+  }
+
   const runKeys = new Set(config.trendRunKeys);
   for (const time of parseTrendTimes(config.trendTimes)) {
     const scheduledMinutes = clockMinutes(time, 0);
@@ -273,7 +344,18 @@ async function syncTelegramAutomationConfig(config) {
   const remote = await bridgeFetch(config, "/automation/config");
   const minutes = Number(remote.reply_targets_minutes || 0);
   const updatedAt = Number(remote.reply_targets_updated_at || 0);
+  const videoMinutes = Number(remote.reply_video_minutes || 0);
+  const videoUpdatedAt = Number(remote.reply_video_updated_at || 0);
+  const bridgeTimeoutSeconds = Number(remote.extension_bridge_timeout_seconds || 0);
   const automationRunning = Boolean(remote.automation_running);
+  if (
+    Number.isFinite(bridgeTimeoutSeconds) &&
+    bridgeTimeoutSeconds >= 30 &&
+    bridgeTimeoutSeconds !== config.timeoutSeconds
+  ) {
+    await chromeStorageSet({ timeoutSeconds: bridgeTimeoutSeconds });
+    config = { ...config, timeoutSeconds: bridgeTimeoutSeconds };
+  }
   const creatorTimezone = String(
     remote.creator_timezone || config.creatorTimezone || DEFAULTS.creatorTimezone
   );
@@ -287,6 +369,26 @@ async function syncTelegramAutomationConfig(config) {
   if (replyTargetsLanguages && replyTargetsLanguages !== config.replyTargetsLanguages) {
     await chromeStorageSet({ replyTargetsLanguages });
     config = { ...config, replyTargetsLanguages };
+  }
+  if (Number.isFinite(videoMinutes) && videoMinutes >= 3) {
+    const videoIntervalChanged = videoMinutes !== config.replyVideoMinutes;
+    const videoRevisionChanged = (
+      videoUpdatedAt > 0 && videoUpdatedAt !== config.replyVideoConfigUpdatedAt
+    );
+    if (videoIntervalChanged || videoRevisionChanged) {
+      const nextReplyVideoAt = Date.now() + videoMinutes * 60 * 1000;
+      await chromeStorageSet({
+        replyVideoMinutes: videoMinutes,
+        replyVideoConfigUpdatedAt: videoUpdatedAt,
+        nextReplyVideoAt
+      });
+      config = {
+        ...config,
+        replyVideoMinutes: videoMinutes,
+        replyVideoConfigUpdatedAt: videoUpdatedAt,
+        nextReplyVideoAt
+      };
+    }
   }
   if (!Number.isFinite(minutes) || minutes < 5) {
     return { ...config, automationRunning };
@@ -321,6 +423,15 @@ function isInsideActiveWindow(date, start, end, timezone = DEFAULTS.creatorTimez
     return current >= startMinutes && current < endMinutes;
   }
   return current >= startMinutes || current < endMinutes;
+}
+
+function isInsideScheduleWindows(date, value, timezone = DEFAULTS.creatorTimezone) {
+  const windows = String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
+  if (!windows.length) return true;
+  return windows.some((windowValue) => {
+    const parts = windowValue.split("-").map((item) => item.trim());
+    return parts.length === 2 && isInsideActiveWindow(date, parts[0], parts[1], timezone);
+  });
 }
 
 function zonedDateParts(date, timezone) {
@@ -415,7 +526,7 @@ async function runJobs({ force, maxJobs }) {
       // The bot often queues the next /tweettrend3 or repair job immediately
       // after receiving this result. Keep one low-frequency follow-up wake so
       // it is not left waiting if the primary repeating alarm disappears.
-      chrome.alarms.create(FOLLOW_UP_ALARM, { delayInMinutes: 0.5 });
+      chrome.alarms.create(FOLLOW_UP_ALARM, { delayInMinutes: 1 });
     }
     return { ok: true, processed };
   } catch (error) {
@@ -459,7 +570,8 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
     const finalOutput = await runProviderPrompt(
       FINAL_PROVIDER_URL,
       finalPrompt,
-      config.timeoutSeconds
+      config.timeoutSeconds,
+      Array.isArray(job.attachments) ? job.attachments : []
     );
     providerCompleted = true;
 
@@ -539,7 +651,7 @@ function startJobHeartbeat(config, jobId) {
     }
   };
   tick();
-  const timer = setInterval(tick, 10000);
+  const timer = setInterval(tick, 20000);
   return () => {
     stopped = true;
     clearInterval(timer);
@@ -557,10 +669,24 @@ async function reportJobError(config, jobId, error) {
   }
 }
 
-async function runProviderPrompt(url, prompt, timeoutSeconds) {
+async function runProviderPrompt(url, prompt, timeoutSeconds, attachments = []) {
   const tab = await prepareProviderTab(url);
   const provider = providerNameFromUrl(url);
   const submittedPrompt = provider === "Gemini" ? compactPromptForSingleInput(prompt) : prompt;
+  if (attachments.length) {
+    await setStatus(`Uploading ${attachments.length} representative frame(s) to ${provider}...`);
+    const [attachmentResult] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: injectedAttachImages,
+      args: [attachments]
+    });
+    const upload = attachmentResult ? attachmentResult.result : null;
+    if (!upload || !upload.ok) {
+      const detail = upload && upload.error ? upload.error : "Image attachment upload failed.";
+      const debug = upload && upload.debug ? ` ${upload.debug}` : "";
+      throw new Error(`${detail}${debug}`);
+    }
+  }
   await setStatus(`Submitting prompt to ${provider}...`);
 
   const [submitResult] = await chrome.scripting.executeScript({
@@ -610,13 +736,13 @@ async function runProviderPrompt(url, prompt, timeoutSeconds) {
     if (value && value.debug) {
       lastDebug = value.debug;
     }
-    if (Date.now() - lastStatusAt > 10000) {
+    if (Date.now() - lastStatusAt > 15000) {
       await setStatus(
         `Waiting for ${provider} response...\n${lastDebug || "No readable candidate yet."}`
       );
       lastStatusAt = Date.now();
     }
-    await delay(2500);
+    await delay(best ? 2500 : 4000);
   }
 
   if (best) {
@@ -749,21 +875,50 @@ async function blobToDataUrl(blob) {
 }
 
 async function getOrCreateTab(url) {
+  const managed = await getManagedProviderTab(url);
+  if (managed) return managed;
+
   const origin = new URL(url).origin;
   const tabs = await chromeTabsQuery({ url: `${origin}/*` });
-  if (tabs.length > 0) {
-    if (tabs.length > 1) {
-      await chromeTabsRemove(tabs.slice(1).map((tab) => tab.id));
-    }
-    return tabs[0];
+  // In normal Chrome, never close or take over several user-owned Gemini tabs.
+  // Reuse a sole existing tab; otherwise create one dedicated managed tab.
+  let tab = tabs.length === 1 ? tabs[0] : null;
+  if (!tab) {
+    tab = await chromeTabsCreate({ url, active: true });
   }
-  return await chromeTabsCreate({ url, active: true });
+  if (!tab || !tab.id) {
+    throw new Error("Chrome did not return a managed Gemini tab.");
+  }
+  await setManagedProviderTab(tab.id);
+  return tab;
+}
+
+async function getManagedProviderTab(url = FINAL_PROVIDER_URL) {
+  const session = await chromeStorageSessionGet({ [PROVIDER_TAB_ID_KEY]: 0 });
+  const tabId = Number(session[PROVIDER_TAB_ID_KEY] || 0);
+  if (!tabId) return null;
+  try {
+    const tab = await chromeTabsGet(tabId);
+    const expectedOrigin = new URL(url).origin;
+    if (tab && tab.id && String(tab.url || "").startsWith(expectedOrigin)) {
+      return tab;
+    }
+  } catch (_error) {
+    // The user may have closed the previously managed tab.
+  }
+  await chromeStorageSessionSet({ [PROVIDER_TAB_ID_KEY]: 0 });
+  return null;
+}
+
+async function setManagedProviderTab(tabId) {
+  await chromeStorageSessionSet({ [PROVIDER_TAB_ID_KEY]: Number(tabId || 0) });
 }
 
 async function prepareProviderTab(url) {
   const tab = await getOrCreateTab(url);
   await chromeTabsUpdate(tab.id, { active: true });
   await waitForTabComplete(tab.id);
+  await injectGeminiHeartbeat(tab.id);
 
   try {
     await waitForProviderReady(tab.id);
@@ -805,8 +960,7 @@ async function recordProviderJobSuccess() {
 }
 
 async function recycleProviderTab() {
-  const origin = new URL(FINAL_PROVIDER_URL).origin;
-  const oldTabs = await chromeTabsQuery({ url: `${origin}/*` });
+  const oldTab = await getManagedProviderTab(FINAL_PROVIDER_URL);
   let replacement = null;
   try {
     // Keep the current Gemini tab alive until the replacement is fully loaded
@@ -818,16 +972,15 @@ async function recycleProviderTab() {
     }
     await waitForTabComplete(replacement.id);
     await waitForProviderReady(replacement.id);
+    await setManagedProviderTab(replacement.id);
+    await injectGeminiHeartbeat(replacement.id);
 
-    const staleIds = oldTabs
-      .map((tab) => tab.id)
-      .filter((tabId) => tabId && tabId !== replacement.id);
-    if (staleIds.length) {
+    if (oldTab && oldTab.id && oldTab.id !== replacement.id) {
       try {
-        await chromeTabsRemove(staleIds);
+        await chromeTabsRemove([oldTab.id]);
       } catch (_cleanupError) {
-        // The replacement is ready. A tab may have been closed manually while
-        // it was loading, so cleanup failure must not discard the new tab.
+        // Only the bot-managed old tab is eligible for cleanup. User-owned
+        // Gemini tabs in normal Chrome are never touched.
       }
     }
     return true;
@@ -839,13 +992,15 @@ async function recycleProviderTab() {
         // The failed replacement may already have been closed by Chrome.
       }
     }
-    const fallback = oldTabs.find((tab) => tab.id);
-    if (fallback) {
+    if (oldTab && oldTab.id) {
+      await setManagedProviderTab(oldTab.id);
       try {
-        await chromeTabsUpdate(fallback.id, { active: true });
+        await chromeTabsUpdate(oldTab.id, { active: true });
       } catch (_activationError) {
         // Preserve the old tab whenever it still exists; the next job retries.
       }
+    } else {
+      await setManagedProviderTab(0);
     }
     return false;
   }
@@ -996,6 +1151,162 @@ async function bridgeFetch(config, path, options = {}) {
     throw new Error(payload.error || `Bridge HTTP ${response.status}`);
   }
   return payload;
+}
+
+async function injectedAttachImages(attachments) {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+  };
+  const asciiLower = (value) => String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const deepElements = (root, selector = "*") => {
+    const found = [];
+    const visited = new Set();
+    const visit = (node) => {
+      if (!node || visited.has(node)) return;
+      visited.add(node);
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        if (node.matches(selector)) found.push(node);
+        if (node.shadowRoot) visit(node.shadowRoot);
+      }
+      for (const child of node.children || []) visit(child);
+    };
+    visit(root);
+    return found;
+  };
+  const queryFastThenDeep = (selector) => {
+    const direct = Array.from(document.querySelectorAll(selector));
+    return direct.length ? direct : deepElements(document.documentElement, selector);
+  };
+  const fileInputs = () => queryFastThenDeep("input[type='file']").sort((left, right) => {
+    const score = (input) => {
+      const accept = String(input.accept || "").toLowerCase();
+      return (accept.includes("image") ? 4 : 0) + (input.multiple ? 2 : 0) + (isVisible(input) ? 1 : 0);
+    };
+    return score(right) - score(left);
+  });
+  const labelFor = (item) => asciiLower(
+    `${item.getAttribute("aria-label") || ""} ${item.getAttribute("data-tooltip") || ""} `
+    + `${item.title || ""} ${item.textContent || ""}`
+  ).replace(/\s+/g, " ").trim();
+  const clickableElements = () => queryFastThenDeep(
+    "button, [role='button'], [role='menuitem'], [role='option'], [aria-label]"
+  ).filter(isVisible);
+  const blobImageCount = () => queryFastThenDeep("img").filter((img) =>
+    String(img.src || "").startsWith("blob:")
+  ).length;
+  const clickMatching = (matcher) => {
+    const item = clickableElements().find((candidate) => matcher(labelFor(candidate)));
+    if (!item) return "";
+    item.click();
+    return labelFor(item).slice(0, 120);
+  };
+  const clickAddMenu = () => clickMatching((label) => (
+    label.includes("open upload file menu")
+      || label.includes("upload file menu")
+      || label.includes("add files")
+      || label.includes("add file")
+      || label.includes("attach files")
+      || label.includes("attach file")
+      || label.includes("them tep")
+      || label.includes("tai tep")
+      || label.includes("ファイルを追加")
+      || label.includes("파일 추가")
+  ));
+  const clickUploadAction = () => clickMatching((label) => (
+    !label.includes("menu") && (
+      label.includes("upload files")
+      || label.includes("upload file")
+      || label.includes("upload from computer")
+      || label.includes("upload from device")
+      || label.includes("choose files")
+      || label.includes("tai tep len")
+      || label.includes("tai len tu may tinh")
+      || label.includes("ファイルをアップロード")
+      || label.includes("파일 업로드")
+    )
+  ));
+  const decodeAttachment = (attachment) => {
+    const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i.exec(String(attachment.data_url || ""));
+    if (!match) throw new Error(`Invalid image data for ${attachment.name || "attachment"}.`);
+    const binary = atob(match[2]);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return new File([bytes], String(attachment.name || "frame.jpg"), {
+      type: String(attachment.mime_type || match[1] || "image/jpeg")
+    });
+  };
+
+  if (!Array.isArray(attachments) || !attachments.length || attachments.length > 5) {
+    return { ok: false, error: "Expected 1-5 image attachments." };
+  }
+  let inputs = fileInputs();
+  const triggerLog = [];
+  if (!inputs.length) {
+    const addLabel = clickAddMenu();
+    if (addLabel) triggerLog.push(`add=${addLabel}`);
+    for (let attempt = 0; attempt < 32 && !inputs.length; attempt += 1) {
+      await sleep(250);
+      inputs = fileInputs();
+      if (inputs.length) break;
+      if ([0, 3, 8, 15, 23].includes(attempt)) {
+        const uploadLabel = clickUploadAction();
+        if (uploadLabel) triggerLog.push(`upload=${uploadLabel}`);
+      }
+    }
+  }
+  const input = inputs[0];
+  if (!input) {
+    return {
+      ok: false,
+      error: "Gemini image file input was not found.",
+      debug: `url=${location.href}; fileInputs=0; triggers=${triggerLog.join(" | ") || "none"}; `
+        + `visibleControls=${clickableElements().slice(0, 8).map(labelFor).filter(Boolean).join(" | ") || "none"}`
+    };
+  }
+  let files;
+  try {
+    files = attachments.map(decodeAttachment);
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
+  const beforeBlobImages = blobImageCount();
+  try {
+    const transfer = new DataTransfer();
+    files.forEach((file) => transfer.items.add(file));
+    const filesSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "files")?.set;
+    if (filesSetter) filesSetter.call(input, transfer.files);
+    else input.files = transfer.files;
+    input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  } catch (error) {
+    return { ok: false, error: `Could not assign Gemini image files: ${error.message || error}` };
+  }
+
+  const expectedNames = files.map((file) => file.name.toLowerCase());
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const pageText = String(document.body.innerText || "").toLowerCase();
+    const named = expectedNames.filter((name) => pageText.includes(name)).length;
+    const blobImages = blobImageCount();
+    if (named === expectedNames.length || blobImages >= beforeBlobImages + files.length) {
+      return {
+        ok: true,
+        debug: `attached=${files.length}; named=${named}; blobImages=${blobImages}`
+      };
+    }
+    await sleep(250);
+  }
+  return {
+    ok: false,
+    error: "Gemini did not confirm the uploaded representative frames.",
+    debug: `expected=${expectedNames.join(",")}; fileInputs=${inputs.length}`
+  };
 }
 
 async function injectedSubmitPrompt(prompt) {
@@ -2092,7 +2403,11 @@ async function loadConfig() {
     token: String(saved.token || DEFAULTS.token),
     timeoutSeconds: Math.max(30, Number(saved.timeoutSeconds || DEFAULTS.timeoutSeconds)),
     autoRun: Boolean(saved.autoRun),
-    pollSeconds: Math.max(30, Number(saved.pollSeconds || DEFAULTS.pollSeconds)),
+    pollSeconds: Math.max(
+      saved.lowResourceMode === false ? 30 : 60,
+      Number(saved.pollSeconds || DEFAULTS.pollSeconds)
+    ),
+    lowResourceMode: saved.lowResourceMode !== false,
     automationEnabled: Boolean(saved.automationEnabled),
     activeStart: String(saved.activeStart || DEFAULTS.activeStart),
     activeEnd: String(saved.activeEnd || DEFAULTS.activeEnd),
@@ -2106,11 +2421,17 @@ async function loadConfig() {
       saved.replyTargetsLanguages || DEFAULTS.replyTargetsLanguages
     ),
     replyTargetsQuery: String(saved.replyTargetsQuery || ""),
+    replyVideoMinutes: Math.max(3, Number(saved.replyVideoMinutes || DEFAULTS.replyVideoMinutes)),
+    replyVideoQuery: String(saved.replyVideoQuery || ""),
+    replyVideoWindows: String(saved.replyVideoWindows || DEFAULTS.replyVideoWindows),
     trendTimes: String(saved.trendTimes || DEFAULTS.trendTimes),
     trendCategory: String(saved.trendCategory || DEFAULTS.trendCategory),
     nextReplyTargetsAt: Number(saved.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(saved.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(saved.replyTargetsConfigUpdatedAt || 0),
+    nextReplyVideoAt: Number(saved.nextReplyVideoAt || 0),
+    lastReplyVideoTriggeredAt: Number(saved.lastReplyVideoTriggeredAt || 0),
+    replyVideoConfigUpdatedAt: Number(saved.replyVideoConfigUpdatedAt || 0),
     trendRunKeys: Array.isArray(saved.trendRunKeys) ? saved.trendRunKeys : [],
     lastStatus: String(session.lastStatus || saved.lastStatus || DEFAULTS.lastStatus)
   };
@@ -2122,7 +2443,11 @@ async function saveConfig(config) {
     token: String(config.token || DEFAULTS.token),
     timeoutSeconds: Math.max(30, Number(config.timeoutSeconds || DEFAULTS.timeoutSeconds)),
     autoRun: Boolean(config.autoRun),
-    pollSeconds: Math.max(30, Number(config.pollSeconds || DEFAULTS.pollSeconds)),
+    pollSeconds: Math.max(
+      config.lowResourceMode === false ? 30 : 60,
+      Number(config.pollSeconds || DEFAULTS.pollSeconds)
+    ),
+    lowResourceMode: config.lowResourceMode !== false,
     automationEnabled: Boolean(config.automationEnabled),
     activeStart: String(config.activeStart || DEFAULTS.activeStart),
     activeEnd: String(config.activeEnd || DEFAULTS.activeEnd),
@@ -2136,11 +2461,17 @@ async function saveConfig(config) {
       config.replyTargetsLanguages || DEFAULTS.replyTargetsLanguages
     ),
     replyTargetsQuery: String(config.replyTargetsQuery || ""),
+    replyVideoMinutes: Math.max(3, Number(config.replyVideoMinutes || DEFAULTS.replyVideoMinutes)),
+    replyVideoQuery: String(config.replyVideoQuery || ""),
+    replyVideoWindows: String(config.replyVideoWindows || DEFAULTS.replyVideoWindows),
     trendTimes: String(config.trendTimes || DEFAULTS.trendTimes),
     trendCategory: String(config.trendCategory || DEFAULTS.trendCategory),
     nextReplyTargetsAt: Number(config.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(config.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(config.replyTargetsConfigUpdatedAt || 0),
+    nextReplyVideoAt: Number(config.nextReplyVideoAt || 0),
+    lastReplyVideoTriggeredAt: Number(config.lastReplyVideoTriggeredAt || 0),
+    replyVideoConfigUpdatedAt: Number(config.replyVideoConfigUpdatedAt || 0),
     trendRunKeys: Array.isArray(config.trendRunKeys) ? config.trendRunKeys : []
   });
 }

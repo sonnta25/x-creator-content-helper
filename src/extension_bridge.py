@@ -12,16 +12,21 @@ from urllib.parse import parse_qs, urlparse
 
 from src.config import Settings
 from src.extension_prompts import gemini_single_pass_prompt
+from src.models import ImageAttachment
 
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
 JOB_LEASE_SECONDS = 75
+JOB_TIMEOUT_MIN_GRACE_SECONDS = 120
+JOB_TIMEOUT_GRACE_RATIO = 0.25
 
 
 class AutomationBridgeHandler(Protocol):
     async def get_automation_config(self) -> dict[str, Any]: ...
 
     async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def trigger_replyvideo(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
     async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -46,6 +51,7 @@ class ExtensionBridgeJob:
     final_prompt: str = ""
     last_heartbeat_at: float = 0.0
     claim_attempts: int = 0
+    attachments: list[dict[str, str]] = field(default_factory=list)
     future: asyncio.Future[str | bytes] = field(default_factory=asyncio.Future)
 
 
@@ -76,7 +82,12 @@ class ExtensionBridgeServer:
         await self._server.wait_closed()
         self._server = None
 
-    async def submit_text_job(self, prompt: str) -> str:
+    async def submit_text_job(
+        self,
+        prompt: str,
+        *,
+        attachments: list[ImageAttachment] | None = None,
+    ) -> str:
         await self.start()
         job = ExtensionBridgeJob(
             id=secrets.token_urlsafe(12),
@@ -84,6 +95,7 @@ class ExtensionBridgeServer:
             original_prompt=prompt,
             phase="final_pending",
             final_prompt=gemini_single_pass_prompt(prompt),
+            attachments=_attachment_payloads(attachments or []),
         )
         async with self._lock:
             self._jobs[job.id] = job
@@ -110,16 +122,62 @@ class ExtensionBridgeServer:
         return result
 
     async def _wait_for_job(self, job: ExtensionBridgeJob) -> str | bytes:
+        configured_timeout = float(self.settings.extension_bridge_timeout_seconds)
+        started_at = time.monotonic()
+        soft_deadline = started_at + configured_timeout
+        hard_deadline = soft_deadline + max(
+            JOB_TIMEOUT_MIN_GRACE_SECONDS,
+            configured_timeout * JOB_TIMEOUT_GRACE_RATIO,
+        )
         try:
-            return await asyncio.wait_for(
-                job.future,
-                timeout=self.settings.extension_bridge_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                "Extension bridge timed out waiting for Chrome. Open the extension "
-                "popup and click Run next job, or check Gemini login."
-            ) from exc
+            while True:
+                now = time.monotonic()
+                remaining = soft_deadline - now
+                if remaining > 0:
+                    try:
+                        return await asyncio.wait_for(
+                            asyncio.shield(job.future),
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+                now = time.monotonic()
+                heartbeat_is_recent = (
+                    job.last_heartbeat_at > 0
+                    and now - job.last_heartbeat_at <= JOB_LEASE_SECONDS
+                )
+                if heartbeat_is_recent and now < hard_deadline:
+                    # Chrome has claimed the job and is still alive. Give the
+                    # provider enough room to finish its own configured timeout
+                    # plus tab/composer startup, but never wait indefinitely.
+                    soft_deadline = min(
+                        hard_deadline,
+                        now + JOB_LEASE_SECONDS,
+                    )
+                    continue
+
+                elapsed = max(0, int(now - started_at))
+                if job.claim_attempts == 0:
+                    detail = (
+                        "Chrome never claimed the queued job. Check that the updated "
+                        "extension is loaded and Automation or Auto Run is ON."
+                    )
+                elif heartbeat_is_recent:
+                    detail = (
+                        "Chrome kept sending heartbeats, but Gemini did not finish before "
+                        "the bounded extended deadline. Check the Gemini tab for a stuck "
+                        "response or usage limit."
+                    )
+                else:
+                    detail = (
+                        "Chrome claimed the job, but its heartbeat stopped. The extension "
+                        "worker, Chrome tab, or browser likely stopped responding."
+                    )
+                raise RuntimeError(
+                    "Extension bridge timed out waiting for Chrome after "
+                    f"{elapsed}s. {detail}"
+                ) from asyncio.TimeoutError()
         finally:
             async with self._lock:
                 self._jobs.pop(job.id, None)
@@ -188,6 +246,11 @@ class ExtensionBridgeServer:
         if path == "/automation/triggers/replytargets" and method == "POST":
             handler = self._require_automation_handler()
             result = await handler.trigger_replytargets(_json_body(request["body"]))
+            return _json_response(202, result)
+
+        if path == "/automation/triggers/replyvideo" and method == "POST":
+            handler = self._require_automation_handler()
+            result = await handler.trigger_replyvideo(_json_body(request["body"]))
             return _json_response(202, result)
 
         if path == "/automation/triggers/tweettrend3" and method == "POST":
@@ -285,6 +348,7 @@ class ExtensionBridgeServer:
                         "provider": "gemini",
                         "final_prompt": job.final_prompt,
                         "grok_prompt": job.final_prompt,
+                        "attachments": job.attachments,
                     }
                 },
             )
@@ -395,6 +459,44 @@ def _clean_final_image_prompt(prompt: str, prefix: str, limit: int = 900) -> str
 
 def _clean_grok_image_prompt(prompt: str, prefix: str, limit: int = 900) -> str:
     return _clean_final_image_prompt(prompt, prefix, limit)
+
+
+def _attachment_payloads(
+    attachments: list[ImageAttachment],
+) -> list[dict[str, str]]:
+    if len(attachments) > 5:
+        raise RuntimeError("A Gemini text job supports at most five image attachments.")
+    payloads: list[dict[str, str]] = []
+    total_bytes = 0
+    for index, attachment in enumerate(attachments, start=1):
+        mime_type = str(attachment.mime_type or "").strip().lower()
+        if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            raise RuntimeError(f"Unsupported attachment type: {mime_type or 'empty'}.")
+        data = bytes(attachment.data)
+        if len(data) < 100 or len(data) > 1_000_000:
+            raise RuntimeError(
+                f"Attachment {index} must contain 100-1,000,000 bytes."
+            )
+        total_bytes += len(data)
+        if total_bytes > 4_000_000:
+            raise RuntimeError("Image attachments exceed the 4 MB job limit.")
+        safe_name = "".join(
+            char for char in str(attachment.name or "")
+            if char.isalnum() or char in {"-", "_", "."}
+        ).strip(".")
+        if not safe_name:
+            safe_name = f"frame-{index:02d}.jpg"
+        payloads.append(
+            {
+                "name": safe_name[:96],
+                "mime_type": mime_type,
+                "data_url": (
+                    f"data:{mime_type};base64,"
+                    f"{base64.b64encode(data).decode('ascii')}"
+                ),
+            }
+        )
+    return payloads
 
 
 def _json_body(body: bytes) -> dict[str, Any]:

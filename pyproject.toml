@@ -10,6 +10,7 @@ dependencies = [
     "python-telegram-bot>=21.8,<23",
     "twscrape>=0.19.2,<1",
     "yt-dlp[default]>=2025.1,<2027",
+    "imageio-ffmpeg>=0.5,<1",
 ]
 
 [project.optional-dependencies]

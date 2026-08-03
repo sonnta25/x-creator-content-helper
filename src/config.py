@@ -31,6 +31,8 @@ class Settings:
     reply_tracking_poll_minutes: int = 5
     reply_watch_path: str = "data/reply_watchlist.json"
     reply_target_mode: str = "balanced"
+    reply_target_batch_size: int = 3
+    reply_video_batch_size: int = 3
     creator_daily_reply_cap: int = 40
     creator_timezone: str = "Asia/Ho_Chi_Minh"
     content_language: str = "Vietnamese"
@@ -49,6 +51,12 @@ class Settings:
     telegram_approval_chat_id: int | None = None
     telegram_reply_targets_minutes: int | None = None
     telegram_reply_targets_updated_at: int | None = None
+    reply_video_min_views: int = 15_000
+    reply_video_max_age_minutes: int = 45
+    reply_video_frame_analysis: bool = True
+    reply_video_frame_count: int = 2
+    telegram_reply_video_minutes: int | None = None
+    telegram_reply_video_updated_at: int | None = None
     automation_approvals_path: str = ""
     download_max_file_mb: int = 45
     download_timeout_seconds: int = 180
@@ -122,6 +130,14 @@ class Settings:
                 "balanced",
                 {"balanced", "reach", "qualified", "relationship"},
             ),
+            reply_target_batch_size=min(
+                5,
+                max(2, _int_env("REPLY_TARGET_BATCH_SIZE", 3)),
+            ),
+            reply_video_batch_size=min(
+                5,
+                max(2, _int_env("REPLY_VIDEO_BATCH_SIZE", 3)),
+            ),
             creator_daily_reply_cap=max(
                 1, _int_env("CREATOR_DAILY_REPLY_CAP", 40)
             ),
@@ -173,6 +189,24 @@ class Settings:
             ),
             telegram_reply_targets_updated_at=_optional_int_env(
                 "TELEGRAM_REPLY_TARGETS_UPDATED_AT"
+            ),
+            reply_video_min_views=max(0, _int_env("REPLY_VIDEO_MIN_VIEWS", 15_000)),
+            reply_video_max_age_minutes=min(
+                180,
+                max(15, _int_env("REPLY_VIDEO_MAX_AGE_MINUTES", 45)),
+            ),
+            reply_video_frame_analysis=_bool_env(
+                "REPLY_VIDEO_FRAME_ANALYSIS", True
+            ),
+            reply_video_frame_count=min(
+                4,
+                max(2, _int_env("REPLY_VIDEO_FRAME_COUNT", 2)),
+            ),
+            telegram_reply_video_minutes=_optional_int_env(
+                "TELEGRAM_REPLY_VIDEO_MINUTES"
+            ),
+            telegram_reply_video_updated_at=_optional_int_env(
+                "TELEGRAM_REPLY_VIDEO_UPDATED_AT"
             ),
             automation_approvals_path=os.getenv(
                 "AUTOMATION_APPROVALS_PATH",

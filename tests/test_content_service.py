@@ -24,7 +24,7 @@ from src.content_service import (
     _tweet_engine_prompt,
 )
 from src.config import Settings
-from src.models import GeneratedContent
+from src.models import GeneratedContent, ImageAttachment
 
 
 def test_limit_x_text_keeps_complete_sentences() -> None:
@@ -445,6 +445,63 @@ def test_replytargets_prompt_does_not_force_creator_niche() -> None:
     assert "readers already participating in the source post's conversation" in service.last_prompt
 
 
+def test_replyvideo_prompt_is_grounded_and_does_not_claim_full_video_access() -> None:
+    class VideoReplyService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/video/status/1",'
+                '"target":"@video clip","reason":"Fresh and uncrowded",'
+                '"reply":"The timing is the whole story here—one beat later and the moment disappears."}]}'
+            )
+
+    service = VideoReplyService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "viral video lanes",
+            "URL: https://x.com/video/status/1\nCaption: a perfectly timed save",
+            video_mode=True,
+        )
+    )
+
+    assert "unordered samples" in service.last_prompt
+    assert "never infer motion between frames" in service.last_prompt
+    assert "usually avoid a trailing question" in service.last_prompt
+
+
+def test_replyvideo_passes_visual_attachments_to_provider() -> None:
+    class VisualReplyService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.names: list[str] = []
+
+        async def _generate_text_with_images(self, prompt, attachments):
+            self.names = [item.name for item in attachments]
+            return (
+                '{"targets":[{"url":"https://x.com/video/status/1",'
+                '"target":"@video clip","reason":"Fresh thread",'
+                '"reply":"That frame makes the scale of it obvious."}]}'
+            )
+
+    service = VisualReplyService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "viral video lanes",
+            "URL: https://x.com/video/status/1\nEvidence mode: visual_frames",
+            video_mode=True,
+            visual_attachments=[
+                ImageAttachment("candidate-1-frame-01.jpg", "image/jpeg", b"x" * 200)
+            ],
+        )
+    )
+
+    assert service.names == ["candidate-1-frame-01.jpg"]
+
+
 def test_looks_like_prompt_leak_detects_user_reported_output() -> None:
     assert _looks_like_prompt_leak(
         "You are a Twitter/X Tweet QA + Humanizer. Your input is ONE generated tweet."
@@ -671,6 +728,82 @@ def test_generate_reply_targets_repairs_an_empty_first_response() -> None:
     assert len(service.prompts) == 2
     assert "repairing an unusable reply-target response" in service.prompts[1]
     assert targets[0].url == "https://x.com/large/status/999"
+
+
+def test_generate_reply_targets_repairs_batch_with_only_one_of_two_candidates() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return (
+                    '{"targets":[{"url":"https://x.com/first/status/1",'
+                    '"target":"@first","reason":"Fast growth",'
+                    '"reply":"The second update changes how the first result reads."}]}'
+                )
+            return (
+                '{"targets":['
+                '{"url":"https://x.com/first/status/1","target":"@first",'
+                '"reason":"Fast growth","reply":"The second update changes how the first result reads."},'
+                '{"url":"https://x.com/second/status/2","target":"@second",'
+                '"reason":"Open thread","reply":"The smaller reply load leaves the useful comparison visible."}'
+                ']}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "current topics",
+            (
+                "1. URL: https://x.com/first/status/1\nPost: First update\n\n"
+                "2. URL: https://x.com/second/status/2\nPost: Second update"
+            ),
+        )
+    )
+
+    assert len(service.prompts) == 2
+    assert "exactly 2\ndistinct targets" in service.prompts[1]
+    assert [target.url for target in targets] == [
+        "https://x.com/first/status/1",
+        "https://x.com/second/status/2",
+    ]
+
+
+def test_generate_reply_targets_requires_every_selected_candidate_up_to_five() -> None:
+    class FourTargetService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":['
+                + ",".join(
+                    "{"
+                    f'\"url\":\"https://x.com/source/status/{index}\",'
+                    f'\"target\":\"@source{index}\",'
+                    f'\"reason\":\"Fresh opening {index}\",'
+                    f'\"reply\":\"Specific useful observation number {index}.\"'
+                    "}"
+                    for index in range(1, 5)
+                )
+                + "]}"
+            )
+
+    service = FourTargetService(Settings(telegram_bot_token="123:ABC"))
+    context = "\n\n".join(
+        f"{index}. URL: https://x.com/source/status/{index}\nPost: Update {index}"
+        for index in range(1, 5)
+    )
+
+    targets = asyncio.run(service.generate_reply_targets("news", context))
+
+    assert len(targets) == 4
+    assert "Return exactly 4 distinct targets" in service.last_prompt
 
 
 def test_generate_reply_targets_includes_selected_learning_strategy() -> None:

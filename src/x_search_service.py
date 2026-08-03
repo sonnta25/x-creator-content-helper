@@ -87,7 +87,7 @@ class XSearchService:
             ) as stream:
                 async for tweet in stream:
                     result = _to_search_result(tweet)
-                    if result.text:
+                    if result.text or result.has_video:
                         results.append(result)
                     if len(results) >= search_limit:
                         break
@@ -295,6 +295,35 @@ def summarize_reply_target_context(results: list[XSearchResult], max_items: int 
     return "\n\n".join(lines)
 
 
+def summarize_reply_video_context(results: list[XSearchResult], max_items: int = 3) -> str:
+    lines: list[str] = []
+    for index, result in enumerate(results[:max_items], start=1):
+        thumbnails = ", ".join(result.media_urls or []) or "not exposed"
+        descriptions = " | ".join(result.media_descriptions or []) or "not exposed"
+        frame_names = ", ".join(result.visual_frame_names or []) or "none"
+        evidence_mode = result.video_context_quality or "grounded_text"
+        lines.append(
+            f"{index}. URL: {result.url}\n"
+            f"Author: @{result.username}\n"
+            f"Language: {result.language or 'unknown'}\n"
+            f"Age: {_format_age_minutes(result)}\n"
+            f"Metrics: {result.like_count} likes, {result.retweet_count} reposts, "
+            f"{result.quote_count} quotes, {result.reply_count} replies, "
+            f"{_format_views(result)}, {result.view_velocity_score:.1f} views/min, "
+            f"{result.views_per_reply:.1f} views per competing reply, "
+            f"video opportunity {result.reply_opportunity_score:.1f}/100\n"
+            f"Caption: {_compact_text(result.text, 500)}\n"
+            f"X-provided media description: {_compact_text(descriptions, 300)}\n"
+            f"Video thumbnail URL(s): {_compact_text(thumbnails, 500)}\n"
+            f"Evidence mode: {evidence_mode}\n"
+            f"Attached representative frame filename(s): {frame_names}\n"
+            "Evidence boundary: thumbnail URLs are references only. Attached frames, when "
+            "listed, are unordered samples; they do not prove motion, timing, audio, intent, "
+            "identity, location, or the full outcome."
+        )
+    return "\n\n".join(lines)
+
+
 def summarize_trends_context(trends: list[XTrend], max_items: int = 10) -> str:
     lines: list[str] = []
     for index, trend in enumerate(trends[:max_items], start=1):
@@ -335,6 +364,8 @@ def _to_search_result(tweet: Any) -> XSearchResult:
             or getattr(user, "blue", False)
         ),
         media_urls=_media_urls(tweet),
+        has_video=_has_video(tweet),
+        media_descriptions=_media_descriptions(tweet),
         author_id=_optional_int(getattr(user, "id", None)),
         conversation_id=_optional_int(getattr(tweet, "conversationId", None)),
         in_reply_to_tweet_id=_optional_int(getattr(tweet, "inReplyToTweetId", None)),
@@ -443,6 +474,7 @@ def rank_fast_growing_posts(
     min_view_velocity_score: float = MIN_REPLY_TARGET_VIEW_VELOCITY_SCORE,
     min_view_count: int = MIN_REPLY_TARGET_VIEW_COUNT,
     min_author_followers: int = 0,
+    allow_view_only_signal: bool = False,
 ) -> list[XSearchResult]:
     now = datetime.now(timezone.utc).timestamp()
     ranked: list[XSearchResult] = []
@@ -509,7 +541,13 @@ def rank_fast_growing_posts(
         if result.view_count is not None and result.view_count < min_view_count:
             continue
         if not _has_reply_target_signal(result):
-            continue
+            has_volume_fallback_signal = (
+                allow_view_only_signal
+                and result.view_count is not None
+                and result.view_count >= min_view_count
+            )
+            if not has_volume_fallback_signal:
+                continue
         viral_score = _viral_score(
             view_velocity=view_velocity,
             engagement_velocity=velocity,
@@ -576,6 +614,106 @@ def rank_fast_growing_posts(
         reverse=True,
     )
     return _select_language_balanced(ordered, max_items=max_items)
+
+
+def rank_viral_video_posts(
+    results: list[XSearchResult],
+    *,
+    max_items: int = 12,
+    max_age_minutes: int = 45,
+    min_view_count: int = 15_000,
+    min_like_count_when_views_missing: int = 80,
+    min_view_velocity: float = 0.0,
+) -> list[XSearchResult]:
+    """Rank fresh videos for reply reach, with reply competition weighted heavily."""
+    now = datetime.now(timezone.utc).timestamp()
+    ranked: list[XSearchResult] = []
+    for result in results:
+        if not result.has_video or result.is_reply or result.is_retweet:
+            continue
+        age_minutes = _age_minutes(result, now)
+        if age_minutes is None or age_minutes > max_age_minutes:
+            continue
+        age_denominator = max(age_minutes, 1.0)
+        has_recent_window = result.momentum_observation_count >= 2
+        lifetime_view_velocity = (
+            (result.view_count or 0) / age_denominator
+            if result.view_count is not None
+            else 0.0
+        )
+        view_velocity = (
+            result.recent_view_velocity_score
+            if has_recent_window and result.view_count is not None
+            else lifetime_view_velocity
+        )
+        if result.view_count is not None:
+            if result.view_count < min_view_count:
+                continue
+        elif result.like_count < min_like_count_when_views_missing:
+            continue
+        if view_velocity < min_view_velocity:
+            continue
+
+        competing_replies = max(0, result.reply_count) + 1
+        views_per_reply = (
+            (result.view_count or 0) / competing_replies
+            if result.view_count is not None
+            else 0.0
+        )
+        recent_views_per_reply = view_velocity / competing_replies
+        like_velocity = result.like_count / age_denominator
+        velocity_component = min(
+            100.0,
+            math.log1p(view_velocity) / math.log1p(10_000) * 100,
+        )
+        # Few replies are intentionally more valuable than another increment of
+        # raw views: this component loses half its value around 20 replies.
+        availability_component = 100.0 / (1.0 + (result.reply_count / 20.0))
+        reach_value = result.view_count or (result.like_count * 80)
+        reach_component = min(
+            100.0,
+            math.log1p(reach_value) / math.log1p(1_000_000) * 100,
+        )
+        recency_component = max(
+            0.0,
+            100.0 * (1.0 - age_minutes / max_age_minutes),
+        )
+        acceleration_bonus = min(
+            12.0,
+            max(0.0, result.momentum_acceleration) * 4.0,
+        )
+        opportunity = min(
+            100.0,
+            velocity_component * 0.36
+            + availability_component * 0.34
+            + reach_component * 0.20
+            + recency_component * 0.10
+            + acceleration_bonus,
+        )
+        ranked.append(
+            replace(
+                result,
+                velocity_score=like_velocity,
+                view_velocity_score=view_velocity,
+                viral_score=(velocity_component * 0.65 + reach_component * 0.35),
+                reply_opportunity_score=opportunity,
+                thread_availability_score=availability_component,
+                reply_saturation_penalty=100.0 - availability_component,
+                views_per_reply=views_per_reply,
+                recent_views_per_reply=recent_views_per_reply,
+            )
+        )
+    return sorted(
+        ranked,
+        key=lambda item: (
+            item.reply_opportunity_score,
+            item.recent_views_per_reply,
+            item.views_per_reply,
+            item.view_velocity_score,
+            item.created_at_timestamp or 0,
+        ),
+        reverse=True,
+    )[:max_items]
 
 
 def _engagement_score(result: XSearchResult) -> float:
@@ -886,6 +1024,38 @@ def _media_urls(tweet: Any) -> list[str]:
             urls.append(url)
 
     return urls
+
+
+def _has_video(tweet: Any) -> bool:
+    media = getattr(tweet, "media", None)
+    if media is None:
+        return False
+    return bool(
+        (getattr(media, "videos", []) or [])
+        or (getattr(media, "animated", []) or [])
+    )
+
+
+def _media_descriptions(tweet: Any) -> list[str]:
+    """Keep only descriptions X/twscrape actually exposes; never infer visuals."""
+    media = getattr(tweet, "media", None)
+    if media is None:
+        return []
+    descriptions: list[str] = []
+    items = [
+        *(getattr(media, "photos", []) or []),
+        *(getattr(media, "videos", []) or []),
+        *(getattr(media, "animated", []) or []),
+    ]
+    for item in items:
+        value = str(
+            getattr(item, "altText", "")
+            or getattr(item, "accessibilityText", "")
+            or ""
+        ).strip()
+        if value and value not in descriptions:
+            descriptions.append(value)
+    return descriptions
 
 
 def normalize_account_name(account_name: str) -> str:

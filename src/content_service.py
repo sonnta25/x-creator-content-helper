@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from src.config import Settings
-from src.models import GeneratedContent, ReplyTargetDraft, TrendPostVariant
+from src.models import GeneratedContent, ImageAttachment, ReplyTargetDraft, TrendPostVariant
 from src.prompt_safety import looks_like_prompt_leak
 
 
@@ -854,7 +854,11 @@ Requirements:
         *,
         strategy: str = "specific_observation",
         strategy_by_url: dict[str, str] | None = None,
+        video_mode: bool = False,
+        visual_attachments: list[ImageAttachment] | None = None,
     ) -> list[ReplyTargetDraft]:
+        candidate_urls = _extract_reply_target_urls(x_context)
+        required_targets = max(1, min(5, len(candidate_urls)))
         strategy_instruction = _reply_strategy_instruction(strategy)
         allocation = ""
         if strategy_by_url:
@@ -866,6 +870,22 @@ Requirements:
                     for url, name in strategy_by_url.items()
                 )
             )
+        video_instruction = (
+            "These are viral-video reply targets. Optimize for a short reply that is "
+            "immediately legible below a fast-moving video: lead with a crisp reaction, "
+            "specific observation, surprising implication, or compact joke with a real point. "
+            "Caption, X-provided media description, metrics, and sometimes representative "
+            "frame attachments may be present. Use an attached frame only for the candidate "
+            "whose context lists that exact filename. Frames are unordered samples, not the "
+            "full video: never infer motion between frames, timing, audio, spoken lines, intent, "
+            "identity, location, or outcome unless another supplied field explicitly supports it. "
+            "For caption_only candidates, discuss only the caption premise. For grounded_text "
+            "candidates, use only caption/media-description claims. For visual_frames candidates, "
+            "you may add a concrete detail directly visible in its attached frames. "
+            "Prefer one or two punchy sentences and usually avoid a trailing question. "
+            if video_mode
+            else ""
+        )
         prompt = _reply_engine_prompt(
             self.settings,
             task=(
@@ -883,29 +903,46 @@ Requirements:
                 "When a precise question follows naturally, aim it at a concrete decision, "
                 "assumption, or tradeoff the "
                 "original author can actually answer; never append a generic engagement hook. "
+                f"{video_instruction}"
+                f"Return exactly {required_targets} distinct targets from the supplied candidates. "
                 f"For this batch, use this reply strategy when no per-URL strategy is assigned: "
                 f"{strategy_instruction}\n{allocation}"
             ),
             context=f"Candidate X posts:\n{x_context}",
-            output_contract=_reply_targets_output_contract(),
+            output_contract=_reply_targets_output_contract(required_targets),
             persona_context=_reply_target_persona_context(self.settings),
         )
-        raw = await self._generate_text(prompt)
-        candidate_urls = _extract_reply_target_urls(x_context)
+        raw = await self._generate_text_with_images(
+            prompt,
+            visual_attachments or [],
+        )
         try:
             targets = _parse_reply_targets(raw, allowed_urls=candidate_urls)
             _validate_value_bearing_targets(targets)
+            _validate_reply_target_count(targets, required_targets)
             return targets
         except RuntimeError as first_error:
             repair_prompt = _reply_targets_repair_prompt(
                 query=query,
                 x_context=x_context,
                 failed_output=raw,
+                required_targets=required_targets,
             )
-            repaired = await self._generate_text(repair_prompt)
+            if video_mode:
+                repair_prompt += (
+                    "\n\nVideo evidence boundary: any attached images are unordered "
+                    "representative frames, not the full motion/audio. Match frame filenames "
+                    "to the candidate context. Do not infer motion, timing, audio, spoken lines, "
+                    "identity, location, intent, or outcome beyond explicit supplied evidence."
+                )
+            repaired = await self._generate_text_with_images(
+                repair_prompt,
+                visual_attachments or [],
+            )
             try:
                 targets = _parse_reply_targets(repaired, allowed_urls=candidate_urls)
                 _validate_value_bearing_targets(targets)
+                _validate_reply_target_count(targets, required_targets)
                 return targets
             except RuntimeError as repair_error:
                 first_preview = _compact_error_text(raw, 220) if raw.strip() else "<empty>"
@@ -945,6 +982,14 @@ Requirements:
 
     async def _generate_text(self, prompt: str) -> str:
         raise NotImplementedError("ContentService requires a concrete text provider.")
+
+    async def _generate_text_with_images(
+        self,
+        prompt: str,
+        attachments: list[ImageAttachment],
+    ) -> str:
+        del attachments
+        return await self._generate_text(prompt)
 
 
 def _reply_strategy_instruction(strategy: str) -> str:
@@ -1126,12 +1171,12 @@ No quotes.
 """.strip()
 
 
-def _reply_targets_output_contract() -> str:
+def _reply_targets_output_contract(required_targets: int = 1) -> str:
     return """
 CRITICAL FORMAT RULES:
 - Return JSON only. No markdown. No prose before or after JSON.
 - The top-level object must contain a "targets" array.
-- Return at most 3 targets, choosing the strongest available candidates.
+- Return exactly REQUIRED_TARGETS distinct targets, choosing the strongest available candidates.
 - Do not return "replies", "items", "results", "options", or plain text.
 - Each target must include url, target, reason, strategy, and reply.
 - URL values must be plain https://x.com/... strings, never Markdown links.
@@ -1158,7 +1203,7 @@ Return only valid JSON with this shape:
     }
   ]
 }
-""".strip()
+""".replace("REQUIRED_TARGETS", str(required_targets)).strip()
 
 
 def _reply_targets_repair_prompt(
@@ -1166,11 +1211,13 @@ def _reply_targets_repair_prompt(
     query: str,
     x_context: str,
     failed_output: str,
+    required_targets: int = 1,
 ) -> str:
     return f"""
 You are a Twitter/X Reply Engine repairing an unusable reply-target response.
 
-Return JSON only with one top-level `targets` array. Return 1-3 targets.
+Return JSON only with one top-level `targets` array. Return exactly {required_targets}
+distinct targets.
 Each object must contain: url, target, reason, strategy, reply.
 Copy each url exactly from Candidate X posts. Never invent or omit a URL.
 Write one short, natural reply for each selected candidate. Do not return an empty array.
@@ -1221,6 +1268,18 @@ def _validate_value_bearing_targets(targets: list[ReplyTargetDraft]) -> None:
     if any(_reply_is_question_only(target.reply) for target in targets):
         raise RuntimeError(
             "AI response contained a question-only reply without a value-bearing statement."
+        )
+
+
+def _validate_reply_target_count(
+    targets: list[ReplyTargetDraft],
+    required_targets: int,
+) -> None:
+    unique_urls = {target.url for target in targets if target.url}
+    if len(unique_urls) != required_targets:
+        raise RuntimeError(
+            "AI response returned the wrong number of distinct reply targets; "
+            f"expected exactly {required_targets}, received {len(unique_urls)}."
         )
 
 

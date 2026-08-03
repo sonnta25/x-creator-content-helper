@@ -23,8 +23,11 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 - `/today [balanced|reach|qualified|relationship]`: prepare a compact daily queue with up to two reply-now cards and one original post.
 - `/setupcheck`: check the X cookie pool, tracking username, approval chat, schedule, timezone, and stale approvals without exposing secrets.
 - `/replyevery <minutes>`: configure the scheduled `/replytargets` interval from Telegram (5-1440 minutes).
+- `/videoevery <minutes>`: configure the scheduled `/replyvideo` interval from Telegram (3-1440 minutes; default 5).
+- `/replybatch show|targets <2-5>|video <2-5>`: inspect or change approval cards requested per run; persists to `.env` immediately.
 - `/replylangs [show|add|remove|set]`: manage up to six X languages and persist them to `.env`.
 - `/replytargets [query]`: scan emerging and late-breakout conversations across configured languages; first sightings are normally watched before a Gemini draft is spent.
+- `/replyvideo [topic]`: hunt fresh viral videos in global, English, Japanese, and Vietnamese lanes, then create a configurable 2-5 low-competition reply cards.
 - `/replylearn [status|on|off|rollback|username @name]`: configure automatic tracking and bounded strategy learning.
 - `/replyreport [7d|30d]`: inspect tracked post/reply outcomes and the account-level follower-window proxy.
 - `/importcookie [account_name] <auth_token=...; ct0=...>`: import an X cookie for search.
@@ -38,8 +41,8 @@ The bot registers these commands with Telegram on startup.
 ### Two-step command input
 
 Commands that need input no longer run immediately when selected from Telegram's
-command menu. Select `/download`, `/tweet`, `/tweetx`, `/retweet`, `/replytargets`,
-`/reply`, `/persona`, `/importcookie`, `/xremove`, or `/replyevery`, and the bot
+command menu. Select `/download`, `/tweet`, `/tweetx`, `/retweet`, `/replytargets`, `/replyvideo`,
+`/reply`, `/persona`, `/importcookie`, `/xremove`, `/replyevery`, `/videoevery`, or `/replybatch`, and the bot
 opens a reply field with a short prompt. Send the requested value as the next
 message to run the command.
 
@@ -118,7 +121,7 @@ Manage languages without editing the VPS manually:
 /replylangs set en ja ko id
 ```
 
-The bot validates X language codes, keeps at least one and at most six, writes the result to `.env`, applies it immediately to `/replytargets` and `/today`, and syncs it to scheduled Chrome scans within about 30 seconds.
+The bot validates X language codes, keeps at least one and at most six, writes the result to `.env`, applies it immediately to `/replytargets` and `/today`, and syncs it to scheduled Chrome scans within about 60 seconds in low-resource mode.
 
 `/tweettrend3` auto mode searches current Google News topics using `CREATOR_NICHE` first, then falls back to broader X/Google/RSS trends. `CONTENT_LANGUAGE` controls final post language; `TREND_LANGUAGE` and `GOOGLE_TRENDS_GEO` control built-in Google News feeds. Image prompts remain English so Gemini image generation is more reliable.
 
@@ -126,7 +129,7 @@ The bot validates X language codes, keeps at least one and at most six, writes t
 
 With extension **Auto Run** OFF, click **Run next job** for the queued batch; with **Auto Run** ON, the extension picks it up automatically on its polling interval.
 
-Extension `0.5.1` waits for Gemini's composer to be visible before inserting a prompt. It inserts the full prompt atomically, verifies at least 98% of the normalized text is present, and automatically retries with a DOM-safe fallback if Gemini replaces its editor node. If a Gemini job fails, it reports the failure to the bot before recycling the provider tab. Recycling opens a new Gemini tab, waits until its composer is ready, and only then closes the old Gemini tabs; if the replacement fails, the old tab is preserved. Auto Run alarms are verified whenever the service worker starts and by a one-minute watchdog. Scheduled windows and fixed times use `CREATOR_TIMEZONE` instead of the VPS locale. The open Gemini tab also wakes the worker every 25 seconds, so Auto Run keeps polling even if Chrome loses all extension alarms. Claimed jobs send a heartbeat; if Chrome or the worker dies, the bridge returns the abandoned job to the queue after 75 seconds.
+Extension `0.8.1` waits for Gemini's composer to be visible before inserting a prompt. It can also upload bounded representative video frames before submitting `/replyvideo`, including Gemini layouts that require opening the attachment menu and then choosing the separate Upload files action. Low-resource mode is enabled by default: idle job and schedule checks run at most once per minute, the watchdog runs every two minutes, the managed-tab recovery heartbeat runs every 60 seconds, claimed-job heartbeats run every 20 seconds, and Gemini response DOM checks back off to four seconds until output appears. Alarm repair no longer performs an extra job poll or schedule scan. The prompt is inserted atomically and verified before submission. Provider failures recycle only the bot-managed Gemini tab, and the bridge retains bounded heartbeat-based timeout recovery.
 
 Trend commands scan X trends, Google Trends RSS, localized Google News RSS feeds, and any custom RSS feeds from `TREND_RSS_URLS` concurrently. Cross-source confirmation and publication recency improve ranking. When X search is configured, selected topics are enriched with recent X context concurrently. `/replytargets` runs on its own scan interval but uses the independent `REPLY_TARGET_MAX_AGE_MINUTES` lookback. Repeated scans persist metric snapshots so ranking can use recent deltas and acceleration rather than lifetime averages alone.
 
@@ -194,7 +197,14 @@ REPLY_TARGET_LANGUAGES=en,ja
 REPLY_TARGET_MODE=balanced
 REPLY_WATCH_PATH=data/reply_watchlist.json
 CREATOR_DAILY_REPLY_CAP=40
+REPLY_TARGET_BATCH_SIZE=3
+REPLY_VIDEO_BATCH_SIZE=3
 REPLY_TARGET_METRICS_PATH=data/reply_target_metrics.json
+REPLY_VIDEO_MIN_VIEWS=15000
+REPLY_VIDEO_MAX_AGE_MINUTES=45
+REPLY_VIDEO_FRAME_ANALYSIS=true
+REPLY_VIDEO_FRAME_COUNT=2
+TELEGRAM_REPLY_VIDEO_MINUTES=5
 REPLY_LEARNING_ENABLED=true
 REPLY_LEARNING_PATH=data/reply_learning.json
 REPLY_TRACKING_POLL_MINUTES=5
@@ -229,33 +239,17 @@ Use this when you have Gemini web access but no API keys.
    - Token: same value as `EXTENSION_BRIDGE_TOKEN`
    - Auto Run: ON if you want jobs to run automatically
 
-When Auto Run is OFF, click **Run next job** after sending a Telegram command. When Auto Run is ON, Chrome checks for pending jobs about every 30 seconds while Chrome is open. A watchdog recreates a missing alarm and the open Gemini tab sends a lightweight runtime heartbeat every 25 seconds, so restarting Chrome Lite or its extension worker does not silently leave jobs queued.
+When Auto Run is OFF, click **Run next job** after sending a Telegram command. When Auto Run is ON, low-resource mode checks pending jobs about every 60 seconds while Chrome is open. The popup can disable low-resource mode when faster 30-second pickup matters more than VPS load. A two-minute watchdog recreates missing alarms and the open Gemini tab sends a lightweight recovery heartbeat every 60 seconds.
 
-Gemini prompts are compacted at the bot layer, then entered into one composer in 1,200-character chunks and submitted once. Each job starts a clean conversation in the same warm tab. After 10 completed Gemini jobs, the extension opens a fresh Gemini tab, waits for its composer, and then closes the old Gemini tabs to release their DOM/JavaScript heap. Provider timeouts and DOM failures trigger the same recycle immediately. Response DOM checks run every 2.5 seconds, and volatile status plus the recycle counter are kept in memory-backed session storage instead of being written repeatedly to the Chrome profile.
+Gemini prompts are compacted at the bot layer and submitted once. Each job starts a clean conversation in the same warm tab. After 10 completed Gemini jobs, the extension opens a fresh Gemini tab, waits for its composer, and then closes the old Gemini tabs to release their DOM/JavaScript heap. Provider timeouts and DOM failures trigger the same recycle immediately. Response DOM checks use a four-second idle interval and shorten only after output appears; volatile status and the recycle counter stay in memory-backed session storage.
 
-### 2 GB RAM VPS mode
+### Normal Chrome on a low-spec VPS
 
-For a 2-core / 2 GB Windows VPS, run Chrome with the included low-memory profile instead of your normal Chrome profile:
+The project supports your normal signed-in Chrome directly and contains no alternate browser-profile launcher, CPU-affinity tool, or browser watchdog. Run Chrome under the same Windows account as the bot. Keep **Low-resource mode** ON and **Poll seconds** at 60 in the popup.
 
-```powershell
-.\scripts\windows\start-chrome-lite.ps1
-```
+The extension tracks one managed Gemini tab in session storage. If exactly one Gemini tab already exists, it reuses it. If several Gemini tabs are open, it creates one dedicated automation tab and leaves the others untouched. Heartbeat injection, conversation reset, and ten-job recycling apply only to that managed tab; the extension never bulk-closes user-owned Gemini tabs.
 
-It uses a separate profile, loads only this extension, disables GPU/background services, limits Chrome to two renderer processes, and caps disk cache at 16 MB (media cache 1 MB). Gemini stays in one warm tab, starts a clean conversation for every job, and hard-recycles the page every 10 jobs. On a 2-core VPS it also pins Chrome to one logical CPU at BelowNormal priority, so Chrome cannot saturate both cores. The bot runner no longer starts Ollama or any unused model service. A background watchdog checks every 30 seconds, reapplies the CPU limit, and relaunches this profile if Chrome exits. Sign in to Gemini once in that profile. Do not use headless mode: this bridge needs the visible Gemini web UI. Stop only this Chrome instance and its watchdog with:
-
-```powershell
-.\scripts\windows\stop-chrome-lite.ps1
-```
-
-If the VPS still kills Chrome, 2 GB is below a comfortable operating margin for Gemini's web UI; increase the Windows page file or move to 4 GB RAM for reliable scheduled runs.
-
-If Chrome disappears without an obvious Task Manager spike, run this on the VPS after it happens:
-
-```powershell
-.\scripts\windows\diagnose-chrome-lite.ps1
-```
-
-It writes a timestamped report under `logs/` with watchdog restart times, current Chrome processes, Windows resource-exhaustion events, Chrome crash/hang reports, Defender events, and Chrome Crashpad files. Run it with `-Hours 48` to inspect a longer period. If the watchdog shows a restart but Windows has no crash, resource, or Defender event, the VPS host/provider or another external policy is the likely source.
+For a small VPS, close unrelated tabs and Chrome windows, remove unused extensions, and keep only one normal Chrome process/profile running for this bot. Increase the Windows page file if the machine has 2 GB RAM. `DOWNLOAD_COOKIES_FROM_BROWSER=chrome` reads the normal Chrome profile; set `DOWNLOAD_BROWSER_PROFILE=Default` or the profile name shown by `chrome://version`. Chrome and the bot must run under the same Windows user.
 
 ### Scheduled Telegram approvals
 
@@ -270,23 +264,34 @@ The extension can schedule content generation while keeping the final X action m
    - **/replytargets maximum post age**: independent lookback; the default is 360 minutes.
    - **/replytargets languages**: comma-separated X language codes; the default is `en,ja`.
    - **/replytargets query**: optional; leave blank for automatic topic selection.
+   - **/replyvideo scan interval**: independent viral-video scan; minimum 3 and default 5 minutes.
+   - **/replyvideo topic**: optional; blank scans global/English/Japanese/Vietnamese video lanes.
+   - **/replyvideo active windows**: defaults to `08:00-11:00,12:00-14:00,19:00-22:00` in the creator timezone.
    - **/tweettrend3 fixed times**: comma-separated local times, for example `09:00, 13:30, 18:00`.
    - **/tweettrend3 category**: `auto`, `trending`, `news`, `sport`, or `entertainment`.
 4. Turn **Automation** ON and keep Chrome, the Telegram bot, and the Gemini/X login sessions running.
 
-You can also change **/replytargets every** from the private Telegram approval chat with `/replyevery 30`. Every command writes a schedule revision, even when the numeric value did not change. The extension picks it up within about 30 seconds and resets the next run from that moment. The popup shows both **Last trigger** and **Next run**.
+You can also change schedules from the private Telegram approval chat with `/replyevery 30` and `/videoevery 5`. Set per-run output with `/replybatch targets 3` and `/replybatch video 3`; `/replybatch show` displays both current values. Batch sizes are limited to 2-5, saved to `.env`, and applied immediately to manual and scheduled runs without restarting the bot. Every schedule command writes a schedule revision, even when the numeric value did not change. Low-resource mode picks it up within about 60 seconds and resets the next run from that moment. The popup shows both **Last trigger** and **Next run**.
 
 For both manual commands and scheduled runs, Telegram sends approval cards. Reply cards add **Alternative** and **Shorter**; post cards add **Generate visual** when an image prompt exists. Only the Telegram user who requested a manual draft can approve it.
 
 `/replytargets` cards show the target link, visible metrics, selected strategy, why-now reason, and copy-ready reply. Auto discovery uses the authenticated account's current X trends plus localized broad queries. When Japanese is enabled, one protected discovery lane covers hot Japanese conversations in economics, current affairs, sports, anime/games, and technology/AI, so personalized trends cannot consume the whole six-query budget. `balanced` and `qualified` modes also add a creator-niche lane; `reach` prioritizes distribution; `relationship` favors authors who have responded before. The trends timeline can reflect the logged-in account's locale/personalization and is not claimed to be a global chart. Search applies language filters but no country filter because most X posts do not carry reliable place metadata.
 
-Up to six topic/language queries run three at a time. Every query searches `Top` and `Latest` concurrently, with at most eight results from each product. `Top` supplies confirmed distribution while `Latest` supplies earlier breakout candidates. `-is:reply -is:retweet` is added at search time, and parsed results are checked again; original and quote posts remain eligible. An explicit `/replytargets <topic>` stays inside that topic but expands it across configured languages unless the user supplies a `lang:` operator.
+Up to six topic/language queries run as serialized search lanes so a small cookie pool is not exhausted by concurrent `SearchTimeline` leases. Every query still searches both `Top` and `Latest`, sequentially, with at most eight results from each product. `Top` supplies confirmed distribution while `Latest` supplies earlier breakout candidates. `-is:reply -is:retweet` is added at search time, and parsed results are checked again; original and quote posts remain eligible. An explicit `/replytargets <topic>` stays inside that topic but expands it across configured languages unless the user supplies a `lang:` operator.
 
 The first time a normal candidate is seen, it is persisted in `data/reply_watchlist.json` rather than immediately spending a Gemini job. Each later auto scan actively re-fetches up to six persisted `watching` or undrafted `ready` tweets by ID, so confirmation no longer depends on a tweet appearing in Top/Latest search again. Watch rows expire when they exceed the configured reply-target lookback. An exceptional first observation can enter reply-now immediately. Japanese candidates that already pass discovery quality checks use slightly earlier first-observation thresholds, helping the bot enter fast-moving local conversations before the thread fills up. Metric snapshots in `data/reply_target_metrics.json` use view, weighted-engagement, direct-reply, and reply/quote deltas plus acceleration. This avoids treating a fixed 15-minute window as a final viral verdict and still catches two-to-six-hour breakouts.
 
 Viral confidence and reply opportunity are separate. Reply activity remains a capped viral signal, but crowded threads are penalized. The bot samples visible replies for top-reply likes and whether the root author participates, then combines that context with recent views per reply, total reply load, new-reply pressure, audience fit, and prior author-response rate. A dominant top reply lowers opportunity because a new reply is less likely to surface.
 
 This design favors a post that is still gaining distribution while its root reply section remains open, including two-to-six-hour late breakouts. The 500-view minimum remains a hard floor whenever X exposes view count. The configured 50,000-follower value is a small capped reach bonus rather than a hard gate. Replies match the source language and must first add one source-grounded observation, implication, comparison, caveat, or reason. A precise question may follow, but question-only replies are automatically rewritten once and rejected if they still fail. Japanese replies prefer a concrete first sentence plus an optional precise question, rather than polite-only endings such as `気になります` or `どう思いますか`. Generic agreement, recap, unsupported context, generic engagement questions, and forced sarcasm are rejected.
+
+Reply-target generation uses a minimum batch size of two and requests the configured `REPLY_TARGET_BATCH_SIZE` (default 3, range 2-5) when enough candidates and daily capacity are available. When fewer than two candidates are fully confirmed, the bot first fills from the strongest first-observation candidates. If the standard pool still contains fewer than two posts, it re-ranks the already fetched pool with relaxed momentum requirements, then a volume fallback view floor of the configured minimum divided by four (normally no lower than 100 views), and finally a minimum-batch tier that accepts any still-fresh root post with a visible view signal. Freshness, original-post-only, active-approval, language, and deduplication checks remain active. Gemini must return exactly one draft for every candidate supplied in the selected batch, up to five. If X truly returns fewer than two real eligible posts or the remaining daily capacity contains only one slot, the bot waits instead of inventing a target or spending a Gemini job on a one-reply batch. Search-lane failures are reported as X cookie/rate-limit/network failures rather than as an empty market, and Telegram status identifies the fallback tier used.
+
+`/replyvideo` is a separate fast lane. Each scan searches `filter:videos` in global, English, Japanese, and Vietnamese lanes using `Top` and `Latest`. It requests `REPLY_VIDEO_BATCH_SIZE` candidates (default 3, range 2-5), while preserving a global-first mix with Vietnamese candidates when available. Strict selection uses `REPLY_VIDEO_MAX_AGE_MINUTES=45`, `REPLY_VIDEO_MIN_VIEWS=15000`, and at least 300 lifetime/recent views per minute. If fewer than two distinct videos remain, a warm tier keeps the 45-minute window with a lower view floor; a final fill tier can expand to 90 minutes and 500 views. It never invents a second target. Reply competition receives 34% of the opportunity score, so a slightly smaller video with five replies can outrank a larger video with hundreds of replies.
+
+Before generation, the bot classifies evidence as `grounded_text`, `caption_only`, or `visual_required`. Emoji-only captions, generic phrases such as `watch this`, X attachment boilerplate, URLs, and very short/repetitive descriptions do not count as reliable context and are removed from the model context. `caption_only` replies are forbidden from claiming visual details. A `visual_required` candidate is downloaded with the existing authenticated yt-dlp path, sampled at up to four positions around 8%, 34%, 66%, and 92% of its duration using the bundled `imageio-ffmpeg` binary, and uploaded to Gemini before the prompt. The five-image job limit reserves enough capacity to analyze at least two captionless candidates when necessary. If download, extraction, or Gemini attachment confirmation fails, that candidate is skipped rather than guessed.
+
+Representative frames improve grounding but are not full temporal or audio analysis. The prompt maps exact frame filenames to each candidate and allows only details directly visible in those frames. It forbids inferences about motion between frames, timing, audio, spoken lines, identity, location, intent, or final outcome unless caption/media text explicitly supports them. Low-resource mode defaults to two 720px frames per visual candidate, with a 600 KB limit per frame; the hard job ceiling remains five images and 4 MB. Set `REPLY_VIDEO_FRAME_COUNT=3..4` only when the VPS has enough memory, or use `REPLY_VIDEO_FRAME_ANALYSIS=false` to disable downloads entirely.
 
 ### Automatic reply tracking and learning
 
@@ -482,6 +487,6 @@ sudo journalctl -u x-content-bot -n 100 --no-pager
 
 - `Missing required environment variable: TELEGRAM_BOT_TOKEN`: edit `.env` in the project root.
 - `Could not connect to the local Chrome extension bridge`: start the bot, open Chrome, confirm the extension Bridge URL/token match `.env`.
-- `Extension bridge timed out`: verify extension `0.3.9` or newer is loaded and Auto Run is ON. The Gemini-tab heartbeat should wake Auto Run within 25 seconds, while the runtime watchdog recreates missing alarms; **Run next job** remains available for an immediate check.
+- `Extension bridge timed out`: verify extension `0.8.1` or newer is loaded and Automation or Auto Run is ON. The error distinguishes a job Chrome never claimed, a claimed job whose heartbeat stopped, and a live Gemini response that exceeded the bounded extended deadline. Low-resource recovery can take up to about 60 seconds; **Run next job** remains available for an immediate check.
 - `Missing image data`: reload the extension, keep the Gemini tab visible, and confirm Gemini generated an image in an `<img>` tag.
 - `No Google/RSS/X trend context found`: check internet access, RSS feed URLs, X cookies, or try a specific category like `/tweettrend3 news`.

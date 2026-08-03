@@ -29,6 +29,13 @@ class ReplyTargetDraft:
 
 
 @dataclass(frozen=True)
+class ImageAttachment:
+    name: str
+    mime_type: str
+    data: bytes
+
+
+@dataclass(frozen=True)
 class XSearchResult:
     id: int
     username: str
@@ -67,6 +74,10 @@ class XSearchResult:
     momentum_acceleration: float = 0.0
     momentum_observation_count: int = 0
     media_urls: list[str] | None = None
+    has_video: bool = False
+    media_descriptions: list[str] | None = None
+    video_context_quality: str = ""
+    visual_frame_names: list[str] | None = None
     author_id: int | None = None
     conversation_id: int | None = None
     in_reply_to_tweet_id: int | None = None

@@ -3,7 +3,8 @@ const DEFAULTS = {
   token: "local-bridge-change-me",
   timeoutSeconds: 360,
   autoRun: false,
-  pollSeconds: 30,
+  pollSeconds: 60,
+  lowResourceMode: true,
   automationEnabled: false,
   activeStart: "08:00",
   activeEnd: "22:00",
@@ -12,11 +13,17 @@ const DEFAULTS = {
   replyTargetsMaxAgeMinutes: 360,
   replyTargetsLanguages: "en,ja",
   replyTargetsQuery: "",
+  replyVideoMinutes: 5,
+  replyVideoQuery: "",
+  replyVideoWindows: "08:00-11:00,12:00-14:00,19:00-22:00",
   trendTimes: "09:00,18:00",
   trendCategory: "auto",
   nextReplyTargetsAt: 0,
   lastReplyTargetsTriggeredAt: 0,
   replyTargetsConfigUpdatedAt: 0,
+  nextReplyVideoAt: 0,
+  lastReplyVideoTriggeredAt: 0,
+  replyVideoConfigUpdatedAt: 0,
   lastStatus: "Ready."
 };
 
@@ -26,6 +33,7 @@ const els = {
   token: document.getElementById("token"),
   timeoutSeconds: document.getElementById("timeoutSeconds"),
   pollSeconds: document.getElementById("pollSeconds"),
+  lowResourceMode: document.getElementById("lowResourceMode"),
   autoRun: document.getElementById("autoRun"),
   automationEnabled: document.getElementById("automationEnabled"),
   activeStart: document.getElementById("activeStart"),
@@ -36,6 +44,10 @@ const els = {
   replyTargetsLanguages: document.getElementById("replyTargetsLanguages"),
   replyTargetsQuery: document.getElementById("replyTargetsQuery"),
   replyScheduleStatus: document.getElementById("replyScheduleStatus"),
+  replyVideoMinutes: document.getElementById("replyVideoMinutes"),
+  replyVideoQuery: document.getElementById("replyVideoQuery"),
+  replyVideoWindows: document.getElementById("replyVideoWindows"),
+  replyVideoScheduleStatus: document.getElementById("replyVideoScheduleStatus"),
   trendTimes: document.getElementById("trendTimes"),
   trendCategory: document.getElementById("trendCategory"),
   save: document.getElementById("save"),
@@ -62,6 +74,17 @@ els.autoRun.addEventListener("click", async () => {
   await saveConfig(currentConfig);
   renderConfig(currentConfig);
   setStatus(currentConfig.autoRun ? "Auto Run is ON." : "Auto Run is OFF.");
+});
+
+els.lowResourceMode.addEventListener("click", async () => {
+  currentConfig = readConfigFromForm();
+  currentConfig.lowResourceMode = !currentConfig.lowResourceMode;
+  if (currentConfig.lowResourceMode && currentConfig.pollSeconds < 60) {
+    currentConfig.pollSeconds = 60;
+  }
+  await saveConfig(currentConfig);
+  renderConfig(currentConfig);
+  setStatus(currentConfig.lowResourceMode ? "Low-resource mode is ON." : "Low-resource mode is OFF.");
 });
 
 els.automationEnabled.addEventListener("click", async () => {
@@ -110,12 +133,21 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (changes.lastStatus) {
     setStatus(changes.lastStatus.newValue || "");
   }
-  if (areaName === "local" && (changes.nextReplyTargetsAt || changes.lastReplyTargetsTriggeredAt)) {
+  if (areaName === "local" && (
+    changes.nextReplyTargetsAt || changes.lastReplyTargetsTriggeredAt ||
+    changes.nextReplyVideoAt || changes.lastReplyVideoTriggeredAt
+  )) {
     if (changes.nextReplyTargetsAt) {
       currentConfig.nextReplyTargetsAt = Number(changes.nextReplyTargetsAt.newValue || 0);
     }
     if (changes.lastReplyTargetsTriggeredAt) {
       currentConfig.lastReplyTargetsTriggeredAt = Number(changes.lastReplyTargetsTriggeredAt.newValue || 0);
+    }
+    if (changes.nextReplyVideoAt) {
+      currentConfig.nextReplyVideoAt = Number(changes.nextReplyVideoAt.newValue || 0);
+    }
+    if (changes.lastReplyVideoTriggeredAt) {
+      currentConfig.lastReplyVideoTriggeredAt = Number(changes.lastReplyVideoTriggeredAt.newValue || 0);
     }
     renderReplyScheduleStatus(currentConfig);
   }
@@ -152,6 +184,9 @@ function renderConfig(config) {
   els.token.value = config.token;
   els.timeoutSeconds.value = String(config.timeoutSeconds);
   els.pollSeconds.value = String(config.pollSeconds);
+  els.lowResourceMode.textContent = config.lowResourceMode ? "ON" : "OFF";
+  els.lowResourceMode.classList.toggle("is-on", config.lowResourceMode);
+  els.lowResourceMode.setAttribute("aria-pressed", config.lowResourceMode ? "true" : "false");
   els.activeStart.value = config.activeStart;
   els.activeEnd.value = config.activeEnd;
   els.creatorTimezone.value = config.creatorTimezone;
@@ -159,6 +194,9 @@ function renderConfig(config) {
   els.replyTargetsMaxAgeMinutes.value = String(config.replyTargetsMaxAgeMinutes);
   els.replyTargetsLanguages.value = config.replyTargetsLanguages;
   els.replyTargetsQuery.value = config.replyTargetsQuery;
+  els.replyVideoMinutes.value = String(config.replyVideoMinutes);
+  els.replyVideoQuery.value = config.replyVideoQuery;
+  els.replyVideoWindows.value = config.replyVideoWindows;
   els.trendTimes.value = config.trendTimes;
   els.trendCategory.value = config.trendCategory;
   els.autoRun.textContent = config.autoRun ? "ON" : "OFF";
@@ -177,6 +215,9 @@ function renderReplyScheduleStatus(config) {
   els.replyScheduleStatus.textContent = config.automationEnabled
     ? `Last trigger: ${format(config.lastReplyTargetsTriggeredAt)} · Next run: ${format(config.nextReplyTargetsAt)}`
     : "Automation is OFF; /replytargets will not run on a schedule.";
+  els.replyVideoScheduleStatus.textContent = config.automationEnabled
+    ? `Last trigger: ${format(config.lastReplyVideoTriggeredAt)} Â· Next run: ${format(config.nextReplyVideoAt)}`
+    : "Automation is OFF; /replyvideo will not run on a schedule.";
 }
 
 function readConfigFromForm() {
@@ -184,7 +225,11 @@ function readConfigFromForm() {
     bridgeUrl: els.bridgeUrl.value.trim().replace(/\/$/, "") || DEFAULTS.bridgeUrl,
     token: els.token.value.trim() || DEFAULTS.token,
     timeoutSeconds: Math.max(30, Number(els.timeoutSeconds.value || DEFAULTS.timeoutSeconds)),
-    pollSeconds: Math.max(30, Number(els.pollSeconds.value || DEFAULTS.pollSeconds)),
+    pollSeconds: Math.max(
+      currentConfig.lowResourceMode ? 60 : 30,
+      Number(els.pollSeconds.value || DEFAULTS.pollSeconds)
+    ),
+    lowResourceMode: Boolean(currentConfig.lowResourceMode),
     autoRun: Boolean(currentConfig.autoRun),
     automationEnabled: Boolean(currentConfig.automationEnabled),
     activeStart: els.activeStart.value || DEFAULTS.activeStart,
@@ -199,11 +244,17 @@ function readConfigFromForm() {
     )),
     replyTargetsLanguages: els.replyTargetsLanguages.value.trim() || DEFAULTS.replyTargetsLanguages,
     replyTargetsQuery: els.replyTargetsQuery.value.trim(),
+    replyVideoMinutes: Math.max(3, Number(els.replyVideoMinutes.value || DEFAULTS.replyVideoMinutes)),
+    replyVideoQuery: els.replyVideoQuery.value.trim(),
+    replyVideoWindows: els.replyVideoWindows.value.trim() || DEFAULTS.replyVideoWindows,
     trendTimes: els.trendTimes.value.trim() || DEFAULTS.trendTimes,
     trendCategory: els.trendCategory.value || DEFAULTS.trendCategory,
     nextReplyTargetsAt: Number(currentConfig.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(currentConfig.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(currentConfig.replyTargetsConfigUpdatedAt || 0),
+    nextReplyVideoAt: Number(currentConfig.nextReplyVideoAt || 0),
+    lastReplyVideoTriggeredAt: Number(currentConfig.lastReplyVideoTriggeredAt || 0),
+    replyVideoConfigUpdatedAt: Number(currentConfig.replyVideoConfigUpdatedAt || 0),
     trendRunKeys: Array.isArray(currentConfig.trendRunKeys) ? currentConfig.trendRunKeys : []
   };
 }

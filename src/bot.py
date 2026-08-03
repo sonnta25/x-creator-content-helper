@@ -7,7 +7,6 @@ import re
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from io import BytesIO
 from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -41,23 +40,15 @@ from src.media_download_service import (
     MediaDownloadError,
     MediaDownloadService,
 )
-from src.models import (
-    GeneratedContent,
-    ImageAttachment,
-    ReplyTargetDraft,
-    TrendPostVariant,
-    XSearchResult,
-)
+from src.models import ImageAttachment, ReplyTargetDraft, XSearchResult
 from src.reply_target_metrics import ReplyTargetMetricStore
 from src.reply_learning import (
-    CHECKPOINT_MINUTES,
     MIN_FEEDBACK_SAMPLES_TO_TUNE,
     MIN_FINAL_SAMPLES_TO_TUNE,
     STRATEGIES,
     ReplyLearningStore,
     match_posted_content,
 )
-from src.trend_source_service import TrendSourceService, summarize_trend_signals
 from src.video_frame_service import VideoFrameExtractor
 from src.x_search_service import (
     MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
@@ -65,24 +56,19 @@ from src.x_search_service import (
     MIN_REPLY_TARGET_VIEW_VELOCITY_SCORE,
     MAX_REPLY_TARGET_LANGUAGES,
     SUPPORTED_REPLY_TARGET_LANGUAGES,
-    TREND_FALLBACK_QUERIES,
     XSearchService,
-    default_english_query,
     extract_tweet_id,
-    format_x_results,
     parse_reply_target_languages,
     query_for_language,
     rank_fast_growing_posts,
     rank_viral_video_posts,
     summarize_reply_target_context,
     summarize_reply_video_context,
-    summarize_x_context,
 )
 
 
 LOGGER = logging.getLogger(__name__)
 
-AUTO_TREND_CATEGORIES = ("trending", "news", "entertainment", "sport")
 AUTO_REPLY_TARGET_FALLBACK_QUERIES = (
     '(breaking news OR politics OR business OR sports OR entertainment OR '
     'technology OR "internet culture" OR crypto OR AI)',
@@ -116,8 +102,6 @@ REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
 REPLY_TARGET_REFRESH_TIMEOUT_SECONDS = 12
 REPLY_TARGET_REFRESH_LIMIT = 6
-TREND_CONTEXT_SIGNAL_ITEMS = 3
-TREND_CONTEXT_X_ITEMS = 4
 COMMAND_INPUT_TIMEOUT_SECONDS = 5 * 60
 COMMAND_INPUT_PROMPTS = {
     "download": (
@@ -250,24 +234,6 @@ MENU_ACTIONS: dict[str, tuple[str, str]] = {
 MENU_BUTTON_PATTERN = re.compile(
     "^(?:" + "|".join(re.escape(label) for label in MENU_ACTIONS) + ")$"
 )
-TWEETTREND_LANGUAGE_ALIASES = {
-    "en": "English",
-    "eng": "English",
-    "english": "English",
-    "vi": "Vietnamese",
-    "vn": "Vietnamese",
-    "vietnamese": "Vietnamese",
-    "tiengviet": "Vietnamese",
-    "tieng-viet": "Vietnamese",
-    "tieng_viet": "Vietnamese",
-}
-
-
-class _SilentStatus:
-    async def edit_text(self, _text: str) -> None:
-        return None
-
-
 @dataclass(frozen=True)
 class _PendingCommandInput:
     command: str
@@ -303,7 +269,6 @@ class ContentBot:
         self.settings = settings
         self.ai = create_ai_service(settings)
         self.x_search = XSearchService(settings)
-        self.trend_sources = TrendSourceService(settings, self.x_search)
         self.media_downloader = MediaDownloadService(settings)
         self.video_frame_extractor = VideoFrameExtractor()
         self._download_semaphore = asyncio.Semaphore(1)
@@ -348,7 +313,6 @@ class ContentBot:
             bridge = getattr(self.ai, "bridge", None)
             if bridge is not None:
                 await bridge.stop()
-            await self.trend_sources.aclose()
             self._application = None
 
         app = (
@@ -583,32 +547,6 @@ class ContentBot:
         finally:
             if media is not None:
                 await asyncio.to_thread(media.cleanup)
-
-    async def automationhere(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        del context
-        chat = update.effective_chat
-        message = update.effective_message
-        if chat is None or message is None:
-            return
-        if chat.type != "private":
-            await message.reply_text(
-                "For approval security, use /automationhere in a private chat with this bot."
-            )
-            return
-        self.approval_chat_id = int(chat.id)
-        self.settings = replace(
-            self.settings,
-            telegram_approval_chat_id=self.approval_chat_id,
-        )
-        update_env_value("TELEGRAM_APPROVAL_CHAT_ID", str(self.approval_chat_id))
-        await message.reply_text(
-            "Automation approvals will be sent to this chat.\n"
-            "Use /replyevery for /replytargets and /videoevery for /replyvideo."
-        )
 
     async def replyevery(
         self,
@@ -1007,123 +945,6 @@ class ContentBot:
             + (f"\n\nAccount check error: {account_error}" if account_error else "")
         )
 
-    async def today(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        message = update.effective_message
-        mode = (
-            context.args[0].strip().lower()
-            if context.args
-            else self.settings.reply_target_mode
-        )
-        if mode not in {"balanced", "reach", "qualified", "relationship"}:
-            await message.reply_text(
-                "Usage: /today [balanced|reach|qualified|relationship]"
-            )
-            return
-        status = await message.reply_text(
-            f"Building today's creator queue in {mode} mode..."
-        )
-        try:
-            max_age = self.settings.reply_target_max_age_minutes
-            languages = parse_reply_target_languages(
-                self.settings.reply_target_languages
-            )
-            search_query, results, selection_note = await self._get_reply_target_context(
-                "",
-                status,
-                max_age_minutes=max_age,
-                languages=languages,
-                mode=mode,
-            )
-            ready, watching = self.reply_watch.classify(results)
-            watching_total = len(
-                self.reply_watch.candidates_for_refresh(
-                    limit=1_000,
-                    languages=languages,
-                    max_age_minutes=max_age,
-                )
-            )
-            remaining_cap = max(
-                0,
-                self.settings.creator_daily_reply_cap
-                - _reply_approvals_created_today(
-                    self.approvals.items(),
-                    timezone_name=self.settings.creator_timezone,
-                ),
-            )
-            reply_batch, promoted_count = _select_reply_draft_batch(
-                ready,
-                watching,
-                capacity=remaining_cap,
-                max_items=2,
-            )
-            await status.edit_text(
-                "Today's queue\n"
-                f"Reply batch: {len(reply_batch)} "
-                f"({promoted_count} early qualified)\n"
-                f"Watching now/total: {len(watching)}/{watching_total}\n"
-                f"Daily reply capacity remaining: {remaining_cap}\n"
-                f"Selection: {selection_note.strip() or 'standard thresholds'}\n"
-                "Preparing one original post and any reply-now drafts..."
-            )
-            approver_user_id = (
-                update.effective_user.id
-                if update.effective_user is not None
-                else message.chat.id
-            )
-            sent_replies = await self._create_reply_approvals(
-                reply_batch,
-                query=search_query,
-                chat_id=message.chat.id,
-                approver_user_id=approver_user_id,
-            )
-
-            contexts = await self._get_trend_contexts_for_tweettrend3(
-                "auto",
-                status,
-                count=1,
-            )
-            sent_posts = 0
-            if contexts:
-                topic, x_context, source, selected_category = contexts[0]
-                generated = (
-                    await self.ai.generate_trend_posts_batch(
-                        [(topic, x_context)],
-                        output_language=self.settings.content_language,
-                    )
-                )[0]
-                approval = self.approvals.create(
-                    kind="post",
-                    text=generated.text,
-                    chat_id=message.chat.id,
-                    approver_user_id=approver_user_id,
-                    target_label=topic,
-                    metadata={
-                        "image_prompt": generated.image_prompt,
-                        "source": source,
-                        "category": selected_category,
-                    },
-                )
-                await self._send_approval(
-                    approval,
-                    reason=f"{source} | {selected_category} | {topic}",
-                )
-                sent_posts = 1
-            await status.edit_text(
-                "Today's queue is ready.\n"
-                f"Reply cards: {sent_replies}\n"
-                f"Original post cards: {sent_posts}\n"
-                f"Watching for confirmation: {watching_total}\n\n"
-                "Use Alternative/Shorter only when needed; images are generated on demand."
-            )
-        except Exception as exc:
-            await status.edit_text(_friendly_error(exc))
-        finally:
-            await self._notify_x_account_errors(message)
-
     async def _create_reply_approvals(
         self,
         results: list[XSearchResult],
@@ -1174,7 +995,7 @@ class ContentBot:
             if self.approvals.has_active_target(target_url):
                 continue
             result = _result_for_url(selected, target_url)
-            strategy = strategy_by_url.get(target_url, draft.strategy)
+            strategy = strategy_by_url.get(target_url, "specific_observation")
             approval = self.approvals.create(
                 kind="reply",
                 text=_format_reply_target_reply(draft),
@@ -1192,7 +1013,7 @@ class ContentBot:
                     "reply_translation_vi": draft.reply_translation_vi,
                 },
             )
-            await self._send_approval(approval, reason=draft.reason)
+            await self._send_approval(approval)
             if not video_mode:
                 self.reply_watch.mark_drafted(target_url)
             sent += 1
@@ -1333,7 +1154,7 @@ class ContentBot:
         generated = await self.ai.generate_reply_from_text(author_response.text)
         approval = self.approvals.create(
             kind="reply",
-            text=generated.text,
+            text=generated,
             chat_id=original.chat_id,
             approver_user_id=original.approver_user_id,
             target_url=author_response.url,
@@ -1349,10 +1170,7 @@ class ContentBot:
                 "author_response_url": author_response.url,
             },
         )
-        await self._send_approval(
-            approval,
-            reason="The original author replied to you; continuing now can strengthen the conversation.",
-        )
+        await self._send_approval(approval)
 
     async def automation_approval(
         self,
@@ -1377,7 +1195,6 @@ class ContentBot:
             "stop",
             "alternative",
             "shorter",
-            "visual",
         }:
             await query.answer("Unknown approval action.", show_alert=True)
             return
@@ -1418,20 +1235,8 @@ class ContentBot:
                     reply_translation_vi=revised_translation,
                 )
                 await query.edit_message_text(
-                    _approval_message_text(approval, reason="Revised on request"),
+                    _approval_message_text(approval),
                     reply_markup=_approval_keyboard(approval),
-                )
-                return
-            if decision == "visual":
-                prompt = str(existing.metadata.get("image_prompt") or "").strip()
-                if existing.kind != "post" or not prompt:
-                    raise RuntimeError("No visual prompt is available for this approval.")
-                await query.answer("Generating the visual...")
-                answered = True
-                image = await self.ai.generate_image(prompt)
-                await query.message.reply_photo(
-                    photo=_as_photo(image),
-                    caption="On-demand visual for this post draft.",
                 )
                 return
             approval = self.approvals.decide(
@@ -1453,10 +1258,7 @@ class ContentBot:
                 approval,
                 approved=decision in {"approve", "mobile", "continue"},
             )
-            if (
-                approval.status == "mobile_approved"
-                and approval.kind in {"reply", "post"}
-            ):
+            if approval.status == "mobile_approved" and approval.kind == "reply":
                 self.reply_learning.register_approval(approval)
             await query.answer()
             answered = True
@@ -1515,15 +1317,6 @@ class ContentBot:
             lambda: self._run_scheduled_replyvideo(query),
         )
 
-    async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]:
-        category = str(payload.get("category", "auto")).strip().lower() or "auto"
-        if category not in {"auto", "best", *AUTO_TREND_CATEGORIES}:
-            raise RuntimeError("tweettrend3 category must be auto, trending, news, sport, or entertainment.")
-        return self._spawn_automation(
-            "tweettrend3",
-            lambda: self._run_scheduled_tweettrend3(category),
-        )
-
     async def next_approved_action(self) -> dict[str, Any] | None:
         approval = self.approvals.claim_next()
         return approval.as_extension_payload() if approval is not None else None
@@ -1543,10 +1336,9 @@ class ContentBot:
         if self._application is None:
             return
         if success:
-            if approval.kind in {"reply", "post"}:
+            if approval.kind == "reply":
                 self.reply_learning.register_approval(approval)
-            detail = "Reply draft" if approval.kind == "reply" else "Post draft"
-            text = f"{detail} opened and filled in X. Review it, then click the final X button."
+            text = "Reply draft opened and filled in X. Review it, then click the final X button."
         else:
             text = f"Could not fill the approved {approval.kind} in X: {error or 'unknown error'}"
         await self._application.bot.send_message(chat_id=approval.chat_id, text=text)
@@ -1763,312 +1555,18 @@ class ContentBot:
             await _delete_message_safely(status)
             raise
 
-    async def _run_scheduled_tweettrend3(self, category: str) -> None:
-        if self._application is None or self.approval_chat_id is None:
-            raise RuntimeError("Automation chat is not ready.")
-        status = _SilentStatus()
-        contexts = await self._get_trend_contexts_for_tweettrend3(category, status)
-        generated_posts = await self.ai.generate_trend_posts_batch(
-            [(topic, x_context) for topic, x_context, _source, _category in contexts],
-            output_language=self.settings.content_language,
-        )
-        for (topic, _x_context, source, selected_category), generated in zip(
-            contexts,
-            generated_posts,
-        ):
-            approval = self.approvals.create(
-                kind="post",
-                text=generated.text,
-                chat_id=self.approval_chat_id,
-                approver_user_id=self.approval_chat_id,
-                target_label=topic,
-                metadata={
-                    "image_prompt": generated.image_prompt,
-                    "source": source,
-                    "category": selected_category,
-                },
-            )
-            await self._send_approval(
-                approval,
-                reason=f"{source} - {selected_category} - {topic}",
-            )
-
     async def _send_approval(
         self,
         approval: AutomationApproval,
-        *,
-        reason: str = "",
     ) -> None:
         if self._application is None:
             raise RuntimeError("Telegram bot is not ready.")
-        body = _approval_message_text(approval, reason=reason)
+        body = _approval_message_text(approval)
         await self._application.bot.send_message(
             chat_id=approval.chat_id,
             text=body[:4096],
             reply_markup=_approval_keyboard(approval),
         )
-
-    async def tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        topic = " ".join(context.args).strip()
-        if not topic:
-            await self._request_command_input(update, "tweet")
-            return
-
-        await message.chat.send_action(ChatAction.TYPING)
-        status = await message.reply_text("Writing a Vietnamese post from your topic...")
-        try:
-            generated = await self.ai.generate_topic_post(topic)
-            await status.delete()
-            approval = self.approvals.create(
-                kind="post",
-                text=generated.text,
-                chat_id=message.chat.id,
-                approver_user_id=(
-                    update.effective_user.id
-                    if update.effective_user is not None
-                    else message.chat.id
-                ),
-                target_label=generated.topic or topic,
-                metadata={"image_prompt": generated.image_prompt, "source": "user topic"},
-            )
-            await self._send_approval(approval, reason="User topic")
-        except Exception as exc:
-            await status.edit_text(_friendly_error(exc))
-
-    async def tweettrend3(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        category, output_language = _parse_tweettrend3_args(context.args)
-
-        await message.chat.send_action(ChatAction.TYPING)
-        status_text = (
-            "Finding current trends around your creator niche..."
-            if category in {"auto", "best"}
-            else f"Finding hot X trends in {category}..."
-        )
-        status_text = f"{status_text}\nOutput language: Vietnamese"
-        status = await message.reply_text(status_text)
-        try:
-            contexts = await self._get_trend_contexts_for_tweettrend3(category, status)
-            total = len(contexts)
-            approver_user_id = (
-                update.effective_user.id if update.effective_user is not None else message.chat.id
-            )
-            await status.edit_text(
-                f"Generating {total} distinct topics in one Gemini batch...\n"
-                f"Language: {output_language}\n\n"
-                "If extension Auto Run is OFF, open its popup and click Run next job."
-            )
-            generated_posts = await self.ai.generate_trend_posts_batch(
-                [(topic, x_context) for topic, x_context, _source, _category in contexts],
-                output_language=output_language,
-            )
-            for index, (
-                (topic, _x_context, source, selected_category),
-                generated,
-            ) in enumerate(zip(contexts, generated_posts), start=1):
-                variant = TrendPostVariant(
-                    angle=topic,
-                    text=generated.text,
-                    hashtags=[],
-                    image_prompt=generated.image_prompt,
-                    score="",
-                )
-                approval = self.approvals.create(
-                    kind="post",
-                    text=_format_trend_variant_copy(variant),
-                    chat_id=message.chat.id,
-                    approver_user_id=approver_user_id,
-                    target_label=topic,
-                    metadata={
-                        "image_prompt": generated.image_prompt,
-                        "source": source,
-                        "category": selected_category,
-                    },
-                )
-                await self._send_trend_variant(
-                    message,
-                    variant,
-                    index,
-                    approval=approval,
-                    approval_reason=(
-                        f"{source} | {selected_category} | {variant.angle}"
-                    ),
-                )
-            await status.edit_text(
-                f"Language: {output_language}\n"
-                f"All {total} topic-based tweet drafts sent."
-            )
-        except Exception as exc:
-            await status.edit_text(_friendly_error(exc))
-        finally:
-            await self._notify_x_account_errors(message)
-
-    async def retweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        source, visual_note = _parse_retweet_args(_command_payload(message, context))
-        if not source:
-            await self._request_command_input(update, "retweet")
-            return
-
-        tweet_id = extract_tweet_id(source)
-        if tweet_id is None:
-            await message.reply_text("Could not read a tweet ID from that link.")
-            return
-
-        await message.chat.send_action(ChatAction.TYPING)
-        status = await message.reply_text("Fetching source X post...")
-        try:
-            result = await self.x_search.tweet_by_id(tweet_id)
-            if result is None or not result.text:
-                await status.edit_text("Could not find readable content for that X post.")
-                return
-
-            media_urls = result.media_urls or []
-            await status.edit_text("Writing an original remix from the source post...")
-            generated = await self.ai.generate_retweet_remix(
-                result.url,
-                result.text,
-                media_urls,
-                visual_note=visual_note,
-            )
-            await status.delete()
-            approval = self.approvals.create(
-                kind="post",
-                text=generated.text,
-                chat_id=message.chat.id,
-                approver_user_id=(
-                    update.effective_user.id
-                    if update.effective_user is not None
-                    else message.chat.id
-                ),
-                target_label=f"Remix of @{result.username}",
-                metadata={
-                    "image_prompt": generated.image_prompt,
-                    "source": result.url,
-                },
-            )
-            await self._send_approval(approval, reason=f"Original remix of {result.url}")
-        except Exception as exc:
-            await status.edit_text(_friendly_error(exc))
-        finally:
-            await self._notify_x_account_errors(message)
-
-    async def dailybrief(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        category = (context.args[0].strip().lower() if context.args else "trending")
-
-        await message.chat.send_action(ChatAction.TYPING)
-        status = await message.reply_text(f"Building daily brief from {category}...")
-        try:
-            topic, x_context, source, _results = await self._get_trend_context(category, status)
-            await status.edit_text(f"Writing daily tweet options from: {topic}")
-            variants = await self.ai.generate_daily_brief(category, topic, source, x_context)
-            await status.edit_text(
-                f"Source: {source}\n"
-                f"Category: {category}\n"
-                f"Topic: {topic}\n\n"
-                "Sending daily tweet options with optional images..."
-            )
-            for index, variant in enumerate(variants, start=1):
-                approval = self.approvals.create(
-                    kind="post",
-                    text=_format_trend_variant_copy(variant),
-                    chat_id=message.chat.id,
-                    approver_user_id=(
-                        update.effective_user.id
-                        if update.effective_user is not None
-                        else message.chat.id
-                    ),
-                    target_label=variant.angle or topic,
-                    metadata={
-                        "image_prompt": variant.image_prompt,
-                        "source": source,
-                        "category": category,
-                    },
-                )
-                await self._send_trend_variant(
-                    message,
-                    variant,
-                    index,
-                    label="Daily tweet",
-                    approval=approval,
-                    approval_reason=f"{source} | {category} | {topic}",
-                )
-            await status.edit_text(
-                f"Source: {source}\nCategory: {category}\nTopic: {topic}\n\n"
-                "Daily tweet options sent."
-            )
-        except Exception as exc:
-            await status.edit_text(_friendly_error(exc))
-        finally:
-            await self._notify_x_account_errors(message)
-
-    async def tweetx(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        topic = " ".join(context.args).strip()
-        if not topic:
-            await self._request_command_input(update, "tweetx")
-            return
-
-        await message.chat.send_action(ChatAction.TYPING)
-        status = await message.reply_text("Searching X for live context...")
-        try:
-            search_query = default_english_query(topic)
-            results = await self.x_search.search(search_query)
-            if not results:
-                await status.edit_text(f"No X posts found for: {search_query}")
-                return
-
-            await status.edit_text("Writing a tweet from the X context...")
-            generated = await self.ai.generate_topic_post_from_x_context(
-                topic,
-                summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS),
-            )
-            await status.delete()
-            approval = self.approvals.create(
-                kind="post",
-                text=generated.text,
-                chat_id=message.chat.id,
-                approver_user_id=(
-                    update.effective_user.id
-                    if update.effective_user is not None
-                    else message.chat.id
-                ),
-                target_label=generated.topic or topic,
-                metadata={
-                    "image_prompt": generated.image_prompt,
-                    "source": f"X search: {search_query}",
-                },
-            )
-            await self._send_approval(
-                approval,
-                reason=f"Live X context: {search_query}",
-            )
-        except Exception as exc:
-            await status.edit_text(_friendly_error(exc))
-        finally:
-            await self._notify_x_account_errors(message)
-
-    async def xsearch(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        query = " ".join(context.args).strip()
-        if not query:
-            await message.reply_text("Usage: /xsearch <X search query>")
-            return
-
-        status = await message.reply_text("Searching X...")
-        try:
-            search_query = default_english_query(query)
-            results = await self.x_search.search(search_query)
-            await _send_text_chunks(
-                status,
-                f"X results for: {search_query}\n\n{format_x_results(results)}",
-            )
-        except Exception as exc:
-            await status.edit_text(_friendly_error(exc))
-        finally:
-            await self._notify_x_account_errors(message)
 
     async def replytargets(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -2269,10 +1767,7 @@ class ContentBot:
                 creator_voice=updates.get("voice", self.settings.creator_voice),
                 target_audience=updates.get("audience", self.settings.target_audience),
             )
-            await self.trend_sources.aclose()
             self.ai = create_ai_service(self.settings)
-            self.x_search = XSearchService(self.settings)
-            self.trend_sources = TrendSourceService(self.settings, self.x_search)
             await message.reply_text(f"Persona updated.\n\n{_format_persona(self.settings)}")
         except Exception as exc:
             await message.reply_text(_friendly_error(exc))
@@ -2306,14 +1801,12 @@ class ContentBot:
             if saved_name == self.settings.x_account_name:
                 update_env_value("X_COOKIE", cookie)
                 self.settings = replace(self.settings, x_cookie=cookie)
-                await self.trend_sources.aclose()
                 self.x_search = XSearchService(self.settings)
-                self.trend_sources = TrendSourceService(self.settings, self.x_search)
             await status.edit_text(
                 f"X cookie saved for account: {saved_name}\n"
                 "twscrape will rotate across active accounts automatically.\n\n"
                 "Try:\n"
-                "/tweetx AI agents\n\n"
+                "/replytargets AI agents\n\n"
                 "For security, I tried to delete the Telegram message that contained the cookie."
             )
         except Exception as exc:
@@ -2344,9 +1837,7 @@ class ContentBot:
             if removed_name == self.settings.x_account_name:
                 update_env_value("X_COOKIE", "")
                 self.settings = replace(self.settings, x_cookie="")
-                await self.trend_sources.aclose()
                 self.x_search = XSearchService(self.settings)
-                self.trend_sources = TrendSourceService(self.settings, self.x_search)
             await status.edit_text(
                 f"Removed X account: {removed_name}\n\n"
                 "Use /xaccounts to verify the active account list."
@@ -2380,221 +1871,12 @@ class ContentBot:
                 await status.edit_text("Writing a reply from the X post...")
             generated = await self.ai.generate_reply_from_text(tweet_text)
             await status.delete()
-            await message.reply_text(generated.text)
+            await message.reply_text(generated)
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
             if tweet_id is not None:
                 await self._notify_x_account_errors(message)
-
-    async def _get_trend_context(
-        self,
-        category: str,
-        status,
-    ) -> tuple[str, str, str, list[XSearchResult]]:
-        await status.edit_text(
-            f"Scanning X, Google Trends, and RSS sources for {category}..."
-        )
-        signals, errors = await self.trend_sources.collect(category)
-        if not signals:
-            await status.edit_text(
-                "Multi-source trend scan returned no items. Falling back to hot X search..."
-            )
-            fallback_query = ""
-            results: list[XSearchResult] = []
-            try:
-                fallback_query, results = await self.x_search.trend_fallback_search(category)
-            except Exception as exc:
-                errors.append(f"X hot search fallback: {exc}")
-            if not results:
-                detail = f" Details: {'; '.join(errors[-3:])}" if errors else ""
-                raise RuntimeError(
-                    "No Google/RSS/X trend context found. Try /tweettrend3 news, "
-                    "refresh X cookies, or add RSS feeds with TREND_RSS_URLS."
-                    f"{detail}"
-                )
-            return (
-                f"hot X discussion in {category}",
-                summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS),
-                f"X hot search fallback ({fallback_query})",
-                results,
-            )
-
-        lead = signals[0]
-        await status.edit_text(
-            f"Enriching multi-source trend with recent X context: {lead.title}"
-        )
-        search_query = ""
-        results: list[XSearchResult] = []
-        try:
-            search_query, results = await self.x_search.search_recent(
-                lead.title,
-                since_minutes=24 * 60,
-                limit=min(self.settings.x_search_limit, TREND_CONTEXT_X_ITEMS),
-                product="Latest",
-            )
-        except Exception as exc:
-            errors.append(f"X enrichment: {exc}")
-
-        context_parts = [
-            "Multi-source trend context:\n"
-            + summarize_trend_signals(signals, max_items=TREND_CONTEXT_SIGNAL_ITEMS)
-        ]
-        if results:
-            context_parts.append(
-                f"Recent X context for {search_query}:\n"
-                f"{summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS)}"
-            )
-        if errors:
-            context_parts.append("Source notes:\n" + "\n".join(f"- {error}" for error in errors[-4:]))
-
-        return (
-            lead.title,
-            "\n\n".join(context_parts),
-            f"multi-source trend scan ({lead.source})",
-            results,
-        )
-
-    async def _get_auto_trend_context(
-        self,
-        status,
-    ) -> tuple[str, str, str, list[XSearchResult], str]:
-        best: tuple[str, str, str, list[XSearchResult], str] | None = None
-        errors: list[str] = []
-
-        for category in AUTO_TREND_CATEGORIES:
-            try:
-                await status.edit_text(f"Checking hot X trends in {category}...")
-                topic, x_context, source, results = await self._get_trend_context(
-                    category,
-                    status,
-                )
-            except Exception as exc:
-                errors.append(f"{category}: {exc}")
-                continue
-
-            candidate = (topic, x_context, source, results, category)
-            if best is None or _trend_context_score(candidate) > _trend_context_score(best):
-                best = candidate
-
-        if best is not None:
-            return best
-
-        detail = "; ".join(errors[-3:]) if errors else "no category returned usable context"
-        raise RuntimeError(
-            "No auto trend context found. Try /tweettrend3 news or /tweettrend3 entertainment. "
-            f"Details: {detail}"
-        )
-
-    async def _get_trend_contexts_for_tweettrend3(
-        self,
-        category: str,
-        status,
-        count: int = 3,
-    ) -> list[tuple[str, str, str, str]]:
-        categories = AUTO_TREND_CATEGORIES if category in {"auto", "best"} else (category,)
-        candidates: list[tuple[Any, str, list[Any], list[str]]] = []
-
-        # Auto mode should find conversations in the configured content lane,
-        # not merely the largest general-interest trends of the day.
-        if category in {"auto", "best"}:
-            await status.edit_text(
-                f"Finding current trends around your niche: {self.settings.creator_niche}..."
-            )
-            niche_signals, niche_errors = await self.trend_sources.collect_niche(
-                self.settings.creator_niche
-            )
-            for signal in niche_signals:
-                candidates.append((signal, "niche", niche_signals, niche_errors))
-
-        niche_topic_count = len({_trend_topic_key(item[0].title) for item in candidates})
-        if niche_topic_count < count:
-            await status.edit_text(
-                "Scanning X, Google Trends, and RSS categories concurrently..."
-            )
-            category_results = await asyncio.gather(
-                *(self.trend_sources.collect(item) for item in categories),
-                return_exceptions=True,
-            )
-            for selected_category, response in zip(categories, category_results):
-                if isinstance(response, Exception):
-                    continue
-                signals, errors = response
-                for signal in signals:
-                    candidates.append((signal, selected_category, signals, errors))
-
-        selected: list[tuple[Any, str, list[Any], list[str]]] = []
-        seen_topics: set[str] = set()
-        for candidate in sorted(
-            candidates,
-            key=lambda item: (item[1] == "niche", item[0].score),
-            reverse=True,
-        ):
-            topic_key = _trend_topic_key(candidate[0].title)
-            if not topic_key or topic_key in seen_topics:
-                continue
-            seen_topics.add(topic_key)
-            selected.append(candidate)
-            if len(selected) == count:
-                break
-
-        await status.edit_text(
-            f"Enriching {len(selected)} selected trend(s) with X context concurrently..."
-        )
-
-        async def enrich_selected(
-            item: tuple[Any, str, list[Any], list[str]],
-        ) -> tuple[str, str, str, str]:
-            signal, selected_category, signals, errors = item
-            search_query = ""
-            results: list[XSearchResult] = []
-            notes = list(errors)
-            try:
-                search_query, results = await self.x_search.search_recent(
-                    signal.title,
-                    since_minutes=24 * 60,
-                    limit=min(self.settings.x_search_limit, TREND_CONTEXT_X_ITEMS),
-                    product="Latest",
-                )
-            except Exception as exc:
-                notes.append(f"X enrichment: {exc}")
-
-            related_signals = [signal] + [item for item in signals if item != signal]
-            context_parts = [
-                "Multi-source trend context:\n"
-                + summarize_trend_signals(
-                    related_signals,
-                    max_items=TREND_CONTEXT_SIGNAL_ITEMS,
-                )
-            ]
-            if results:
-                context_parts.append(
-                    f"Recent X context for {search_query}:\n"
-                    f"{summarize_x_context(results, max_items=TREND_CONTEXT_X_ITEMS)}"
-                )
-            if notes:
-                context_parts.append(
-                    "Source notes:\n" + "\n".join(f"- {note}" for note in notes[-4:])
-                )
-            return (
-                signal.title,
-                "\n\n".join(context_parts),
-                f"multi-source trend scan ({signal.source})",
-                selected_category,
-            )
-
-        contexts = list(await asyncio.gather(*(enrich_selected(item) for item in selected)))
-        if contexts:
-            return contexts
-
-        # A source outage may leave only the existing hot-X fallback. Keep that
-        # one useful topic rather than fabricating three copies of the same topic.
-        if category in {"auto", "best"}:
-            topic, x_context, source, _results, selected_category = await self._get_auto_trend_context(status)
-        else:
-            topic, x_context, source, _results = await self._get_trend_context(category, status)
-            selected_category = category
-        return [(topic, x_context, source, selected_category)]
 
     async def _get_reply_target_context(
         self,
@@ -3197,9 +2479,8 @@ class ContentBot:
         *,
         mode: str = "balanced",
     ) -> list[str]:
-        # /replytargets is deliberately independent from CREATOR_NICHE. Its job
-        # is reach discovery across today's largest conversations; niche-led
-        # discovery remains the responsibility of /tweettrend3.
+        # /replytargets starts broad for reach, then adds the configured creator
+        # niche in balanced/qualified modes so one command covers both lanes.
         selected_languages = parse_reply_target_languages(
             languages,
             default=self.settings.reply_target_languages,
@@ -3276,70 +2557,6 @@ class ContentBot:
             except Exception:
                 return
 
-    async def _send_optional_image(
-        self,
-        message,
-        generated: GeneratedContent,
-        label: str,
-    ) -> None:
-        if not self.settings.generate_images:
-            return
-
-        status = await message.reply_text(f"Generating the {label} image...")
-        try:
-            image = await self.ai.generate_image(generated.image_prompt)
-        except Exception as exc:
-            await status.edit_text(
-                f"Could not generate image: {_friendly_error(exc)}\n\n"
-                f"Image prompt:\n{generated.image_prompt}"
-            )
-            return
-        await status.delete()
-        await message.reply_photo(
-            photo=_as_photo(image),
-            caption=_caption_for_generated(generated, self.settings.telegram_caption_limit),
-        )
-
-    async def _send_trend_variant(
-        self,
-        message,
-        variant: TrendPostVariant,
-        index: int,
-        label: str = "Option",
-        approval: AutomationApproval | None = None,
-        approval_reason: str = "",
-    ) -> None:
-        copy_text = _format_trend_variant_copy(variant)
-        if approval is None:
-            await message.reply_text(copy_text)
-        else:
-            await self._send_approval(approval, reason=approval_reason)
-            # Approval cards expose an on-demand visual button. Avoid spending a
-            # Gemini image job before the user chooses this post.
-            return
-
-        if not self.settings.generate_images:
-            return
-
-        try:
-            image = await self.ai.generate_image(variant.image_prompt)
-        except Exception as exc:
-            await message.reply_text(
-                f"Could not generate image: {_friendly_error(exc)}\n\n"
-                f"Image prompt:\n{variant.image_prompt}"
-            )
-            return
-
-        await message.reply_photo(photo=_as_photo(image))
-
-
-def _as_photo(image: bytes) -> BytesIO:
-    buffer = BytesIO(image)
-    buffer.name = "generated.png"
-    buffer.seek(0)
-    return buffer
-
-
 def _menu_keyboard(menu_name: str = "main") -> ReplyKeyboardMarkup:
     layout = MENU_LAYOUTS.get(menu_name, MENU_LAYOUTS["main"])
     return ReplyKeyboardMarkup(
@@ -3353,25 +2570,6 @@ def _menu_keyboard(menu_name: str = "main") -> ReplyKeyboardMarkup:
 
 async def _set_bot_commands(app: Application) -> None:
     await app.bot.set_my_commands(BOT_COMMANDS)
-
-
-def _caption_for_generated(generated: GeneratedContent, limit: int) -> str:
-    caption = f"Topic: {generated.topic}\n\n{generated.text}"
-    if len(caption) <= limit:
-        return caption
-    return caption[: limit - 3].rstrip() + "..."
-
-
-def _format_trend_variant_copy(variant: TrendPostVariant) -> str:
-    text = variant.text.strip()
-    hashtags = [
-        hashtag.strip()
-        for hashtag in variant.hashtags
-        if hashtag.strip() and hashtag.strip().lower() not in text.lower()
-    ]
-    if hashtags:
-        text = f"{text}\n\n{' '.join(hashtags)}"
-    return text.strip()
 
 
 def _format_reply_target_reply(draft: ReplyTargetDraft) -> str:
@@ -3591,15 +2789,6 @@ def _approval_keyboard(
                     ),
                 ]
             )
-        elif approval.kind == "post" and approval.metadata.get("image_prompt"):
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        "Generate visual",
-                        callback_data=f"automation:visual:{approval.id}",
-                    )
-                ]
-            )
     else:
         rows.append(
             [
@@ -3631,13 +2820,6 @@ def _approval_keyboard(
     if final_row:
         rows.append(final_row)
     return InlineKeyboardMarkup(rows)
-
-
-def _trend_context_score(
-    candidate: tuple[str, str, str, list[XSearchResult], str],
-) -> tuple[int, int]:
-    _topic, x_context, _source, results, _category = candidate
-    return len(results), len(x_context)
 
 
 def _dedupe_queries(queries: list[str]) -> list[str]:
@@ -3854,21 +3036,6 @@ def _combine_reply_target_results(
     return combined, search_query_by_url
 
 
-def _trend_topic_key(topic: str) -> str:
-    return " ".join(
-        part for part in "".join(char.lower() if char.isalnum() else " " for char in topic).split()
-        if len(part) > 2
-    )
-
-
-def _reply_target_interval_minutes(value: Any, *, default: int) -> int:
-    try:
-        minutes = int(value)
-    except (TypeError, ValueError):
-        minutes = default
-    return min(1440, max(5, minutes))
-
-
 def _reply_target_max_age_minutes(value: Any, *, default: int) -> int:
     try:
         minutes = int(value)
@@ -3911,13 +3078,6 @@ def _no_reply_targets_message(
         "without accepting older posts. Check X cookies/account limits, try again "
         "later, or use a specific topic such as `/replytargets crypto`."
     )
-
-
-async def _send_text_chunks(message, text: str, limit: int = 3900) -> None:
-    chunks = [text[i : i + limit] for i in range(0, len(text), limit)] or [""]
-    await message.edit_text(chunks[0])
-    for chunk in chunks[1:]:
-        await message.reply_text(chunk)
 
 
 async def _delete_message_safely(message) -> None:
@@ -3966,37 +3126,6 @@ def _format_file_size(size_bytes: int) -> str:
     if size_mb >= 1:
         return f"{size_mb:.1f} MB"
     return f"{max(1, round(size_bytes / 1024))} KB"
-
-
-def _parse_retweet_args(raw_args: str) -> tuple[str, str]:
-    clean = raw_args.strip()
-    if not clean:
-        return "", ""
-
-    link, separator, visual_note = clean.partition("|")
-    if separator:
-        return link.strip(), visual_note.strip()
-
-    parts = clean.split(maxsplit=1)
-    if len(parts) == 1:
-        return parts[0].strip(), ""
-    return parts[0].strip(), parts[1].strip()
-
-
-def _parse_tweettrend3_args(args: list[str]) -> tuple[str, str]:
-    category = "auto"
-    output_language = "Vietnamese"
-    for arg in args:
-        clean = arg.strip()
-        if not clean:
-            continue
-        normalized = clean.lower()
-        language = TWEETTREND_LANGUAGE_ALIASES.get(normalized)
-        if language is not None:
-            continue
-        if category == "auto":
-            category = normalized
-    return category, output_language
 
 
 def _looks_like_x_cookie(cookie: str) -> bool:

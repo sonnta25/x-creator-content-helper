@@ -56,7 +56,7 @@ def test_watchlist_allows_exceptional_first_observation_and_marks_drafted(tmp_pa
 
     assert ready == [candidate]
     assert watching == []
-    assert store.watching() == []
+    assert store.candidates_for_refresh() == []
 
 
 def test_watchlist_allows_qualified_japanese_candidate_earlier(tmp_path) -> None:
@@ -89,4 +89,3 @@ def test_watchlist_exposes_candidates_for_refresh_and_expires_old_rows(tmp_path)
 
     assert [row["tweet_id"] for row in rows] == [5]
     assert expired == []
-    assert store.watching() == []

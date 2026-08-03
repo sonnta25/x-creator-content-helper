@@ -513,11 +513,6 @@ async function runOneJob(config) {
   }
 
   const job = next.job;
-  if (job.kind === "image") {
-    await runImageJob(config, job);
-    return true;
-  }
-
   await runGeminiTextJob(config, job);
   return true;
 }
@@ -527,7 +522,7 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
   let providerCompleted = false;
   const stopHeartbeat = startJobHeartbeat(config, job.id);
   try {
-    const finalPrompt = job.final_prompt || job.grok_prompt;
+    const finalPrompt = job.final_prompt;
     if (!finalPrompt) {
       throw new Error(`Missing ${FINAL_PROVIDER_NAME} prompt for job ${job.id}.`);
     }
@@ -557,43 +552,6 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
     if (reportError) {
       await reportJobError(config, job.id, error);
     }
-    if (providerStarted && !providerCompleted) {
-      await recycleProviderAfterFailure();
-    }
-    throw error;
-  } finally {
-    stopHeartbeat();
-  }
-}
-
-async function runImageJob(config, job) {
-  let providerStarted = false;
-  let providerCompleted = false;
-  const stopHeartbeat = startJobHeartbeat(config, job.id);
-  try {
-    await setStatus(`Image job ${job.id}\nUsing existing ${FINAL_PROVIDER_NAME} tab...`);
-    providerStarted = true;
-    const dataUrl = await runProviderImage(
-      FINAL_PROVIDER_URL,
-      job.final_prompt || job.grok_prompt,
-      config.timeoutSeconds
-    );
-    if (!isUsableDataUrl(dataUrl)) {
-      throw new Error(`${FINAL_PROVIDER_NAME} image was visible, but the extension could not extract usable image bytes.`);
-    }
-    providerCompleted = true;
-    await bridgeFetch(config, `/jobs/${job.id}/result`, {
-      method: "POST",
-      body: { image_data_url: dataUrl }
-    });
-    const lifecycle = await recordProviderJobSuccess();
-    await setStatus(
-      lifecycle.recycled
-        ? `Image returned to bot. Gemini tab recycled after ${PROVIDER_RECYCLE_AFTER_JOBS} successful jobs.`
-        : `Image returned to bot. Gemini tab remains open (${lifecycle.count}/${PROVIDER_RECYCLE_AFTER_JOBS} jobs before recycle).`
-    );
-  } catch (error) {
-    await reportJobError(config, job.id, error);
     if (providerStarted && !providerCompleted) {
       await recycleProviderAfterFailure();
     }
@@ -753,93 +711,6 @@ async function diagnoseProviderDom(url) {
   }
   await setStatus(report);
   return report;
-}
-
-async function runProviderImage(url, prompt, timeoutSeconds) {
-  const tab = await prepareProviderTab(url);
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: injectedSubmitAndFindImage,
-    args: [prompt, timeoutSeconds * 1000]
-  });
-  if (!result || !result.result) {
-    throw new Error(`No generated image detected on ${url}`);
-  }
-  if (typeof result.result === "string") {
-    if (!isUsableDataUrl(result.result)) {
-      throw new Error(`${FINAL_PROVIDER_NAME} returned an empty image data URL.`);
-    }
-    return result.result;
-  }
-  if (isUsableDataUrl(result.result.dataUrl)) {
-    return result.result.dataUrl;
-  }
-  if (result.result.src) {
-    try {
-      await setStatus(`Image visible. Downloading the ${FINAL_PROVIDER_NAME} image URL...`);
-      return await fetchImageUrlAsDataUrl(result.result.src);
-    } catch (_error) {
-      if (!result.result.rect) {
-        throw _error;
-      }
-    }
-  }
-  if (result.result.rect) {
-    await setStatus(`Image visible. Capturing and cropping the ${FINAL_PROVIDER_NAME} tab...`);
-    return await captureVisibleImage(tab.windowId, result.result.rect);
-  }
-  throw new Error(`Generated image was detected on ${url}, but image bytes were empty.`);
-}
-
-function isUsableDataUrl(value) {
-  return typeof value === "string" && /^data:image\/[a-z0-9.+-]+;base64,.{200,}/i.test(value);
-}
-
-async function fetchImageUrlAsDataUrl(src) {
-  const response = await fetch(src, { credentials: "include" });
-  if (!response.ok) {
-    throw new Error(`${FINAL_PROVIDER_NAME} image URL returned HTTP ${response.status}`);
-  }
-  const blob = await response.blob();
-  if (!blob || blob.size < 20000) {
-    throw new Error(`${FINAL_PROVIDER_NAME} image URL returned an empty image.`);
-  }
-  if (!String(blob.type || "").startsWith("image/")) {
-    throw new Error(`${FINAL_PROVIDER_NAME} image URL returned ${blob.type || "unknown content type"}.`);
-  }
-  return await blobToDataUrl(blob);
-}
-
-async function captureVisibleImage(windowId, rect) {
-  const screenshot = await chromeCaptureVisibleTab(windowId, { format: "png" });
-  const response = await fetch(screenshot);
-  const blob = await response.blob();
-  const bitmap = await createImageBitmap(blob);
-  const scale = Number(rect.devicePixelRatio || 1);
-  const x = Math.max(0, Math.floor(Number(rect.left || 0) * scale));
-  const y = Math.max(0, Math.floor(Number(rect.top || 0) * scale));
-  const width = Math.min(bitmap.width - x, Math.floor(Number(rect.width || 0) * scale));
-  const height = Math.min(bitmap.height - y, Math.floor(Number(rect.height || 0) * scale));
-  if (width <= 0 || height <= 0) {
-    throw new Error("Generated image is visible, but its screen bounds could not be cropped.");
-  }
-  const canvas = new OffscreenCanvas(width, height);
-  const context = canvas.getContext("2d");
-  context.drawImage(bitmap, x, y, width, height, 0, 0, width, height);
-  const cropped = await canvas.convertToBlob({ type: "image/png" });
-  return await blobToDataUrl(cropped);
-}
-
-async function blobToDataUrl(blob) {
-  const buffer = await blob.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    const chunk = bytes.subarray(index, index + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-  return `data:${blob.type || "image/png"};base64,${btoa(binary)}`;
 }
 
 async function getOrCreateTab(url) {
@@ -1528,10 +1399,7 @@ function injectedReadProviderResponse(prompt, before) {
   const normalizedPrompt = normalizeText(prompt);
   const promptStart = normalizedPrompt.slice(0, 120);
   const expectsJson = /return\s+(?:only\s+)?(?:valid\s+)?json/i.test(prompt)
-    || /"targets"|"variants"|"image_prompt"|"topic"/i.test(prompt);
-  const expectsSinglePostJson = expectsJson
-    && !/"targets"|"variants"|thread_posts/i.test(prompt)
-    && /(?:keys?\s*:\s*text\s*,\s*image_prompt\s*,\s*topic|"text"\s+field)/i.test(prompt);
+    || /"targets"/i.test(prompt);
 
   const isVisible = (el) => {
     if (!el) return false;
@@ -1572,20 +1440,11 @@ function injectedReadProviderResponse(prompt, before) {
   const looksLikePromptLeak = (text) => {
     const normalized = normalizeText(text);
     return [
-      "you are a twitter/x tweet qa",
       "you are a twitter/x reply engine",
       "you are an x reply qa",
-      "you are an autonomous twitter/x knowledge engine",
       "original task:",
       "original reply task:",
       "original reply-target task:",
-      "original tweet task:",
-      "original tweet-variants task:",
-      "original vietnamese-source task:",
-      "chatgpt analysis/draft:",
-      "chatgpt draft/analysis",
-      "first-pass gemini draft:",
-      "generated json:",
       "generated x reply:",
       "required json shape:",
       "tham khảo nội dung sau",
@@ -1622,33 +1481,6 @@ function injectedReadProviderResponse(prompt, before) {
     return clean;
   };
 
-  const hasSinglePostText = (text) => {
-    if (!expectsSinglePostJson) return true;
-    try {
-      let payload = JSON.parse(text);
-      for (let depth = 0; depth < 4 && payload; depth += 1) {
-        if (typeof payload === "string") {
-          payload = JSON.parse(payload);
-        }
-        if (!payload || typeof payload !== "object") break;
-        const postText = ["text", "tweet", "post", "content"]
-          .map((key) => payload[key])
-          .find((value) => typeof value === "string" && value.trim());
-        if (postText) return true;
-        payload = ["response", "result", "output", "data", "message"]
-          .map((key) => payload[key])
-          .find((value) => value && (
-            typeof value === "object"
-            || (typeof value === "string" && value.includes("{"))
-          ));
-      }
-    } catch (_error) {
-      // Keep support for otherwise recoverable JSON containing an unescaped quote.
-      return /"(?:text|tweet|post|content)"\s*:\s*"[^"\s][\s\S]*/i.test(text);
-    }
-    return false;
-  };
-
   const selectors = ["[data-message-author-role='assistant']", "[dir='auto']", "pre"];
   const candidates = [];
   const seen = new Set();
@@ -1657,7 +1489,6 @@ function injectedReadProviderResponse(prompt, before) {
     seen.add(el);
     const text = normalizeCandidateText(el.innerText || el.textContent || "");
     if (text.length < 8 || text.length > 30000) return;
-    if (!hasSinglePostText(text)) return;
     if (looksLikeSubmittedPrompt(text)) return;
     if (looksLikePromptLeak(text)) return;
     const normalized = normalizeText(text);
@@ -1898,19 +1729,12 @@ function injectedSubmitAndRead(prompt, timeoutMs) {
     const normalized = normalizeText(text);
     if (!normalized) return false;
     return [
-      "you are a twitter/x tweet qa",
       "you are a twitter/x reply engine",
       "you are an x reply qa",
-      "you are an autonomous twitter/x knowledge engine",
-      "your input is one generated tweet",
       "your input is one generated x reply",
-      "your job is not to create a new topic",
       "your job is not to write a new reply",
-      "your purpose is not to write tweets",
       "never explain your reasoning",
-      "return only one final tweet",
       "return only the final rewritten reply",
-      "step 1 - silent ai detection",
       "step 1 (silent)",
       "final silent qa"
     ].some((marker) => normalized.includes(marker));
@@ -1984,7 +1808,7 @@ function injectedSubmitAndRead(prompt, timeoutMs) {
     if (!candidates.length) {
       for (const el of document.body ? document.body.querySelectorAll("*") : []) {
         const text = compactText(el.innerText || el.textContent || "");
-        if (!/[{}]/.test(text) && !/"(?:text|targets|variants|reply|url|image_prompt)"\s*:/.test(text)) {
+        if (!/[{}]/.test(text) && !/"(?:targets|reply|url)"\s*:/.test(text)) {
           continue;
         }
         pushCandidate(el);
@@ -2155,212 +1979,6 @@ function injectedDiagnoseDom() {
   return reportLines.join("\n");
 }
 
-function injectedSubmitAndFindImage(prompt, timeoutMs) {
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const splitInputChunks = (value, maxLength = 1200) => {
-    const text = String(value || "");
-    const chunks = [];
-    for (let start = 0; start < text.length;) {
-      let end = Math.min(text.length, start + maxLength);
-      if (end < text.length) {
-        const boundary = Math.max(text.lastIndexOf("\n", end), text.lastIndexOf(" ", end));
-        if (boundary > start + Math.floor(maxLength / 2)) end = boundary + 1;
-      }
-      chunks.push(text.slice(start, end));
-      start = end;
-    }
-    return chunks.length ? chunks : [""];
-  };
-
-  const isVisible = (el) => {
-    if (!el) return false;
-    const style = window.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 120 && rect.height > 120;
-  };
-
-  const isInputVisible = (el) => {
-    if (!el) return false;
-    const style = window.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
-  };
-
-  const findInput = () => {
-    const selectors = ["textarea", "[contenteditable='true']", "div[role='textbox']", "p[data-placeholder]"];
-    for (const selector of selectors) {
-      const items = Array.from(document.querySelectorAll(selector)).filter(isInputVisible);
-      if (items.length) return items[items.length - 1];
-    }
-    return null;
-  };
-
-  const setInput = async (el, value) => {
-    el.focus();
-    if ("value" in el) {
-      el.value = "";
-      for (const chunk of splitInputChunks(value)) {
-        el.value += chunk;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        await sleep(25);
-      }
-      return;
-    }
-    document.execCommand("selectAll", false, null);
-    for (const chunk of splitInputChunks(value)) {
-      if (!document.execCommand("insertText", false, chunk)) {
-        el.textContent = `${el.textContent || ""}${chunk}`;
-      }
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: chunk }));
-      await sleep(25);
-    }
-  };
-
-  const clickSend = () => {
-    const buttons = Array.from(document.querySelectorAll("button")).filter(isInputVisible);
-    const send = buttons.find((button) => {
-      const label = `${button.getAttribute("aria-label") || ""} ${button.title || ""} ${button.textContent || ""}`.toLowerCase();
-      return label.includes("send") || label.includes("submit") || label.includes("arrow");
-    });
-    if (!send) return false;
-    send.click();
-    return true;
-  };
-
-  const pressEnter = (el) => {
-    for (const type of ["keydown", "keypress", "keyup"]) {
-      el.dispatchEvent(new KeyboardEvent(type, {
-        key: "Enter",
-        code: "Enter",
-        bubbles: true,
-        cancelable: true
-      }));
-    }
-  };
-
-  const imageSrcs = () => Array.from(document.images)
-    .filter(isVisible)
-    .map((img) => {
-      const rect = img.getBoundingClientRect();
-      const style = window.getComputedStyle(img);
-      const src = img.currentSrc || img.src;
-      return {
-        src,
-        complete: Boolean(img.complete),
-        naturalWidth: Number(img.naturalWidth || 0),
-        naturalHeight: Number(img.naturalHeight || 0),
-        area: rect.width * rect.height,
-        opacity: Number(style.opacity || 1),
-        filter: String(style.filter || ""),
-        blurAncestor: Boolean(img.closest("[class*='blur'], [style*='blur']")),
-        isPreferredAsset: /(?:googleusercontent\.com|generativelanguage)/i.test(String(src || "")),
-        rect
-      };
-    })
-    .filter((item) => {
-      const src = item.src || "";
-      if (!src || src.includes("avatar") || src.includes("profile")) return false;
-      if (item.filter && item.filter !== "none") return false;
-      if (item.opacity < 0.95 || item.blurAncestor) return false;
-      if (!item.complete && !src.startsWith("blob:") && !src.startsWith("data:")) return false;
-      if (item.naturalWidth > 0 || item.naturalHeight > 0) {
-        return item.naturalWidth >= 512 && item.naturalHeight >= 512;
-      }
-      return item.area > 180000;
-    })
-    .sort((a, b) => {
-      if (a.isPreferredAsset !== b.isPreferredAsset) return a.isPreferredAsset ? 1 : -1;
-      return a.area - b.area;
-    });
-
-  const imageKey = (item) => item.src;
-
-  const imageRectPayload = (item) => ({
-    left: item.rect.left,
-    top: item.rect.top,
-    width: item.rect.width,
-    height: item.rect.height,
-    devicePixelRatio: window.devicePixelRatio || 1
-  });
-
-  const isUsableDataUrl = (value) => (
-    typeof value === "string" && /^data:image\/[a-z0-9.+-]+;base64,.{200,}/i.test(value)
-  );
-
-  const toDataUrl = async (src) => {
-    if (isUsableDataUrl(src)) {
-      return src;
-    }
-    const response = await fetch(src);
-    if (!response.ok) {
-      throw new Error(`Image fetch returned HTTP ${response.status}`);
-    }
-    const blob = await response.blob();
-    if (!blob || blob.size < 20000) {
-      throw new Error("Image fetch returned an empty blob");
-    }
-    return await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-  };
-
-  return (async () => {
-    const readyStarted = Date.now();
-    let input = null;
-    while (Date.now() - readyStarted < 30000) {
-      input = findInput();
-      if (input) break;
-      await sleep(500);
-    }
-    if (!input) throw new Error("Could not find the Gemini chat input. Are you logged in?");
-
-    const before = new Set(imageSrcs().map(imageKey));
-    await setInput(input, prompt);
-    await sleep(500);
-    if (!clickSend()) pressEnter(input);
-
-    const started = Date.now();
-    let visibleCandidate = null;
-    let stableCandidate = null;
-    let stableSince = 0;
-    while (Date.now() - started < timeoutMs) {
-      const candidates = imageSrcs();
-      const newest = candidates.filter((item) => !before.has(imageKey(item))).pop();
-      if (newest) {
-        visibleCandidate = newest;
-        if (!stableCandidate || imageKey(stableCandidate) !== imageKey(newest)) {
-          stableCandidate = newest;
-          stableSince = Date.now();
-        } else {
-          stableCandidate = newest;
-        }
-        if (Date.now() - stableSince > 3500) {
-          try {
-            const dataUrl = await toDataUrl(newest.src);
-            if (isUsableDataUrl(dataUrl)) {
-              return { dataUrl, src: newest.src, rect: imageRectPayload(newest) };
-            }
-            return { src: newest.src, rect: imageRectPayload(newest) };
-          } catch (_error) {
-            return { src: newest.src, rect: imageRectPayload(newest) };
-          }
-        }
-      }
-      if (!visibleCandidate && candidates.length) {
-        visibleCandidate = candidates[candidates.length - 1];
-      }
-      await sleep(1500);
-    }
-    if (visibleCandidate) {
-      return { src: visibleCandidate.src, rect: imageRectPayload(visibleCandidate) };
-    }
-    throw new Error("Timed out waiting for a generated image.");
-  })();
-}
-
 async function loadConfig() {
   const [saved, session] = await Promise.all([
     chromeStorageGet(DEFAULTS),
@@ -2487,16 +2105,4 @@ function chromeAlarmsClear(name) {
 
 function chromeAlarmsGet(name) {
   return new Promise((resolve) => chrome.alarms.get(name, resolve));
-}
-
-function chromeCaptureVisibleTab(windowId, options) {
-  return new Promise((resolve, reject) => {
-    chrome.tabs.captureVisibleTab(windowId, options, (dataUrl) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-      resolve(dataUrl);
-    });
-  });
 }

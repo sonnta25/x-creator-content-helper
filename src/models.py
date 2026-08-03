@@ -4,28 +4,10 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class GeneratedContent:
-    text: str
-    image_prompt: str
-    topic: str
-
-
-@dataclass(frozen=True)
-class TrendPostVariant:
-    angle: str
-    text: str
-    image_prompt: str
-    hashtags: list[str]
-    score: str
-
-
-@dataclass(frozen=True)
 class ReplyTargetDraft:
     url: str
     target: str
-    reason: str
     reply: str
-    strategy: str = "specific_observation"
     source_summary_vi: str = ""
     reply_translation_vi: str = ""
 
@@ -100,14 +82,3 @@ class XTrend:
     name: str
     rank: str
     description: str = ""
-
-
-@dataclass(frozen=True)
-class TrendSignal:
-    title: str
-    source: str
-    category: str
-    url: str = ""
-    description: str = ""
-    published_at: str = ""
-    score: float = 0.0

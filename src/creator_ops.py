@@ -78,21 +78,6 @@ class ReplyWatchStore:
             row["drafted_at"] = datetime.now(UTC).isoformat()
             self._save()
 
-    def watching(self, limit: int = 5) -> list[dict[str, Any]]:
-        rows = [
-            dict(row)
-            for row in self.data.get("items", {}).values()
-            if isinstance(row, dict) and row.get("state") == "watching"
-        ]
-        rows.sort(
-            key=lambda row: (
-                float(row.get("opportunity_score", 0.0)),
-                float(row.get("viral_score", 0.0)),
-            ),
-            reverse=True,
-        )
-        return rows[: max(0, limit)]
-
     def candidates_for_refresh(
         self,
         *,

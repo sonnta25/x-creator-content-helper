@@ -410,21 +410,6 @@ class ReplyLearningStore:
         self.data["feedback_events"] = events[-1000:]
         self._save()
 
-    def author_response_rate(self, username: str) -> float:
-        clean = username.strip().lstrip("@").casefold()
-        rows = [
-            row
-            for row in self.records("tracking", "measured")
-            if str(row.get("root_author") or "").casefold() == clean
-        ]
-        if not rows:
-            return 0.0
-        # One virtual success and three virtual failures avoid over-trusting a
-        # single lucky author interaction.
-        return (
-            1 + sum(bool(row.get("author_replied")) for row in rows)
-        ) / (4 + len(rows))
-
     def relationship_strength(
         self,
         username: str,
@@ -614,19 +599,6 @@ class ReplyLearningStore:
             encoding="utf-8",
         )
         temp.replace(self.path)
-
-
-def match_posted_reply(
-    record: dict[str, Any],
-    replies: Iterable[XSearchResult],
-    *,
-    discovery_window_minutes: int = 90,
-) -> XSearchResult | None:
-    return match_posted_content(
-        record,
-        replies,
-        discovery_window_minutes=discovery_window_minutes,
-    )
 
 
 def match_posted_content(

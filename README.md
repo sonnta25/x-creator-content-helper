@@ -9,7 +9,7 @@ The current AI flow is:
 Telegram bot -> local extension bridge -> one Gemini job -> Telegram bot
 ```
 
-Gemini produces each final draft in one browser job. The extension reuses one logged-in tab but starts a clean Gemini conversation for every job, preventing context from one command leaking into the next. It hard-recycles that tab after 10 successful jobs, or immediately after a provider/DOM failure, so a long-running VPS does not retain Gemini's old page heap indefinitely. Optional images use one additional Gemini job. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
+Gemini produces each final reply in one browser job. The extension reuses one logged-in tab but starts a clean Gemini conversation for every job, preventing context from one command leaking into the next. It hard-recycles that tab after 10 successful jobs, or immediately after a provider/DOM failure, so a long-running VPS does not retain Gemini's old page heap indefinitely. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
 
 ## Commands
 
@@ -142,9 +142,9 @@ The bot validates X language codes, keeps at least one and at most six, writes t
 
 With extension **Auto Run** OFF, click **Run next job** for the queued batch; with **Auto Run** ON, the extension picks it up automatically on its polling interval.
 
-Extension `0.8.1` waits for Gemini's composer to be visible before inserting a prompt. It can also upload bounded representative video frames before submitting `/replyvideo`, including Gemini layouts that require opening the attachment menu and then choosing the separate Upload files action. Low-resource mode is enabled by default: idle job and schedule checks run at most once per minute, the watchdog runs every two minutes, the managed-tab recovery heartbeat runs every 60 seconds, claimed-job heartbeats run every 20 seconds, and Gemini response DOM checks back off to four seconds until output appears. Alarm repair no longer performs an extra job poll or schedule scan. The prompt is inserted atomically and verified before submission. Provider failures recycle only the bot-managed Gemini tab, and the bridge retains bounded heartbeat-based timeout recovery.
+Extension `0.8.2` waits for Gemini's composer to be visible before inserting a prompt. It can also upload bounded representative video frames before submitting `/replyvideo`, including Gemini layouts that require opening the attachment menu and then choosing the separate Upload files action. Low-resource mode is enabled by default: idle job and schedule checks run at most once per minute, the watchdog runs every two minutes, the managed-tab recovery heartbeat runs every 60 seconds, claimed-job heartbeats run every 20 seconds, and Gemini response DOM checks back off to four seconds until output appears. Alarm repair no longer performs an extra job poll or schedule scan. The prompt is inserted atomically and verified before submission. Provider failures recycle only the bot-managed Gemini tab, and the bridge retains bounded heartbeat-based timeout recovery.
 
-Trend commands scan X trends, Google Trends RSS, localized Google News RSS feeds, and any custom RSS feeds from `TREND_RSS_URLS` concurrently. Cross-source confirmation and publication recency improve ranking. When X search is configured, selected topics are enriched with recent X context concurrently. `/replytargets` runs on its own scan interval but uses the independent `REPLY_TARGET_MAX_AGE_MINUTES` lookback. Repeated scans persist metric snapshots so ranking can use recent deltas and acceleration rather than lifetime averages alone.
+Automatic `/replytargets` discovery uses the authenticated X trends timeline plus localized broad and creator-niche search lanes. Its scan interval and `REPLY_TARGET_MAX_AGE_MINUTES` lookback are independent. Repeated scans persist metric snapshots so ranking can use recent deltas and acceleration rather than lifetime averages alone.
 
 ## Setup
 
@@ -194,10 +194,6 @@ EXTENSION_BRIDGE_PORT=8765
 EXTENSION_BRIDGE_TOKEN=choose-a-private-token
 EXTENSION_BRIDGE_TIMEOUT_SECONDS=360
 
-GENERATE_IMAGES=false
-IMAGE_PROVIDER=extension_bridge
-GEMINI_IMAGE_PROMPT_PREFIX=Create one square realistic image for this social post. Return the image only, with no extra text.
-
 X_COOKIE=
 X_ACCOUNT_NAME=telegram_bot
 X_ACCOUNTS_DB=data/twscrape_accounts.db
@@ -222,16 +218,6 @@ REPLY_LEARNING_ENABLED=true
 REPLY_LEARNING_PATH=data/reply_learning.json
 REPLY_TRACKING_POLL_MINUTES=5
 CREATOR_TIMEZONE=Asia/Ho_Chi_Minh
-X_POST_CHAR_LIMIT=2000
-
-TREND_SOURCES=x,google_trends,rss
-GOOGLE_TRENDS_GEO=US
-TREND_LANGUAGE=en
-TREND_RSS_URLS=
-CONTENT_LANGUAGE=Vietnamese
-
-HASHTAG_MODE=none
-
 CREATOR_NICHE=gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products
 CREATOR_VOICE=witty, practical, dry, slightly contrarian, with a sharp creator POV
 TARGET_AUDIENCE=Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools
@@ -284,7 +270,7 @@ The extension can schedule content generation while keeping the final X action m
 
 You can also change schedules from the private Telegram approval chat with `/replyevery 30` and `/videoevery 5`. Set per-run output with `/replybatch targets 3` and `/replybatch video 3`; `/replybatch show` displays both current values. Batch sizes are limited to 2-5, saved to `.env`, and applied immediately to manual and scheduled runs without restarting the bot. Every schedule command writes a schedule revision, even when the numeric value did not change. Low-resource mode picks it up within about 60 seconds and resets the next run from that moment. The popup shows both **Last trigger** and **Next run**.
 
-For both manual commands and scheduled runs, Telegram sends approval cards. Reply cards add **Alternative** and **Shorter**; post cards add **Generate visual** when an image prompt exists. Only the Telegram user who requested a manual draft can approve it.
+For both manual commands and scheduled runs, Telegram sends approval cards. Reply cards add **Alternative** and **Shorter**. Only the Telegram user who requested a manual draft can approve it.
 
 `/replytargets` and `/replyvideo` cards show the target link, a concise Vietnamese summary of the source, a Vietnamese translation of the proposed reply, and the original copy-ready reply in the source language. Views, reply counts, opportunity score, strategy, evidence mode, and why-now reasoning remain available internally for ranking and learning but are hidden from the approval card. Auto discovery uses the authenticated account's current X trends plus localized broad queries. When Japanese is enabled, one protected discovery lane covers hot Japanese conversations in economics, current affairs, sports, anime/games, and technology/AI, so personalized trends cannot consume the whole six-query budget. `balanced` and `qualified` modes also add a creator-niche lane; `reach` prioritizes distribution; `relationship` favors authors who have responded before. The trends timeline can reflect the logged-in account's locale/personalization and is not claimed to be a global chart. Search applies language filters but no country filter because most X posts do not carry reliable place metadata.
 
@@ -436,29 +422,6 @@ with recovery commands. Remove a bad account with:
 
 The default cookie is written to `.env`. Named accounts are stored in `data/twscrape_accounts.db`. Keep `.env` and `data/` private.
 
-## Trend context
-
-Automatic reply discovery can use these sources for topic context:
-
-```env
-TREND_SOURCES=x,google_trends,rss
-GOOGLE_TRENDS_GEO=US
-TREND_RSS_URLS=
-```
-
-`rss` includes built-in Google News feeds for `trending`, `news`, `sport`, and `entertainment`.
-Add custom feeds with semicolon-separated `Label|URL` entries:
-
-```env
-TREND_RSS_URLS=TechCrunch|https://techcrunch.com/feed/;The Verge|https://www.theverge.com/rss/index.xml
-```
-
-Use only RSS and Google Trends when X cookies are not available:
-
-```env
-TREND_SOURCES=google_trends,rss
-```
-
 ## Ubuntu Service
 
 Example systemd unit:
@@ -498,9 +461,7 @@ sudo journalctl -u x-content-bot -n 100 --no-pager
 
 - `Missing required environment variable: TELEGRAM_BOT_TOKEN`: edit `.env` in the project root.
 - `Could not connect to the local Chrome extension bridge`: start the bot, open Chrome, confirm the extension Bridge URL/token match `.env`.
-- `Extension bridge timed out`: verify extension `0.8.1` or newer is loaded and Automation or Auto Run is ON. The error distinguishes a job Chrome never claimed, a claimed job whose heartbeat stopped, and a live Gemini response that exceeded the bounded extended deadline. Low-resource recovery can take up to about 60 seconds; **Run next job** remains available for an immediate check.
-- `Missing image data`: reload the extension, keep the Gemini tab visible, and confirm Gemini generated an image in an `<img>` tag.
-- `No Google/RSS/X trend context found`: check internet access, RSS feed URLs, and X cookies, or provide a topic to `/replytargets`.
+- `Extension bridge timed out`: verify extension `0.8.2` or newer is loaded and Automation or Auto Run is ON. The error distinguishes a job Chrome never claimed, a claimed job whose heartbeat stopped, and a live Gemini response that exceeded the bounded extended deadline. Low-resource recovery can take up to about 60 seconds; **Run next job** remains available for an immediate check.
 
 ## BUY ME A COFFEE
 

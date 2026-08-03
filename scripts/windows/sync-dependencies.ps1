@@ -37,7 +37,7 @@ function Test-RequiredImports {
         # Missing imports are expected here. Windows PowerShell turns native
         # stderr into ErrorRecords, so suppress it and use the process exit code.
         $ErrorActionPreference = "SilentlyContinue"
-        & $pythonExe -c "import dotenv, gallery_dl, httpx, telegram, twscrape, yt_dlp" *> $null
+        & $pythonExe -c "import dotenv, gallery_dl, telegram, twscrape, yt_dlp" *> $null
         $exitCode = $LASTEXITCODE
     } catch {
         $exitCode = 1

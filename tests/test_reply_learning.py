@@ -7,7 +7,6 @@ from src.reply_learning import (
     MIN_FINAL_SAMPLES_TO_TUNE,
     ReplyLearningStore,
     match_posted_content,
-    match_posted_reply,
 )
 
 
@@ -66,7 +65,7 @@ def _approval(
     )
 
 
-def test_matches_posted_reply_by_parent_time_and_text() -> None:
+def test_matches_posted_content_by_parent_time_and_text() -> None:
     approved_at = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
     record = {
         "target_id": 42,
@@ -85,7 +84,7 @@ def test_matches_posted_reply_by_parent_time_and_text() -> None:
         created_at=approved_at + timedelta(minutes=3),
     )
 
-    assert match_posted_reply(record, [wrong_parent, correct]) == correct
+    assert match_posted_content(record, [wrong_parent, correct]) == correct
 
 
 def test_tracking_persists_and_finishes_at_24h(tmp_path) -> None:

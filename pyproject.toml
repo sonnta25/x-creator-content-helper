@@ -1,11 +1,10 @@
 [project]
 name = "x-telegram-content-bot"
 version = "0.1.0"
-description = "Telegram bot that generates X posts/replies from live trends and tweet links."
+description = "Telegram bot that finds high-opportunity X conversations and drafts standout replies."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "httpx>=0.27,<1",
     "python-dotenv>=1.0,<2",
     "python-telegram-bot>=21.8,<23",
     "twscrape>=0.19.2,<1",

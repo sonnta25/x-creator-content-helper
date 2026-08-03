@@ -18,14 +18,16 @@ $excludedDirs = @(
     ".agents",
     ".codex",
     ".git",
+    ".github",
     ".pytest_cache",
     ".venv",
     "__pycache__",
     "data",
     "dist",
-    "logs"
+    "logs",
+    "tests"
 )
-$excludedFiles = @(".env")
+$excludedFiles = @(".env", ".gitignore")
 
 function Get-PackageFiles {
     param([string] $Path)

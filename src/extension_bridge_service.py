@@ -17,7 +17,6 @@ class ExtensionBridgeService(ContentService):
         if looks_like_prompt_leak(output):
             raise RuntimeError("AI returned prompt instructions instead of final content.")
         return output
-
     async def _generate_text_with_images(
         self,
         prompt: str,
@@ -30,8 +29,3 @@ class ExtensionBridgeService(ContentService):
         if looks_like_prompt_leak(output):
             raise RuntimeError("AI returned prompt instructions instead of final content.")
         return output
-
-    async def generate_image(self, prompt: str) -> bytes:
-        if self.settings.image_provider != "extension_bridge":
-            return await super().generate_image(prompt)
-        return await self.bridge.submit_image_job(prompt)

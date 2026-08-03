@@ -24,13 +24,6 @@ SUPPORTED_REPLY_TARGET_LANGUAGES = {
 }
 MAX_REPLY_TARGET_LANGUAGES = 6
 
-TREND_FALLBACK_QUERIES = {
-    "trending": ["openai", "AI", "news", "entertainment"],
-    "news": ["news", "politics", "business", "technology"],
-    "sport": ["sports", "NBA", "NFL", "soccer"],
-    "entertainment": ["entertainment", "movies", "music", "Netflix"],
-}
-
 REPLY_TARGET_SEARCH_LIMIT = 40
 MIN_REPLY_TARGET_ENGAGEMENT_SCORE = 10.0
 MIN_REPLY_TARGET_VELOCITY_SCORE = 1.0
@@ -43,10 +36,6 @@ class XSearchService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._api: Any | None = None
-
-    @property
-    def is_configured(self) -> bool:
-        return bool(self.settings.x_cookie)
 
     async def import_cookie_account(self, account_name: str, cookie: str) -> str:
         clean_name = normalize_account_name(account_name)
@@ -184,28 +173,6 @@ class XSearchService:
             raise RuntimeError(f"X trends failed: {exc}") from exc
         return trends
 
-    async def trend_fallback_search(
-        self,
-        category: str = "trending",
-        limit: int | None = None,
-    ) -> tuple[str, list[XSearchResult]]:
-        clean_category = category.strip().lower() or "trending"
-        if clean_category not in TREND_CATEGORIES:
-            raise RuntimeError(
-                "Unknown trend category. Use trending, news, sport, or entertainment."
-            )
-
-        for query in TREND_FALLBACK_QUERIES[clean_category]:
-            search_query = default_english_query(query)
-            search_query = recent_search_query(search_query, 24 * 60)
-            results = await self.search(search_query, limit=limit, product="Latest")
-            if results:
-                return search_query, results
-        return recent_search_query(
-            default_english_query(TREND_FALLBACK_QUERIES[clean_category][-1]),
-            24 * 60,
-        ), []
-
     async def _get_api(self) -> Any:
         if self._api is None:
             try:
@@ -227,43 +194,6 @@ class XSearchService:
                         self.settings.x_cookie,
                     )
         return self._api
-
-
-def format_x_results(results: list[XSearchResult]) -> str:
-    if not results:
-        return "No X posts found."
-
-    lines: list[str] = []
-    for index, result in enumerate(results, start=1):
-        author = f"@{result.username}"
-        name = result.display_name.strip()
-        if name and name.lower() != result.username.lower():
-            author = f"{name} ({author})"
-        metrics = (
-            f"{result.like_count} likes, {result.retweet_count} reposts, "
-            f"{result.quote_count} quotes, {result.reply_count} replies"
-        )
-        if result.view_count is not None:
-            metrics = f"{metrics}, {result.view_count} views"
-        if result.author_followers_count is not None:
-            metrics = f"{metrics}, {result.author_followers_count} author followers"
-        lines.append(
-            f"{index}. {author} - {result.created_at}\n"
-            f"{_compact_text(result.text, 420)}\n"
-            f"{metrics}\n"
-            f"{result.url}"
-        )
-    return "\n\n".join(lines)
-
-
-def summarize_x_context(results: list[XSearchResult], max_items: int = 6) -> str:
-    lines: list[str] = []
-    for index, result in enumerate(results[:max_items], start=1):
-        lines.append(
-            f"{index}. @{result.username} ({result.created_at}, "
-            f"{result.like_count} likes): {_compact_text(result.text, 320)}"
-        )
-    return "\n".join(lines)
 
 
 def summarize_reply_target_context(results: list[XSearchResult], max_items: int = 5) -> str:
@@ -322,15 +252,6 @@ def summarize_reply_video_context(results: list[XSearchResult], max_items: int =
             "identity, location, or the full outcome."
         )
     return "\n\n".join(lines)
-
-
-def summarize_trends_context(trends: list[XTrend], max_items: int = 10) -> str:
-    lines: list[str] = []
-    for index, trend in enumerate(trends[:max_items], start=1):
-        detail = f" - {trend.description}" if trend.description else ""
-        rank = f"rank {trend.rank}" if trend.rank else f"item {index}"
-        lines.append(f"{index}. {trend.name} ({rank}){detail}")
-    return "\n".join(lines)
 
 
 def _to_search_result(tweet: Any) -> XSearchResult:

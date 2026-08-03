@@ -7,7 +7,6 @@ import pytest
 
 from src.x_search_service import (
     TREND_CATEGORIES,
-    TREND_FALLBACK_QUERIES,
     _to_search_result,
     default_english_query,
     extract_tweet_id,
@@ -17,22 +16,12 @@ from src.x_search_service import (
     rank_fast_growing_posts,
     rank_viral_video_posts,
     recent_search_query,
-    summarize_trends_context,
 )
 from src.x_search_service import XSearchService
 
 
 def test_trend_categories_match_supported_twscrape_ids() -> None:
     assert TREND_CATEGORIES == {"trending", "news", "sport", "entertainment"}
-    assert set(TREND_FALLBACK_QUERIES) == TREND_CATEGORIES
-
-
-def test_summarize_trends_context() -> None:
-    context = summarize_trends_context(
-        [XTrend(name="OpenAI", rank="1", description="Trending in Technology")]
-    )
-
-    assert context == "1. OpenAI (rank 1) - Trending in Technology"
 
 
 def test_normalize_account_name() -> None:

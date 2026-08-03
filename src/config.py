@@ -11,8 +11,6 @@ from dotenv import load_dotenv
 class Settings:
     telegram_bot_token: str
     content_provider: str = "extension_bridge"
-    generate_images: bool = False
-    image_provider: str = "extension_bridge"
     telegram_caption_limit: int = 1024
     x_cookie: str = ""
     x_account_name: str = "telegram_bot"
@@ -20,7 +18,6 @@ class Settings:
     x_accounts_db: str = "data/twscrape_accounts.db"
     x_search_limit: int = 8
     x_search_product: str = "Top"
-    x_post_char_limit: int = 2000
     reply_target_min_author_followers: int = 50_000
     reply_target_min_views: int = 500
     reply_target_max_age_minutes: int = 360
@@ -35,12 +32,6 @@ class Settings:
     reply_video_batch_size: int = 3
     creator_daily_reply_cap: int = 40
     creator_timezone: str = "Asia/Ho_Chi_Minh"
-    content_language: str = "Vietnamese"
-    trend_language: str = "en"
-    trend_sources: str = "x,google_trends,rss"
-    google_trends_geo: str = "US"
-    trend_rss_urls: str = ""
-    hashtag_mode: str = "none"
     creator_niche: str = "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products"
     creator_voice: str = "witty, practical, dry, slightly contrarian, with a sharp creator POV"
     target_audience: str = "Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools"
@@ -63,11 +54,6 @@ class Settings:
     download_cookies_file: str = ""
     download_cookies_from_browser: str = ""
     download_browser_profile: str = ""
-    gemini_image_prompt_prefix: str = (
-        "Create one square realistic image for this social post. Return the image only, "
-        "with no extra text."
-    )
-
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv(_project_env_path(), override=True, encoding="utf-8-sig")
@@ -75,12 +61,6 @@ class Settings:
             telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
             content_provider=_choice_env(
                 "CONTENT_PROVIDER",
-                "extension_bridge",
-                {"extension_bridge"},
-            ),
-            generate_images=_bool_env("GENERATE_IMAGES", False),
-            image_provider=_choice_env(
-                "IMAGE_PROVIDER",
                 "extension_bridge",
                 {"extension_bridge"},
             ),
@@ -94,7 +74,6 @@ class Settings:
             or "data/twscrape_accounts.db",
             x_search_limit=_int_env("X_SEARCH_LIMIT", 8),
             x_search_product=os.getenv("X_SEARCH_PRODUCT", "Top").strip() or "Top",
-            x_post_char_limit=_int_env("X_POST_CHAR_LIMIT", 2000),
             reply_target_min_author_followers=max(
                 0, _int_env("REPLY_TARGET_MIN_AUTHOR_FOLLOWERS", 50_000)
             ),
@@ -145,17 +124,6 @@ class Settings:
                 "CREATOR_TIMEZONE", "Asia/Ho_Chi_Minh"
             ).strip()
             or "Asia/Ho_Chi_Minh",
-            content_language=os.getenv(
-                "CONTENT_LANGUAGE", "Vietnamese"
-            ).strip()
-            or "Vietnamese",
-            trend_language=os.getenv("TREND_LANGUAGE", "en").strip().lower()
-            or "en",
-            trend_sources=os.getenv("TREND_SOURCES", "x,google_trends,rss").strip()
-            or "x,google_trends,rss",
-            google_trends_geo=os.getenv("GOOGLE_TRENDS_GEO", "US").strip() or "US",
-            trend_rss_urls=os.getenv("TREND_RSS_URLS", "").strip(),
-            hashtag_mode=_choice_env("HASHTAG_MODE", "none", {"none", "auto", "one"}),
             creator_niche=os.getenv(
                 "CREATOR_NICHE",
                 "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products",
@@ -222,22 +190,7 @@ class Settings:
             download_browser_profile=os.getenv(
                 "DOWNLOAD_BROWSER_PROFILE", ""
             ).strip(),
-            gemini_image_prompt_prefix=(
-                os.getenv("GEMINI_IMAGE_PROMPT_PREFIX")
-                or os.getenv(
-                    "GROK_IMAGE_PROMPT_PREFIX",
-                    (
-                        "Create one square realistic image for this social post. "
-                        "Return the image only, with no extra text."
-                    ),
-                )
-            ).strip()
-            or "Create one square realistic image for this social post. Return the image only.",
         )
-
-    @property
-    def grok_image_prompt_prefix(self) -> str:
-        return self.gemini_image_prompt_prefix
 
 
 def _required(name: str) -> str:

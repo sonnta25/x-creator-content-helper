@@ -23,7 +23,6 @@ from src.bot import (
     _friendly_error,
     _format_reply_target_link,
     _format_reply_target_reply,
-    _format_trend_variant_copy,
     _format_x_account_error_notification,
     _no_reply_targets_message,
     _approval_message_text,
@@ -33,9 +32,6 @@ from src.bot import (
     _mobile_x_open_url,
     _parse_importcookie_args,
     _parse_persona_args,
-    _parse_retweet_args,
-    _parse_tweettrend3_args,
-    _reply_target_interval_minutes,
     _reply_target_max_age_minutes,
     _reply_video_search_queries,
     _video_context_quality,
@@ -48,12 +44,9 @@ from src.bot import (
 from src.config import Settings
 from src.media_download_service import DownloadedMedia
 from src.models import (
-    GeneratedContent,
     ImageAttachment,
     ReplyRevision,
     ReplyTargetDraft,
-    TrendPostVariant,
-    TrendSignal,
     XSearchResult,
     XTrend,
 )
@@ -94,28 +87,6 @@ def test_parse_persona_args() -> None:
 def test_parse_persona_args_rejects_unknown_key() -> None:
     with pytest.raises(RuntimeError):
         _parse_persona_args("tone=witty")
-
-
-def test_parse_retweet_args() -> None:
-    link, visual_note = _parse_retweet_args(
-        "https://x.com/user/status/123 | Brazil supporter in yellow jersey sitting in stadium stands"
-    )
-
-    assert link == "https://x.com/user/status/123"
-    assert visual_note == "Brazil supporter in yellow jersey sitting in stadium stands"
-
-
-def test_parse_retweet_args_without_pipe() -> None:
-    link, visual_note = _parse_retweet_args(
-        "https://x.com/user/status/123 Brazil supporter in stadium stands"
-    )
-
-    assert link == "https://x.com/user/status/123"
-    assert visual_note == "Brazil supporter in stadium stands"
-
-
-def test_parse_tweettrend3_args_defaults_to_auto_vietnamese() -> None:
-    assert _parse_tweettrend3_args([]) == ("auto", "Vietnamese")
 
 
 def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
@@ -559,16 +530,6 @@ def test_replyvideo_cleans_download_when_frame_extraction_fails(tmp_path) -> Non
     assert skipped == 1
     assert cleaned == [True]
 
-def test_parse_tweettrend3_args_accepts_vietnamese_shortcut() -> None:
-    assert _parse_tweettrend3_args(["vi"]) == ("auto", "Vietnamese")
-    assert _parse_tweettrend3_args(["news", "vi"]) == ("news", "Vietnamese")
-    assert _parse_tweettrend3_args(["vi", "entertainment"]) == (
-        "entertainment",
-        "Vietnamese",
-    )
-    assert _parse_tweettrend3_args(["news", "en"]) == ("news", "Vietnamese")
-
-
 def test_reply_language_updates_add_remove_set_and_validate_limits() -> None:
     assert _updated_reply_target_languages("en,ja", "add", "ko, es") == [
         "en",
@@ -666,7 +627,6 @@ def test_format_reply_target_messages_are_copy_focused() -> None:
     draft = ReplyTargetDraft(
         url="https://x.com/user/status/123",
         target="@user - AI",
-        reason="Good target",
         reply="This is the reply.",
     )
 
@@ -675,7 +635,7 @@ def test_format_reply_target_messages_are_copy_focused() -> None:
 
 
 def test_mobile_reply_intent_prefills_text_and_target_tweet() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     approval = bot.approvals.create(
         kind="reply",
         text="This is ready to paste & reply.",
@@ -693,7 +653,7 @@ def test_mobile_reply_intent_prefills_text_and_target_tweet() -> None:
 
 
 def test_approval_keyboard_adds_mobile_intent_and_short_copy_button() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     approval = bot.approvals.create(
         kind="post",
         text="Short post draft",
@@ -717,37 +677,22 @@ def test_approval_keyboard_adds_mobile_intent_and_short_copy_button() -> None:
     assert any(button.copy_text and button.copy_text.text == approval.text for button in buttons)
 
 
-def test_reply_and_post_approval_cards_offer_lazy_quick_actions() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+def test_reply_approval_cards_offer_lazy_quick_actions() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     reply = bot.approvals.create(
         kind="reply",
         text="A specific reply",
         chat_id=123,
         target_url="https://x.com/source/status/1",
     )
-    post = bot.approvals.create(
-        kind="post",
-        text="An original post",
-        chat_id=123,
-        metadata={"image_prompt": "A square realistic photo"},
-    )
-
     reply_callbacks = {
         button.callback_data
         for row in _approval_keyboard(reply).inline_keyboard
         for button in row
         if button.callback_data
     }
-    post_callbacks = {
-        button.callback_data
-        for row in _approval_keyboard(post).inline_keyboard
-        for button in row
-        if button.callback_data
-    }
-
     assert f"automation:alternative:{reply.id}" in reply_callbacks
     assert f"automation:shorter:{reply.id}" in reply_callbacks
-    assert f"automation:visual:{post.id}" in post_callbacks
     assert f"automation:skip:{reply.id}" in reply_callbacks
 
 
@@ -919,11 +864,7 @@ def test_author_response_is_detected_between_metric_checkpoints(tmp_path) -> Non
     class FakeAI:
         async def generate_reply_from_text(self, text):
             assert text == response.text
-            return GeneratedContent(
-                text="That makes the rollout decision much clearer.",
-                image_prompt="",
-                topic="reply",
-            )
+            return "That makes the rollout decision much clearer."
 
     sent = []
 
@@ -1011,7 +952,7 @@ def test_stop_here_marks_the_parent_conversation_stopped(tmp_path) -> None:
 
 
 def test_mobile_post_falls_back_to_a_short_composer_url_when_draft_is_long() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     approval = bot.approvals.create(
         kind="post",
         text="Nội dung dài " * 200,
@@ -1024,7 +965,7 @@ def test_mobile_post_falls_back_to_a_short_composer_url_when_draft_is_long() -> 
 
 
 def test_reply_approval_message_shows_vietnamese_summary_and_translation() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     approval = bot.approvals.create(
         kind="reply",
         text="This is the reply draft.",
@@ -1062,7 +1003,7 @@ def test_reply_approval_message_shows_vietnamese_summary_and_translation() -> No
 
 
 def test_approval_keyboard_omits_copy_button_for_long_post() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     approval = bot.approvals.create(
         kind="post",
         text="x" * 257,
@@ -1078,124 +1019,18 @@ def test_approval_keyboard_omits_copy_button_for_long_post() -> None:
     assert all(button.copy_text is None for button in buttons)
 
 
-def test_format_trend_variant_copy_removes_option_score_metadata() -> None:
-    variant = TrendPostVariant(
-        angle="Useful observation",
-        text="Entertainment drama is really a fight over who gets to own the story.",
-        hashtags=["#EntertainmentBiz", "#CreatorLife"],
-        image_prompt="realistic photo",
-        score="Originality 4/5, Clarity 5/5",
-    )
-
-    copy_text = _format_trend_variant_copy(variant)
-
-    assert copy_text == (
-        "Entertainment drama is really a fight over who gets to own the story.\n\n"
-        "#EntertainmentBiz #CreatorLife"
-    )
-    assert "Option" not in copy_text
-    assert "Score" not in copy_text
-    assert "Hashtags:" not in copy_text
-
-
-def test_format_trend_variant_copy_does_not_duplicate_existing_hashtags() -> None:
-    variant = TrendPostVariant(
-        angle="Useful observation",
-        text="AI wrappers are becoming cable bundles with better branding. #AI",
-        hashtags=["#AI", "#CreatorTools"],
-        image_prompt="realistic photo",
-        score="",
-    )
-
-    assert _format_trend_variant_copy(variant).endswith("#CreatorTools")
-    assert _format_trend_variant_copy(variant).count("#AI") == 1
-
-
-def test_send_optional_image_is_silent_when_images_are_disabled() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
-    message = _FakeMessage()
-    generated = GeneratedContent(
-        text="Post text",
-        image_prompt="image prompt should not be sent",
-        topic="topic",
-    )
-
-    asyncio.run(bot._send_optional_image(message, generated, "topic"))
-
-    assert message.texts == []
-    assert message.photos == []
-
-
-def test_send_trend_variant_does_not_send_image_prompt_when_images_are_disabled() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
-    message = _FakeMessage()
-    variant = TrendPostVariant(
-        angle="Angle",
-        text="Post text",
-        hashtags=[],
-        image_prompt="image prompt should not be sent",
-        score="",
-    )
-
-    asyncio.run(bot._send_trend_variant(message, variant, 1))
-
-    assert message.texts == ["Post text"]
-    assert message.photos == []
-
-
-def test_send_trend_variant_uses_approval_card_when_provided() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
-    message = _FakeMessage()
-    variant = TrendPostVariant(
-        angle="Angle",
-        text="Post text",
-        hashtags=[],
-        image_prompt="image prompt",
-        score="",
-    )
-    approval = bot.approvals.create(
-        kind="post",
-        text="Post text",
-        chat_id=123,
-        approver_user_id=456,
-    )
-    sent = []
-
-    async def fake_send_approval(item, *, reason=""):
-        sent.append((item, reason))
-
-    bot._send_approval = fake_send_approval
-
-    asyncio.run(
-        bot._send_trend_variant(
-            message,
-            variant,
-            1,
-            approval=approval,
-            approval_reason="scheduled trend",
-        )
-    )
-
-    assert message.texts == []
-    assert sent == [(approval, "scheduled trend")]
-
-
 def test_dedupe_queries_preserves_order() -> None:
     assert _dedupe_queries(["AI", " ai ", "", "Crypto", "crypto"]) == ["AI", "Crypto"]
 
 
-def test_reply_target_interval_is_clamped_to_supported_schedule_range() -> None:
-    assert _reply_target_interval_minutes(45, default=30) == 45
-    assert _reply_target_interval_minutes("bad", default=30) == 30
-    assert _reply_target_interval_minutes(1, default=30) == 5
-    assert _reply_target_interval_minutes(9999, default=30) == 1440
+def test_reply_target_max_age_is_clamped_to_supported_range() -> None:
     assert _reply_target_max_age_minutes(360, default=360) == 360
     assert _reply_target_max_age_minutes(15, default=360) == 30
     assert _reply_target_max_age_minutes("bad", default=360) == 360
 
 
 def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     attempts = []
     expected = XSearchResult(
         id=2,
@@ -1241,7 +1076,7 @@ def test_replytargets_fetches_each_topic_once_then_relaxes_locally() -> None:
 
 
 def test_replytargets_auto_mode_compares_candidates_across_topics() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     now = int(datetime.now(UTC).timestamp())
     first_topic_slow = XSearchResult(
         id=40,
@@ -1304,8 +1139,7 @@ def test_replytargets_auto_mode_refetches_persisted_watched_tweet(tmp_path) -> N
     bot = ContentBot(
         Settings(
             telegram_bot_token="123:ABC",
-            generate_images=False,
-            reply_watch_path=str(tmp_path / "watch.json"),
+                        reply_watch_path=str(tmp_path / "watch.json"),
             reply_target_metrics_path=str(tmp_path / "metrics.json"),
         )
     )
@@ -1390,8 +1224,7 @@ def test_scheduled_replytargets_reports_daily_cap_instead_of_confirmation(tmp_pa
     bot = ContentBot(
         Settings(
             telegram_bot_token="123:ABC",
-            generate_images=False,
-            creator_daily_reply_cap=1,
+                        creator_daily_reply_cap=1,
             automation_approvals_path=str(tmp_path / "approvals.json"),
             reply_watch_path=str(tmp_path / "watch.json"),
         )
@@ -1437,7 +1270,7 @@ def test_scheduled_replytargets_reports_daily_cap_instead_of_confirmation(tmp_pa
 
 
 def test_replytargets_explicit_topic_expands_languages_without_topic_drift() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     attempts = []
     japanese = XSearchResult(
         id=42,
@@ -1483,7 +1316,7 @@ def test_replytargets_explicit_topic_expands_languages_without_topic_drift() -> 
 
 
 def test_replytargets_relaxed_ranking_keeps_view_count_as_a_hard_floor() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     now = int(datetime.now(UTC).timestamp())
     low_view = XSearchResult(
         id=9,
@@ -1523,8 +1356,7 @@ def test_replytargets_volume_fallback_lowers_view_floor_to_fill_batch(tmp_path) 
     bot = ContentBot(
         Settings(
             telegram_bot_token="123:ABC",
-            generate_images=False,
-            reply_watch_path=str(tmp_path / "watch.json"),
+                        reply_watch_path=str(tmp_path / "watch.json"),
             reply_target_metrics_path=str(tmp_path / "metrics.json"),
             reply_target_min_views=500,
         )
@@ -1590,8 +1422,7 @@ def test_replytargets_minimum_batch_fallback_accepts_any_visible_views(tmp_path)
     bot = ContentBot(
         Settings(
             telegram_bot_token="123:ABC",
-            generate_images=False,
-            reply_watch_path=str(tmp_path / "watch.json"),
+                        reply_watch_path=str(tmp_path / "watch.json"),
             reply_target_metrics_path=str(tmp_path / "metrics.json"),
             reply_target_min_views=500,
         )
@@ -1645,8 +1476,7 @@ def test_replytargets_reports_search_outage_instead_of_empty_market(tmp_path) ->
     bot = ContentBot(
         Settings(
             telegram_bot_token="123:ABC",
-            generate_images=False,
-            reply_watch_path=str(tmp_path / "watch.json"),
+                        reply_watch_path=str(tmp_path / "watch.json"),
             reply_target_metrics_path=str(tmp_path / "metrics.json"),
         )
     )
@@ -1671,7 +1501,7 @@ def test_replytargets_reports_search_outage_instead_of_empty_market(tmp_path) ->
 
 
 def test_replytargets_relaxed_ranking_rejects_fresh_posts_without_signal() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     no_signal = XSearchResult(
         id=11,
         username="nosignal",
@@ -1694,7 +1524,7 @@ def test_replytargets_relaxed_ranking_rejects_fresh_posts_without_signal() -> No
 
 
 def test_replytargets_never_accepts_posts_older_than_lookback() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     expected = XSearchResult(
         id=3,
         username="user",
@@ -1733,7 +1563,7 @@ def test_replytargets_never_accepts_posts_older_than_lookback() -> None:
 
 
 def test_replytargets_auto_topic_discovery_uses_one_bounded_trend_call() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     calls = []
 
     class XSearch:
@@ -1763,7 +1593,7 @@ def test_replytargets_auto_topic_discovery_uses_one_bounded_trend_call() -> None
 
 
 def test_replytargets_auto_fallback_round_robins_configured_languages() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
 
     class XSearch:
         async def trends(self, category, limit):
@@ -1882,7 +1712,7 @@ def test_reply_batch_waits_when_fewer_than_two_candidates_exist() -> None:
 
 
 def test_replytargets_searches_top_and_latest_root_posts_within_freshness_window() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     calls = []
 
     class XSearch:
@@ -1904,7 +1734,7 @@ def test_replytargets_searches_top_and_latest_root_posts_within_freshness_window
 
 
 def test_replytargets_merges_top_and_latest_and_keeps_fresher_metrics() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     duplicate_top = XSearchResult(
         id=50,
         username="same",
@@ -1951,77 +1781,6 @@ def test_replytargets_merges_top_and_latest_and_keeps_fresher_metrics() -> None:
     assert [result.id for result in results] == [50, 51]
     assert results[0].view_count == 1_500
     assert results[0].like_count == 20
-
-
-def test_tweettrend3_collects_three_distinct_topics() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
-    searched = []
-
-    class Status:
-        async def edit_text(self, _text):
-            return None
-
-    class Trends:
-        async def collect(self, category):
-            return [
-                TrendSignal(title="Topic one", source="RSS", category=category, score=30),
-                TrendSignal(title="Topic two", source="RSS", category=category, score=20),
-                TrendSignal(title="Topic three", source="RSS", category=category, score=10),
-            ], []
-
-    class XSearch:
-        async def search_recent(self, query, **_kwargs):
-            searched.append(query)
-            return query, []
-
-    bot.trend_sources = Trends()
-    bot.x_search = XSearch()
-
-    contexts = asyncio.run(
-        bot._get_trend_contexts_for_tweettrend3("news", Status())
-    )
-
-    assert [context[0] for context in contexts] == [
-        "Topic one",
-        "Topic two",
-        "Topic three",
-    ]
-    assert searched == ["Topic one", "Topic two", "Topic three"]
-
-
-def test_tweettrend3_auto_prefers_creator_niche_topics() -> None:
-    bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
-
-    class Status:
-        async def edit_text(self, _text):
-            return None
-
-    class Trends:
-        async def collect_niche(self, niche):
-            assert niche == bot.settings.creator_niche
-            return [
-                TrendSignal(title="Creator tool launch", source="Niche", category="niche", score=5),
-                TrendSignal(title="AI workflow update", source="Niche", category="niche", score=4),
-                TrendSignal(title="Indie business funding", source="Niche", category="niche", score=3),
-            ], []
-
-        async def collect(self, _category):
-            raise AssertionError("General trends should not be needed when niche has three topics")
-
-    class XSearch:
-        async def search_recent(self, query, **_kwargs):
-            return query, []
-
-    bot.trend_sources = Trends()
-    bot.x_search = XSearch()
-
-    contexts = asyncio.run(bot._get_trend_contexts_for_tweettrend3("auto", Status()))
-
-    assert [context[0] for context in contexts] == [
-        "Creator tool launch",
-        "AI workflow update",
-        "Indie business funding",
-    ]
 
 
 def test_no_reply_targets_message_allows_auto_mode() -> None:

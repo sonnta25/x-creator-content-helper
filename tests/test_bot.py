@@ -4,11 +4,17 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from telegram import ForceReply
+from telegram import ForceReply, ReplyKeyboardMarkup
 
 from src.bot import (
     BOT_COMMANDS,
     ContentBot,
+    MENU_ACTIONS,
+    MENU_LAYOUTS,
+    MENU_REPLY_BATCH,
+    MENU_REPLY_TARGETS,
+    MENU_REPLY_VIDEO,
+    MENU_VIDEO_SCHEDULE,
     _command_payload,
     _dedupe_queries,
     _exception_detail,
@@ -44,6 +50,7 @@ from src.media_download_service import DownloadedMedia
 from src.models import (
     GeneratedContent,
     ImageAttachment,
+    ReplyRevision,
     ReplyTargetDraft,
     TrendPostVariant,
     TrendSignal,
@@ -114,13 +121,32 @@ def test_parse_tweettrend3_args_defaults_to_auto_vietnamese() -> None:
 def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
     commands = {command.command for command in BOT_COMMANDS}
 
-    assert {"vntweet", "angles", "xsearch"}.isdisjoint(commands)
-    assert {"tweet", "tweettrend3", "tweetx", "dailybrief", "retweet", "reply"}.issubset(commands)
-    assert "replyevery" in commands
-    assert {"replylearn", "replyreport", "replylangs", "replybatch"}.issubset(commands)
-    assert {"today", "setupcheck"}.issubset(commands)
-    assert "download" in commands
-    assert "cancel" in commands
+    assert {
+        "vntweet", "angles", "xsearch", "tweet", "tweetx", "xtweet",
+        "tweettrend3", "dailybrief", "retweet", "today", "automationhere",
+    }.isdisjoint(commands)
+    assert {
+        "start", "menu", "help", "download", "replytargets", "replyvideo",
+        "reply", "replyevery", "videoevery", "replybatch", "replylangs",
+        "replylearn", "replyreport", "setupcheck", "cancel",
+    }.issubset(commands)
+
+
+def test_grouped_menu_keeps_replyvideo_and_automation_controls() -> None:
+    assert MENU_REPLY_TARGETS in MENU_LAYOUTS["reply"][0]
+    assert MENU_REPLY_VIDEO in MENU_LAYOUTS["reply"][0]
+    assert MENU_VIDEO_SCHEDULE in MENU_LAYOUTS["automation"][0]
+    assert MENU_REPLY_BATCH in MENU_LAYOUTS["automation"][1]
+    assert MENU_ACTIONS[MENU_REPLY_VIDEO] == ("command", "replyvideo")
+    assert MENU_ACTIONS[MENU_VIDEO_SCHEDULE] == ("command", "videoevery")
+
+
+def test_menu_keyboard_is_persistent() -> None:
+    from src.bot import _menu_keyboard
+
+    keyboard = _menu_keyboard("main")
+    assert isinstance(keyboard, ReplyKeyboardMarkup)
+    assert keyboard.is_persistent is True
 
 
 def test_command_payload_preserves_plain_follow_up_text() -> None:
@@ -275,13 +301,13 @@ def test_download_command_sends_document_and_cleans_temp_file(tmp_path) -> None:
             self.document_bytes = b""
 
         async def reply_text(self, text):
-            assert text == "Downloading the video..."
+            assert text == "Downloading media from the post..."
             return self.status
 
         async def reply_document(self, document, **kwargs):
             self.document_bytes = document.read()
             assert kwargs["filename"] == media_path.name
-            assert "Prepared video file" in kwargs["caption"]
+            assert "Prepared video" in kwargs["caption"]
             assert "Source reference:" in kwargs["caption"]
             assert "Sample" not in kwargs["caption"]
 
@@ -296,6 +322,62 @@ def test_download_command_sends_document_and_cleans_temp_file(tmp_path) -> None:
     assert message.document_bytes == b"downloaded video"
     assert message.status.deleted is True
     assert not media_path.exists()
+
+
+def test_download_command_sends_every_image_in_a_carousel(tmp_path) -> None:
+    first = tmp_path / "creator-image-one.jpg"
+    second = tmp_path / "creator-image-two.webp"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    downloaded = DownloadedMedia(
+        path=first,
+        additional_paths=(second,),
+        title="Carousel",
+        source_url="https://www.instagram.com/p/example/",
+        extractor="gallery-dl",
+    )
+
+    class FakeDownloader:
+        def download(self, _url):
+            return downloaded
+
+    class FakeStatus:
+        async def edit_text(self, text):
+            assert "2 images" in text
+
+        async def delete(self):
+            return None
+
+    class FakeChat:
+        async def send_action(self, _action):
+            return None
+
+    class FakeMessage:
+        text = f"/download {downloaded.source_url}"
+        caption = None
+        chat = FakeChat()
+
+        def __init__(self):
+            self.files = []
+
+        async def reply_text(self, text):
+            assert text == "Downloading media from the post..."
+            return FakeStatus()
+
+        async def reply_document(self, document, **kwargs):
+            self.files.append((kwargs["filename"], document.read()))
+            assert "Prepared media file" in kwargs["caption"]
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    bot.media_downloader = FakeDownloader()
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message)
+
+    asyncio.run(bot.download(update, SimpleNamespace(args=[downloaded.source_url])))
+
+    assert message.files == [(first.name, b"one"), (second.name, b"two")]
+    assert not first.exists()
+    assert not second.exists()
 
 
 def test_automation_config_exposes_telegram_reply_interval() -> None:
@@ -669,6 +751,58 @@ def test_reply_and_post_approval_cards_offer_lazy_quick_actions() -> None:
     assert f"automation:skip:{reply.id}" in reply_callbacks
 
 
+def test_shorter_updates_reply_translation_on_the_same_card() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    approval = bot.approvals.create(
+        kind="reply",
+        text="The original reply is longer than it needs to be.",
+        chat_id=123,
+        approver_user_id=456,
+        target_url="https://x.com/source/status/1",
+        metadata={
+            "root_text": "A source post about rollout timing.",
+            "source_summary_vi": "Bài viết nói về thời điểm triển khai.",
+            "reply_translation_vi": "Bản dịch cũ.",
+        },
+    )
+
+    class FakeAI:
+        async def generate_reply_revision(self, *_args):
+            return ReplyRevision(
+                reply="Timing is the real tradeoff.",
+                reply_translation_vi="Thời điểm mới là sự đánh đổi thực sự.",
+            )
+
+    edits = []
+
+    class FakeQuery:
+        data = f"automation:shorter:{approval.id}"
+        from_user = SimpleNamespace(id=456)
+        message = SimpleNamespace(chat=SimpleNamespace(id=123))
+
+        async def answer(self, *_args, **_kwargs):
+            return None
+
+        async def edit_message_text(self, *args, **kwargs):
+            edits.append((args, kwargs))
+
+    bot.ai = FakeAI()
+    asyncio.run(
+        bot.automation_approval(
+            SimpleNamespace(callback_query=FakeQuery()),
+            SimpleNamespace(),
+        )
+    )
+
+    updated = bot.approvals.get(approval.id)
+    assert updated.text == "Timing is the real tradeoff."
+    assert updated.metadata["reply_translation_vi"] == (
+        "Thời điểm mới là sự đánh đổi thực sự."
+    )
+    assert "Bản dịch cũ" not in edits[0][0][0]
+    assert "Thời điểm mới là sự đánh đổi thực sự" in edits[0][0][0]
+
+
 def test_author_followup_card_shows_response_and_continue_stop_actions() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
     approval = bot.approvals.create(
@@ -889,7 +1023,7 @@ def test_mobile_post_falls_back_to_a_short_composer_url_when_draft_is_long() -> 
     assert "copy it above" in _mobile_approval_note(approval)
 
 
-def test_reply_approval_message_contains_only_link_and_draft() -> None:
+def test_reply_approval_message_shows_vietnamese_summary_and_translation() -> None:
     bot = ContentBot(Settings(telegram_bot_token="123:ABC", generate_images=False))
     approval = bot.approvals.create(
         kind="reply",
@@ -897,19 +1031,34 @@ def test_reply_approval_message_contains_only_link_and_draft() -> None:
         chat_id=123,
         target_url="https://x.com/user/status/123",
         target_label="@user - topic",
+        metadata={
+            "source_summary_vi": "Tác giả chia sẻ một thay đổi trong kế hoạch.",
+            "reply_translation_vi": "Điểm đánh đổi khi triển khai quan trọng hơn ngày ra mắt.",
+            "root_views": 15_517,
+            "root_replies": 21,
+            "reply_opportunity_score": 56,
+            "reply_strategy": "practical_implication",
+            "video_context_quality": "caption_only",
+        },
     )
 
     text = _approval_message_text(approval, reason="High engagement")
 
     assert text == (
-        "https://x.com/user/status/123\n"
-        "Why now: High engagement\n\n"
+        "https://x.com/user/status/123\n\n"
+        "Tóm tắt bài viết:\n"
+        "Tác giả chia sẻ một thay đổi trong kế hoạch.\n\n"
+        "Bản dịch reply:\n"
+        "Điểm đánh đổi khi triển khai quan trọng hơn ngày ra mắt.\n\n"
+        "Reply gốc:\n"
         "This is the reply draft."
     )
-    assert "Reply approval" not in text
-    assert "Why:" not in text
-    assert "Choose" not in text
-    assert "Approved" not in text
+    assert "caption only" not in text
+    assert "15,517 views" not in text
+    assert "21 replies" not in text
+    assert "opportunity" not in text
+    assert "practical implication" not in text
+    assert "Why now" not in text
 
 
 def test_approval_keyboard_omits_copy_button_for_long_post() -> None:

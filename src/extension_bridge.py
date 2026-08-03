@@ -28,8 +28,6 @@ class AutomationBridgeHandler(Protocol):
 
     async def trigger_replyvideo(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
-    async def trigger_tweettrend3(self, payload: dict[str, Any]) -> dict[str, Any]: ...
-
     async def next_approved_action(self) -> dict[str, Any] | None: ...
 
     async def finish_approved_action(
@@ -251,11 +249,6 @@ class ExtensionBridgeServer:
         if path == "/automation/triggers/replyvideo" and method == "POST":
             handler = self._require_automation_handler()
             result = await handler.trigger_replyvideo(_json_body(request["body"]))
-            return _json_response(202, result)
-
-        if path == "/automation/triggers/tweettrend3" and method == "POST":
-            handler = self._require_automation_handler()
-            result = await handler.trigger_tweettrend3(_json_body(request["body"]))
             return _json_response(202, result)
 
         if path == "/automation/approvals/next" and method == "GET":

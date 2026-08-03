@@ -170,4 +170,4 @@ if ($EnableVpsRestartSchedule) {
 & (Join-Path $ProjectRoot "scripts\windows\stop.ps1")
 & (Join-Path $ProjectRoot "scripts\windows\start.ps1")
 
-Write-Host "Setup complete. Try /tweettrend3 or /replytargets in Telegram."
+Write-Host "Setup complete. Try /replytargets, /replyvideo, or /download in Telegram."

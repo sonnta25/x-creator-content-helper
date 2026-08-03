@@ -8,7 +8,13 @@ from typing import Any
 import httpx
 
 from src.config import Settings
-from src.models import GeneratedContent, ImageAttachment, ReplyTargetDraft, TrendPostVariant
+from src.models import (
+    GeneratedContent,
+    ImageAttachment,
+    ReplyRevision,
+    ReplyTargetDraft,
+    TrendPostVariant,
+)
 from src.prompt_safety import looks_like_prompt_leak
 
 
@@ -738,7 +744,7 @@ Return only valid JSON with this shape:
         source_text: str,
         current_reply: str,
         instruction: str,
-    ) -> str:
+    ) -> ReplyRevision:
         prompt = _reply_engine_prompt(
             self.settings,
             task=(
@@ -749,23 +755,24 @@ Return only valid JSON with this shape:
                 f"Source post:\n{source_text}\n\n"
                 f"Current reply:\n{current_reply}"
             ),
-            output_contract=_single_reply_output_contract(),
+            output_contract=_reply_revision_output_contract(),
         )
-        reply = _parse_single_reply(await self._generate_text(prompt))
+        reply, translation = _parse_reply_revision(await self._generate_text(prompt))
         if _reply_is_question_only(reply):
             repaired = await self._generate_text(
                 _single_reply_value_repair_prompt(
                     settings=self.settings,
                     source_text=source_text,
                     failed_reply=reply,
+                    output_contract=_reply_revision_output_contract(),
                 )
             )
-            reply = _parse_single_reply(repaired)
+            reply, translation = _parse_reply_revision(repaired)
             if _reply_is_question_only(reply):
                 raise RuntimeError(
                     "AI returned a question-only reply after one automatic value repair."
                 )
-        return reply
+        return ReplyRevision(reply=reply, reply_translation_vi=translation)
 
     async def generate_retweet_remix(
         self,
@@ -1036,7 +1043,7 @@ Task:
 {brief.strip()}{context_block}
 
 Shared tweet-family rules:
-- Use the same Knowledge Engine process for /tweet, /tweetx, and /tweettrend3.
+- Use the same Knowledge Engine process for supported original-post generation.
 - Each post must say one concrete thing worth noticing; do not manufacture a grand lesson.
 - Use a clear stance or personal lens when it fits the available context, not a generic life lesson.
 - Prefer a real tension, tradeoff, or overlooked detail over an invented second-order effect.
@@ -1171,6 +1178,17 @@ No quotes.
 """.strip()
 
 
+def _reply_revision_output_contract() -> str:
+    return """
+Return JSON only with this exact shape:
+{
+  "reply": "revised copy-ready reply in the source post's language",
+  "reply_translation_vi": "natural Vietnamese translation of the revised reply"
+}
+No markdown and no explanation.
+""".strip()
+
+
 def _reply_targets_output_contract(required_targets: int = 1) -> str:
     return """
 CRITICAL FORMAT RULES:
@@ -1178,7 +1196,8 @@ CRITICAL FORMAT RULES:
 - The top-level object must contain a "targets" array.
 - Return exactly REQUIRED_TARGETS distinct targets, choosing the strongest available candidates.
 - Do not return "replies", "items", "results", "options", or plain text.
-- Each target must include url, target, reason, strategy, and reply.
+- Each target must include url, target, reason, strategy, reply, source_summary_vi,
+  and reply_translation_vi.
 - URL values must be plain https://x.com/... strings, never Markdown links.
 - Escape every double quote inside a JSON string as \\\". The complete response must parse as JSON.
 
@@ -1188,6 +1207,10 @@ For each candidate, write:
 - Why reply: one short metric-grounded reason this post has current momentum
 - Draft reply: one distinctive, natural reply in the candidate post's language,
   under 220 characters
+- Vietnamese source summary: summarize the source post naturally in Vietnamese in
+  one or two concise sentences; never add facts outside the supplied candidate
+- Vietnamese reply translation: translate the exact meaning and tone of the draft
+  reply naturally; never strengthen, soften, or add claims
 
 Keep the URL with the matching candidate. Do not make up links.
 
@@ -1199,7 +1222,9 @@ Return only valid JSON with this shape:
       "target": "@author - short topic",
       "reason": "why this is worth replying to",
       "strategy": "assigned strategy name",
-      "reply": "copy-ready reply under 220 characters"
+      "reply": "copy-ready reply under 220 characters",
+      "source_summary_vi": "concise Vietnamese summary of the source post",
+      "reply_translation_vi": "natural Vietnamese translation of the reply"
     }
   ]
 }
@@ -1218,7 +1243,8 @@ You are a Twitter/X Reply Engine repairing an unusable reply-target response.
 
 Return JSON only with one top-level `targets` array. Return exactly {required_targets}
 distinct targets.
-Each object must contain: url, target, reason, strategy, reply.
+Each object must contain: url, target, reason, strategy, reply, source_summary_vi,
+reply_translation_vi.
 Copy each url exactly from Candidate X posts. Never invent or omit a URL.
 Write one short, natural reply for each selected candidate. Do not return an empty array.
 Each reply must first state one source-grounded observation, implication, comparison,
@@ -1238,8 +1264,12 @@ Candidate X posts:
 Previous unusable output:
 {_compact_error_text(failed_output, 1200)}
 
+For every object, source_summary_vi must be a faithful one- or two-sentence
+Vietnamese summary of that candidate. reply_translation_vi must be a natural
+Vietnamese translation of the exact reply without adding claims.
+
 Required shape:
-{{"targets":[{{"url":"exact candidate URL","target":"@author - topic","reason":"short reach reason","strategy":"specific_observation","reply":"copy-ready reply"}}]}}
+{{"targets":[{{"url":"exact candidate URL","target":"@author - topic","reason":"short reach reason","strategy":"specific_observation","reply":"copy-ready reply","source_summary_vi":"Vietnamese source summary","reply_translation_vi":"Vietnamese reply translation"}}]}}
 """.strip()
 
 
@@ -1248,6 +1278,7 @@ def _single_reply_value_repair_prompt(
     settings: Settings,
     source_text: str,
     failed_reply: str,
+    output_contract: str | None = None,
 ) -> str:
     return _reply_engine_prompt(
         settings,
@@ -1260,7 +1291,7 @@ def _single_reply_value_repair_prompt(
             f"Source post:\n{source_text}\n\n"
             f"Question-only draft to replace:\n{failed_reply}"
         ),
-        output_contract=_single_reply_output_contract(),
+        output_contract=output_contract or _single_reply_output_contract(),
     )
 
 
@@ -1681,6 +1712,20 @@ def _parse_reply_targets(
                 target=str(item.get("target", "")).strip(),
                 reason=str(item.get("reason", "")).strip(),
                 reply=reply,
+                source_summary_vi=_first_text_value(
+                    item,
+                    "source_summary_vi",
+                    "sourceSummaryVi",
+                    "summary_vi",
+                    "summaryVi",
+                ),
+                reply_translation_vi=_first_text_value(
+                    item,
+                    "reply_translation_vi",
+                    "replyTranslationVi",
+                    "translation_vi",
+                    "translationVi",
+                ),
                 strategy=(
                     str(item.get("strategy", "")).strip()
                     if str(item.get("strategy", "")).strip()
@@ -1836,6 +1881,28 @@ def _parse_single_reply(raw: str) -> str:
     if len(reply.split()) > 60:
         raise RuntimeError("AI returned a reply longer than the 60-word reply contract.")
     return reply
+
+
+def _parse_reply_revision(raw: str) -> tuple[str, str]:
+    try:
+        payload = _parse_json(str(raw or ""))
+    except (ModelJsonParseError, json.JSONDecodeError, RuntimeError):
+        return _parse_single_reply(raw), ""
+    reply = _limit_x_text(_first_text_value(payload, "reply", "text", "response"))
+    translation = _first_text_value(
+        payload,
+        "reply_translation_vi",
+        "replyTranslationVi",
+        "translation_vi",
+        "translationVi",
+    )
+    if not reply:
+        raise RuntimeError("AI returned JSON without the required reply field.")
+    if _looks_like_prompt_leak(reply):
+        raise RuntimeError("AI returned prompt instructions instead of a revised reply.")
+    if len(reply.split()) > 60:
+        raise RuntimeError("AI returned a reply longer than the 60-word reply contract.")
+    return reply, translation.strip()
 
 
 def _first_list_value(payload: dict[str, Any], *keys: str) -> list[Any] | None:

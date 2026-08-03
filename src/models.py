@@ -26,6 +26,14 @@ class ReplyTargetDraft:
     reason: str
     reply: str
     strategy: str = "specific_observation"
+    source_summary_vi: str = ""
+    reply_translation_vi: str = ""
+
+
+@dataclass(frozen=True)
+class ReplyRevision:
+    reply: str
+    reply_translation_vi: str = ""
 
 
 @dataclass(frozen=True)

@@ -16,15 +16,12 @@ const DEFAULTS = {
   replyVideoMinutes: 5,
   replyVideoQuery: "",
   replyVideoWindows: "08:00-11:00,12:00-14:00,19:00-22:00",
-  trendTimes: "09:00,18:00",
-  trendCategory: "auto",
   nextReplyTargetsAt: 0,
   lastReplyTargetsTriggeredAt: 0,
   replyTargetsConfigUpdatedAt: 0,
   nextReplyVideoAt: 0,
   lastReplyVideoTriggeredAt: 0,
   replyVideoConfigUpdatedAt: 0,
-  trendRunKeys: [],
   lastStatus: "Ready."
 };
 
@@ -67,7 +64,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     changes.creatorTimezone ||
     changes.replyTargetsMinutes || changes.replyTargetsMaxAgeMinutes ||
     changes.replyTargetsLanguages || changes.replyVideoMinutes ||
-    changes.replyVideoWindows || changes.trendTimes
+    changes.replyVideoWindows
   ) {
     if (changes.replyTargetsMinutes) {
       const minutes = Math.max(5, Number(changes.replyTargetsMinutes.newValue || DEFAULTS.replyTargetsMinutes));
@@ -265,7 +262,6 @@ async function automationTick() {
   }
 
   const now = new Date();
-  const zoned = zonedDateParts(now, config.creatorTimezone);
   const nowMs = now.getTime();
   let shouldRunJobs = Boolean(config.automationRunning);
   if (!config.nextReplyTargetsAt) {
@@ -317,26 +313,6 @@ async function automationTick() {
     }
   }
 
-  const runKeys = new Set(config.trendRunKeys);
-  for (const time of parseTrendTimes(config.trendTimes)) {
-    const scheduledMinutes = clockMinutes(time, 0);
-    const currentMinutes = zoned.hour * 60 + zoned.minute;
-    const ageMinutes = currentMinutes - scheduledMinutes;
-    const key = `${zoned.dateKey}|${time}`;
-    if (ageMinutes >= 0 && ageMinutes < 10 && !runKeys.has(key)) {
-      await setStatus(`Starting scheduled /tweettrend3 ${config.trendCategory}...`);
-      const trigger = await bridgeFetch(config, "/automation/triggers/tweettrend3", {
-        method: "POST",
-        body: { category: config.trendCategory }
-      });
-      if (trigger.status === "accepted") {
-        runKeys.add(key);
-        await chromeStorageSet({ trendRunKeys: Array.from(runKeys).slice(-14) });
-        shouldRunJobs = true;
-        break;
-      }
-    }
-  }
   return { runJobs: shouldRunJobs };
 }
 
@@ -480,14 +456,6 @@ function clockMinutes(value, fallback) {
   return hours * 60 + minutes;
 }
 
-function parseTrendTimes(value) {
-  return Array.from(new Set(String(value || "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter((item) => clockMinutes(item, -1) >= 0)))
-    .sort();
-}
-
 function scheduledTimeToday(now, value) {
   const minutes = clockMinutes(value, 0);
   const result = new Date(now);
@@ -523,8 +491,8 @@ async function runJobs({ force, maxJobs }) {
     if (processed === 0) {
       await setStatus(`No pending job. Last checked ${new Date().toLocaleTimeString()}.`);
     } else {
-      // The bot often queues the next /tweettrend3 or repair job immediately
-      // after receiving this result. Keep one low-frequency follow-up wake so
+      // The bot can queue a repair job immediately after receiving this result.
+      // Keep one low-frequency follow-up wake so
       // it is not left waiting if the primary repeating alarm disappears.
       chrome.alarms.create(FOLLOW_UP_ALARM, { delayInMinutes: 1 });
     }
@@ -2424,15 +2392,12 @@ async function loadConfig() {
     replyVideoMinutes: Math.max(3, Number(saved.replyVideoMinutes || DEFAULTS.replyVideoMinutes)),
     replyVideoQuery: String(saved.replyVideoQuery || ""),
     replyVideoWindows: String(saved.replyVideoWindows || DEFAULTS.replyVideoWindows),
-    trendTimes: String(saved.trendTimes || DEFAULTS.trendTimes),
-    trendCategory: String(saved.trendCategory || DEFAULTS.trendCategory),
     nextReplyTargetsAt: Number(saved.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(saved.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(saved.replyTargetsConfigUpdatedAt || 0),
     nextReplyVideoAt: Number(saved.nextReplyVideoAt || 0),
     lastReplyVideoTriggeredAt: Number(saved.lastReplyVideoTriggeredAt || 0),
     replyVideoConfigUpdatedAt: Number(saved.replyVideoConfigUpdatedAt || 0),
-    trendRunKeys: Array.isArray(saved.trendRunKeys) ? saved.trendRunKeys : [],
     lastStatus: String(session.lastStatus || saved.lastStatus || DEFAULTS.lastStatus)
   };
 }
@@ -2464,15 +2429,12 @@ async function saveConfig(config) {
     replyVideoMinutes: Math.max(3, Number(config.replyVideoMinutes || DEFAULTS.replyVideoMinutes)),
     replyVideoQuery: String(config.replyVideoQuery || ""),
     replyVideoWindows: String(config.replyVideoWindows || DEFAULTS.replyVideoWindows),
-    trendTimes: String(config.trendTimes || DEFAULTS.trendTimes),
-    trendCategory: String(config.trendCategory || DEFAULTS.trendCategory),
     nextReplyTargetsAt: Number(config.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(config.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(config.replyTargetsConfigUpdatedAt || 0),
     nextReplyVideoAt: Number(config.nextReplyVideoAt || 0),
     lastReplyVideoTriggeredAt: Number(config.lastReplyVideoTriggeredAt || 0),
-    replyVideoConfigUpdatedAt: Number(config.replyVideoConfigUpdatedAt || 0),
-    trendRunKeys: Array.isArray(config.trendRunKeys) ? config.trendRunKeys : []
+    replyVideoConfigUpdatedAt: Number(config.replyVideoConfigUpdatedAt || 0)
   });
 }
 

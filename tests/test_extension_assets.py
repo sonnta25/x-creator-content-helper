@@ -79,6 +79,19 @@ def test_replyvideo_has_independent_five_minute_schedule() -> None:
     assert "/replyvideo topic" in popup_html
 
 
+def test_removed_tweettrend3_scheduler_is_not_exposed() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+    popup_html = (PROJECT_ROOT / "browser_extension" / "popup.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "/automation/triggers/tweettrend3" not in background_js
+    assert "/tweettrend3 fixed times" not in popup_html
+    assert "/tweettrend3 category" not in popup_html
+
+
 def test_extension_uploads_replyvideo_frames_before_submitting_prompt() -> None:
     background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
         encoding="utf-8"

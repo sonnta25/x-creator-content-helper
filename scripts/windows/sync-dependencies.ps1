@@ -31,8 +31,20 @@ function Get-FileSha256 {
 }
 
 function Test-RequiredImports {
-    & $pythonExe -c "import dotenv, httpx, telegram, twscrape, yt_dlp" *> $null
-    return ($LASTEXITCODE -eq 0)
+    $previousPreference = $ErrorActionPreference
+    $exitCode = 1
+    try {
+        # Missing imports are expected here. Windows PowerShell turns native
+        # stderr into ErrorRecords, so suppress it and use the process exit code.
+        $ErrorActionPreference = "SilentlyContinue"
+        & $pythonExe -c "import dotenv, gallery_dl, httpx, telegram, twscrape, yt_dlp" *> $null
+        $exitCode = $LASTEXITCODE
+    } catch {
+        $exitCode = 1
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return ($exitCode -eq 0)
 }
 
 $projectHash = Get-FileSha256 -Path $projectFile
@@ -48,8 +60,18 @@ if (-not $Force -and $importsReady -and $installedHash -eq $projectHash) {
 }
 
 Write-Host "Synchronizing Python dependencies..."
-& $pythonExe -m pip install --disable-pip-version-check -e $ProjectRoot
-if ($LASTEXITCODE -ne 0) {
+$previousPreference = $ErrorActionPreference
+$pipExitCode = 1
+try {
+    # pip can emit non-fatal progress and warnings on stderr. Preserve them for
+    # diagnosis, but decide success from its native exit code.
+    $ErrorActionPreference = "Continue"
+    & $pythonExe -m pip install --disable-pip-version-check -e $ProjectRoot
+    $pipExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousPreference
+}
+if ($pipExitCode -ne 0) {
     throw "Could not install Python dependencies from pyproject.toml."
 }
 if (-not (Test-RequiredImports)) {

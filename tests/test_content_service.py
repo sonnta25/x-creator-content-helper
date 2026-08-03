@@ -24,7 +24,7 @@ from src.content_service import (
     _tweet_engine_prompt,
 )
 from src.config import Settings
-from src.models import GeneratedContent, ImageAttachment
+from src.models import GeneratedContent, ImageAttachment, ReplyRevision
 
 
 def test_limit_x_text_keeps_complete_sentences() -> None:
@@ -109,7 +109,7 @@ def test_tweet_engine_prompt_is_shared_for_tweet_family() -> None:
 
     assert "autonomous Twitter/X Knowledge Engine" in prompt
     assert "Shared tweet-family rules" in prompt
-    assert "/tweet, /tweetx, and /tweettrend3" in prompt
+    assert "supported original-post generation" in prompt
     assert "clear stance or personal lens" in prompt
     assert "Recent X context" in prompt
     assert "Editorial Visual Strategist rules for image_prompt" in prompt
@@ -440,6 +440,9 @@ def test_replytargets_prompt_does_not_force_creator_niche() -> None:
     assert "natural Japanese for a Japanese post" in service.last_prompt
     assert "same language as its candidate post" in service.last_prompt
     assert "original author can actually answer" in service.last_prompt
+    assert "source_summary_vi" in service.last_prompt
+    assert "reply_translation_vi" in service.last_prompt
+    assert "Vietnamese source summary" in service.last_prompt
     assert "gold and crypto only" not in service.last_prompt
     assert "gold investors only" not in service.last_prompt
     assert "readers already participating in the source post's conversation" in service.last_prompt
@@ -647,7 +650,9 @@ def test_parse_reply_targets() -> None:
               "url": "https://x.com/user/status/123",
               "target": "@user - AI tooling",
               "reason": "Good fit for a practical counterpoint.",
-              "reply": "The underrated part is not the tool count, it's having one workflow people can actually stick with."
+              "reply": "The underrated part is not the tool count, it's having one workflow people can actually stick with.",
+              "source_summary_vi": "Tác giả bàn về việc sử dụng nhiều công cụ AI.",
+              "reply_translation_vi": "Điểm bị xem nhẹ không phải số lượng công cụ mà là một quy trình mọi người thực sự duy trì được."
             }
           ]
         }
@@ -657,6 +662,8 @@ def test_parse_reply_targets() -> None:
     assert len(targets) == 1
     assert targets[0].url == "https://x.com/user/status/123"
     assert targets[0].reply.startswith("The underrated part")
+    assert targets[0].source_summary_vi.startswith("Tác giả")
+    assert targets[0].reply_translation_vi.startswith("Điểm bị xem nhẹ")
 
 
 def test_parse_reply_targets_accepts_common_browser_model_key_variants() -> None:
@@ -932,7 +939,10 @@ def test_generate_reply_revision_returns_copy_ready_text() -> None:
         async def _generate_text(self, prompt: str) -> str:
             assert "Make it shorter" in prompt
             assert "Current reply:" in prompt
-            return '{"reply":"The rollout tradeoff matters more than the launch date."}'
+            return (
+                '{"reply":"The rollout tradeoff matters more than the launch date.",'
+                '"reply_translation_vi":"Sự đánh đổi khi triển khai quan trọng hơn ngày ra mắt."}'
+            )
 
     service = RevisionService(Settings(telegram_bot_token="123:ABC"))
     revised = asyncio.run(
@@ -943,7 +953,10 @@ def test_generate_reply_revision_returns_copy_ready_text() -> None:
         )
     )
 
-    assert revised == "The rollout tradeoff matters more than the launch date"
+    assert revised == ReplyRevision(
+        reply="The rollout tradeoff matters more than the launch date",
+        reply_translation_vi="Sự đánh đổi khi triển khai quan trọng hơn ngày ra mắt.",
+    )
 
 
 def test_parse_reply_targets_recovers_all_items_from_unescaped_reply_quotes() -> None:

@@ -16,8 +16,6 @@ const DEFAULTS = {
   replyVideoMinutes: 5,
   replyVideoQuery: "",
   replyVideoWindows: "08:00-11:00,12:00-14:00,19:00-22:00",
-  trendTimes: "09:00,18:00",
-  trendCategory: "auto",
   nextReplyTargetsAt: 0,
   lastReplyTargetsTriggeredAt: 0,
   replyTargetsConfigUpdatedAt: 0,
@@ -48,8 +46,6 @@ const els = {
   replyVideoQuery: document.getElementById("replyVideoQuery"),
   replyVideoWindows: document.getElementById("replyVideoWindows"),
   replyVideoScheduleStatus: document.getElementById("replyVideoScheduleStatus"),
-  trendTimes: document.getElementById("trendTimes"),
-  trendCategory: document.getElementById("trendCategory"),
   save: document.getElementById("save"),
   run: document.getElementById("run"),
   diagnoseGemini: document.getElementById("diagnoseGemini"),
@@ -197,8 +193,6 @@ function renderConfig(config) {
   els.replyVideoMinutes.value = String(config.replyVideoMinutes);
   els.replyVideoQuery.value = config.replyVideoQuery;
   els.replyVideoWindows.value = config.replyVideoWindows;
-  els.trendTimes.value = config.trendTimes;
-  els.trendCategory.value = config.trendCategory;
   els.autoRun.textContent = config.autoRun ? "ON" : "OFF";
   els.autoRun.classList.toggle("is-on", config.autoRun);
   els.autoRun.setAttribute("aria-pressed", config.autoRun ? "true" : "false");
@@ -247,15 +241,12 @@ function readConfigFromForm() {
     replyVideoMinutes: Math.max(3, Number(els.replyVideoMinutes.value || DEFAULTS.replyVideoMinutes)),
     replyVideoQuery: els.replyVideoQuery.value.trim(),
     replyVideoWindows: els.replyVideoWindows.value.trim() || DEFAULTS.replyVideoWindows,
-    trendTimes: els.trendTimes.value.trim() || DEFAULTS.trendTimes,
-    trendCategory: els.trendCategory.value || DEFAULTS.trendCategory,
     nextReplyTargetsAt: Number(currentConfig.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(currentConfig.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(currentConfig.replyTargetsConfigUpdatedAt || 0),
     nextReplyVideoAt: Number(currentConfig.nextReplyVideoAt || 0),
     lastReplyVideoTriggeredAt: Number(currentConfig.lastReplyVideoTriggeredAt || 0),
-    replyVideoConfigUpdatedAt: Number(currentConfig.replyVideoConfigUpdatedAt || 0),
-    trendRunKeys: Array.isArray(currentConfig.trendRunKeys) ? currentConfig.trendRunKeys : []
+    replyVideoConfigUpdatedAt: Number(currentConfig.replyVideoConfigUpdatedAt || 0)
   };
 }
 

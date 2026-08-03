@@ -22,8 +22,12 @@ def test_dependency_sync_tracks_pyproject_and_checks_download_package() -> None:
     assert "pyproject.toml" in script
     assert ".project-dependencies.sha256" in script
     assert "yt_dlp" in script
+    assert "gallery_dl" in script
     assert "pip install" in script
     assert "-e $ProjectRoot" in script
+    assert '$ErrorActionPreference = "SilentlyContinue"' in script
+    assert "$pipExitCode = $LASTEXITCODE" in script
+    assert "return ($exitCode -eq 0)" in script
 
 
 def test_setup_preserves_download_settings_and_forces_dependency_sync() -> None:

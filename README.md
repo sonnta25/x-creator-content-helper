@@ -12,15 +12,8 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 
 ## Commands
 
-- `/download <video URL>`: download one public video and send it back as a Telegram file.
-- `/tweet <topic>`: create one Vietnamese long-form X post, with an optional image.
-- `/tweetx <topic/search>`: search X first, then create one long-form X post from live context.
-- `/tweettrend3 [auto|trending|news|sport|entertainment]`: in `auto` mode, find current topics around `CREATOR_NICHE` first, then create three Vietnamese posts with approval buttons.
-- `/dailybrief [trending|news|sport|entertainment]`: create daily-ready long-form post options from multi-source trend context.
-- `/retweet <X post link> | <visual description>`: remix a source X post into a fresh original tweet with an optional image.
+- `/download <post URL>`: download images, carousels, videos, or Reels and send the original media files to Telegram.
 - `/reply <tweet text or X post link>`: create one copy-ready text reply only.
-- `/automationhere`: use the current Telegram chat for scheduled approval requests.
-- `/today [balanced|reach|qualified|relationship]`: prepare a compact daily queue with up to two reply-now cards and one original post.
 - `/setupcheck`: check the X cookie pool, tracking username, approval chat, schedule, timezone, and stale approvals without exposing secrets.
 - `/replyevery <minutes>`: configure the scheduled `/replytargets` interval from Telegram (5-1440 minutes).
 - `/videoevery <minutes>`: configure the scheduled `/replyvideo` interval from Telegram (3-1440 minutes; default 5).
@@ -41,34 +34,38 @@ The bot registers these commands with Telegram on startup.
 ### Two-step command input
 
 Commands that need input no longer run immediately when selected from Telegram's
-command menu. Select `/download`, `/tweet`, `/tweetx`, `/retweet`, `/replytargets`, `/replyvideo`,
-`/reply`, `/persona`, `/importcookie`, `/xremove`, `/replyevery`, `/videoevery`, or `/replybatch`, and the bot
+grouped menu. Select `/download`, `/replytargets`, `/replyvideo`, `/reply`,
+`/persona`, `/importcookie`, `/xremove`, `/replyevery`, `/videoevery`, or `/replybatch`, and the bot
 opens a reply field with a short prompt. Send the requested value as the next
 message to run the command.
 
-The direct form still works, for example `/tweet AI agents` or
+The direct form still works, for example `/replytargets AI agents` or
 `/download https://...`. Pending input is isolated per chat and Telegram user,
 expires after five minutes, and can be stopped with `/cancel`. Selecting a
 different command replaces the previous pending request. Use `auto` when the
 `/replytargets` prompt should choose its own topic, and `show` to inspect
 `/persona` or `/replyevery`.
 
-### Video downloads
+### Post media downloads
 
-Send a public video link:
+Send a public post, video, or Reel link:
 
 ```text
 /download https://www.tiktok.com/@creator/video/123
 ```
 
-The bot downloads one video and uploads it to the same Telegram chat as a document,
+The bot downloads the post media and uploads it to the same Telegram chat as documents,
 so the file can be saved directly to a phone or computer without relying on a
 short-lived platform CDN link. The downloader supports sites handled by `yt-dlp`,
-including common TikTok, Douyin, Xiaohongshu, Facebook, and X public-video URLs.
-Playlists are disabled.
+including common TikTok, Douyin, Xiaohongshu, Facebook/Instagram Reels, and X
+public-video URLs. If the URL is an image post or carousel, `gallery-dl` is used
+as a bounded fallback and returns up to ten media files. The combined download
+must remain within `DOWNLOAD_MAX_FILE_MB`. Profile and timeline URLs are not
+intended for bulk downloads.
 
-Delivered files use a neutral name such as
-`creator-video-20260727-101112-a1b2c3.mp4`; the source title and platform video ID
+Delivered files use neutral names such as
+`creator-video-20260727-101112-a1b2c3.mp4` or
+`creator-image-20260727-101112-a1b2c3-01.jpg`; the source title and platform video ID
 are not used in the filename or Telegram caption. The downloader also disables
 description, info JSON, thumbnail, comment, and subtitle sidecar files. Telegram
 keeps the source URL in the message caption for permission and provenance checks,
@@ -105,9 +102,9 @@ authorized to save.
 ## Creator Flow
 
 1. Run `/setupcheck` once after deployment and resolve any reported blocker.
-2. Use `/today` for the normal low-touch workflow: reply-now cards, watched candidates, and one original post.
-3. Use `/replytargets <topic>` only when you want to force a specific conversation lane.
-4. Tap **Alternative** or **Shorter** only when a reply needs revision. Generate a post image only after selecting the post.
+2. Use `/replytargets` for broad conversations or `/replyvideo` for the video-first lane.
+3. Add a topic only when you want to force a specific conversation lane.
+4. Tap **Alternative** or **Shorter** only when a reply needs revision.
 5. Approve in Telegram, review the pre-filled composer, and submit manually on X.
 
 General X search commands add `lang:en` automatically unless the query already includes a `lang:` filter. `/replytargets` is separate: it expands auto and plain-topic searches across `REPLY_TARGET_LANGUAGES` (default `en,ja`) and writes each reply in the source post's language.
@@ -121,11 +118,7 @@ Manage languages without editing the VPS manually:
 /replylangs set en ja ko id
 ```
 
-The bot validates X language codes, keeps at least one and at most six, writes the result to `.env`, applies it immediately to `/replytargets` and `/today`, and syncs it to scheduled Chrome scans within about 60 seconds in low-resource mode.
-
-`/tweettrend3` auto mode searches current Google News topics using `CREATOR_NICHE` first, then falls back to broader X/Google/RSS trends. `CONTENT_LANGUAGE` controls final post language; `TREND_LANGUAGE` and `GOOGLE_TRENDS_GEO` control built-in Google News feeds. Image prompts remain English so Gemini image generation is more reliable.
-
-`/tweettrend3` selects up to three distinct trend topics and creates their independent drafts in one Gemini batch job. Draft lengths are intentionally mixed. Images are lazy: Telegram exposes **Generate visual** on a chosen post instead of spending one image job for every option.
+The bot validates X language codes, keeps at least one and at most six, writes the result to `.env`, applies it immediately to `/replytargets`, and syncs it to scheduled Chrome scans within about 60 seconds in low-resource mode.
 
 With extension **Auto Run** OFF, click **Run next job** for the queued batch; with **Auto Run** ON, the extension picks it up automatically on its polling interval.
 
@@ -255,7 +248,7 @@ For a small VPS, close unrelated tabs and Chrome windows, remove unused extensio
 
 The extension can schedule content generation while keeping the final X action manual:
 
-1. Start the bot and send `/automationhere` in the Telegram chat that should receive approvals.
+1. Set `TELEGRAM_APPROVAL_CHAT_ID` in `.env` to the private Telegram chat that should receive approvals, then restart the bot.
 2. Reload `browser_extension/` from `chrome://extensions` after updating the project.
 3. Open the extension popup and configure **Scheduled approvals**:
    - **Creator timezone**: IANA timezone such as `Asia/Ho_Chi_Minh`; schedules no longer depend on the VPS locale.
@@ -267,15 +260,13 @@ The extension can schedule content generation while keeping the final X action m
    - **/replyvideo scan interval**: independent viral-video scan; minimum 3 and default 5 minutes.
    - **/replyvideo topic**: optional; blank scans global/English/Japanese/Vietnamese video lanes.
    - **/replyvideo active windows**: defaults to `08:00-11:00,12:00-14:00,19:00-22:00` in the creator timezone.
-   - **/tweettrend3 fixed times**: comma-separated local times, for example `09:00, 13:30, 18:00`.
-   - **/tweettrend3 category**: `auto`, `trending`, `news`, `sport`, or `entertainment`.
 4. Turn **Automation** ON and keep Chrome, the Telegram bot, and the Gemini/X login sessions running.
 
 You can also change schedules from the private Telegram approval chat with `/replyevery 30` and `/videoevery 5`. Set per-run output with `/replybatch targets 3` and `/replybatch video 3`; `/replybatch show` displays both current values. Batch sizes are limited to 2-5, saved to `.env`, and applied immediately to manual and scheduled runs without restarting the bot. Every schedule command writes a schedule revision, even when the numeric value did not change. Low-resource mode picks it up within about 60 seconds and resets the next run from that moment. The popup shows both **Last trigger** and **Next run**.
 
 For both manual commands and scheduled runs, Telegram sends approval cards. Reply cards add **Alternative** and **Shorter**; post cards add **Generate visual** when an image prompt exists. Only the Telegram user who requested a manual draft can approve it.
 
-`/replytargets` cards show the target link, visible metrics, selected strategy, why-now reason, and copy-ready reply. Auto discovery uses the authenticated account's current X trends plus localized broad queries. When Japanese is enabled, one protected discovery lane covers hot Japanese conversations in economics, current affairs, sports, anime/games, and technology/AI, so personalized trends cannot consume the whole six-query budget. `balanced` and `qualified` modes also add a creator-niche lane; `reach` prioritizes distribution; `relationship` favors authors who have responded before. The trends timeline can reflect the logged-in account's locale/personalization and is not claimed to be a global chart. Search applies language filters but no country filter because most X posts do not carry reliable place metadata.
+`/replytargets` and `/replyvideo` cards show the target link, a concise Vietnamese summary of the source, a Vietnamese translation of the proposed reply, and the original copy-ready reply in the source language. Views, reply counts, opportunity score, strategy, evidence mode, and why-now reasoning remain available internally for ranking and learning but are hidden from the approval card. Auto discovery uses the authenticated account's current X trends plus localized broad queries. When Japanese is enabled, one protected discovery lane covers hot Japanese conversations in economics, current affairs, sports, anime/games, and technology/AI, so personalized trends cannot consume the whole six-query budget. `balanced` and `qualified` modes also add a creator-niche lane; `reach` prioritizes distribution; `relationship` favors authors who have responded before. The trends timeline can reflect the logged-in account's locale/personalization and is not claimed to be a global chart. Search applies language filters but no country filter because most X posts do not carry reliable place metadata.
 
 Up to six topic/language queries run as serialized search lanes so a small cookie pool is not exhausted by concurrent `SearchTimeline` leases. Every query still searches both `Top` and `Latest`, sequentially, with at most eight results from each product. `Top` supplies confirmed distribution while `Latest` supplies earlier breakout candidates. `-is:reply -is:retweet` is added at search time, and parsed results are checked again; original and quote posts remain eligible. An explicit `/replytargets <topic>` stays inside that topic but expands it across configured languages unless the user supplies a `lang:` operator.
 
@@ -362,7 +353,7 @@ Once a reply target is pending, approved, or confirmed published, the bot skips 
 
 Review or edit the filled draft in X, then submit it yourself. A pending approval expires after 30 minutes. `Auto Run` still controls whether Gemini jobs from manually entered Telegram commands run automatically; when it is OFF, use **Run next job** before approving the returned draft.
 
-The first scheduled run may wait for the configured interval. While a scheduled workflow is active, automation processes one Gemini job per 30-second check, which keeps CPU use steadier on small VPS plans. When no scheduled workflow is active, it does not poll `/jobs/next`; manual commands still obey the separate `Auto Run` switch. Fixed `/tweettrend3` times are considered due for ten minutes, which allows for Chrome alarm delays or a briefly sleeping computer. Missed runs are not replayed in bulk.
+The first scheduled run may wait for the configured interval. While a scheduled workflow is active, automation processes one Gemini job per check, which keeps CPU use steadier on small VPS plans. When no scheduled workflow is active, it does not poll `/jobs/next`; manual commands still obey the separate `Auto Run` switch.
 
 If Gemini asks for human verification, solve it manually in Chrome and run the job again. This bridge depends on the web UI, so reload the extension after changing files in `browser_extension/`.
 
@@ -397,7 +388,7 @@ Expected provider: `extension_bridge`.
 
 ## X Cookie Search
 
-To enable `/tweetx`, `/tweettrend3`, `/dailybrief`, and `/replytargets` live X context:
+To enable `/replytargets`, `/replyvideo`, and `/reply` live X context:
 
 1. Open `x.com` in a logged-in browser.
 2. Open DevTools > Application > Cookies.
@@ -425,9 +416,9 @@ with recovery commands. Remove a bad account with:
 
 The default cookie is written to `.env`. Named accounts are stored in `data/twscrape_accounts.db`. Keep `.env` and `data/` private.
 
-## Multi-Source Trends
+## Trend context
 
-`/tweettrend3` and `/dailybrief` use these sources by default:
+Automatic reply discovery can use these sources for topic context:
 
 ```env
 TREND_SOURCES=x,google_trends,rss
@@ -489,4 +480,4 @@ sudo journalctl -u x-content-bot -n 100 --no-pager
 - `Could not connect to the local Chrome extension bridge`: start the bot, open Chrome, confirm the extension Bridge URL/token match `.env`.
 - `Extension bridge timed out`: verify extension `0.8.1` or newer is loaded and Automation or Auto Run is ON. The error distinguishes a job Chrome never claimed, a claimed job whose heartbeat stopped, and a live Gemini response that exceeded the bounded extended deadline. Low-resource recovery can take up to about 60 seconds; **Run next job** remains available for an immediate check.
 - `Missing image data`: reload the extension, keep the Gemini tab visible, and confirm Gemini generated an image in an `<img>` tag.
-- `No Google/RSS/X trend context found`: check internet access, RSS feed URLs, X cookies, or try a specific category like `/tweettrend3 news`.
+- `No Google/RSS/X trend context found`: check internet access, RSS feed URLs, and X cookies, or provide a topic to `/replytargets`.

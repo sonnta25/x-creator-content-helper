@@ -18,6 +18,7 @@ from telegram import (
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction
@@ -110,7 +111,7 @@ REPLY_VIDEO_RESULT_LIMIT = 16
 REPLY_VIDEO_CONTEXT_ITEMS = 3
 REPLY_VIDEO_MIN_BATCH_ITEMS = 2
 REPLY_VIDEO_GLOBAL_LANGUAGES = ("en", "ja", "ko", "es", "pt", "zh-cn")
-BOT_RUNTIME_REVISION = "configurable-reply-batch-v4"
+BOT_RUNTIME_REVISION = "translated-reply-card-v5"
 REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
 REPLY_TARGET_REFRESH_TIMEOUT_SECONDS = 12
@@ -120,20 +121,8 @@ TREND_CONTEXT_X_ITEMS = 4
 COMMAND_INPUT_TIMEOUT_SECONDS = 5 * 60
 COMMAND_INPUT_PROMPTS = {
     "download": (
-        "Send the public video URL you want to download.",
-        "Paste a video URL",
-    ),
-    "tweet": (
-        "Send the topic for the Vietnamese X post.",
-        "Enter a topic",
-    ),
-    "tweetx": (
-        "Send a topic or X search query for the English post.",
-        "Enter a topic or search",
-    ),
-    "retweet": (
-        "Send the X post link. You can add a visual note after `|`.",
-        "Paste an X post link",
+        "Send a public post, image, carousel, video, or Reel URL.",
+        "Paste a post or media URL",
     ),
     "replytargets": (
         "Send a topic to search, or send `auto` to let the bot choose.",
@@ -175,6 +164,92 @@ COMMAND_INPUT_PROMPTS = {
         "show, targets 3, or video 2",
     ),
 }
+
+MENU_MAIN = "🏠 Main menu"
+MENU_REPLY = "🎯 Viral replies"
+MENU_AUTOMATION = "🤖 Automation"
+MENU_INSIGHTS = "📊 Tracking & insights"
+MENU_X_ACCOUNTS = "🔐 X accounts"
+MENU_VIDEO = "🎬 Video tools"
+MENU_CREATOR = "⚙️ Creator settings"
+MENU_HELP = "❓ Help"
+MENU_CANCEL = "✖️ Cancel"
+
+MENU_REPLY_TARGETS = "🎯 Find viral posts"
+MENU_REPLY_VIDEO = "🎬 Find viral videos"
+MENU_WRITE_REPLY = "💬 Write a standout reply"
+MENU_REPLY_SCHEDULE = "⏱️ Reply-target schedule"
+MENU_VIDEO_SCHEDULE = "🎬 Reply-video schedule"
+MENU_REPLY_BATCH = "🔢 Replies per run"
+MENU_REPLY_LANGS = "🌍 Reply languages"
+MENU_REPLY_LEARN = "🧠 Performance learning"
+MENU_REPLY_REPORT = "📈 Reply report"
+MENU_SETUP_CHECK = "🩺 System check"
+MENU_IMPORT_COOKIE = "🍪 Import X cookie"
+MENU_X_LIST = "👥 Account list"
+MENU_X_REMOVE = "🗑️ Remove account"
+MENU_DOWNLOAD = "📥 Download video"
+MENU_PERSONA = "🎭 Creator persona"
+
+MENU_LAYOUTS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "main": (
+        (MENU_REPLY, MENU_AUTOMATION),
+        (MENU_INSIGHTS, MENU_X_ACCOUNTS),
+        (MENU_VIDEO, MENU_CREATOR),
+        (MENU_HELP, MENU_CANCEL),
+    ),
+    "reply": (
+        (MENU_REPLY_TARGETS, MENU_REPLY_VIDEO),
+        (MENU_WRITE_REPLY,),
+        (MENU_MAIN,),
+    ),
+    "automation": (
+        (MENU_REPLY_SCHEDULE, MENU_VIDEO_SCHEDULE),
+        (MENU_REPLY_BATCH,),
+        (MENU_MAIN,),
+    ),
+    "insights": (
+        (MENU_REPLY_LANGS, MENU_REPLY_LEARN),
+        (MENU_REPLY_REPORT, MENU_SETUP_CHECK),
+        (MENU_MAIN,),
+    ),
+    "x_accounts": (
+        (MENU_IMPORT_COOKIE, MENU_X_LIST),
+        (MENU_X_REMOVE, MENU_MAIN),
+    ),
+    "video": ((MENU_DOWNLOAD, MENU_MAIN),),
+    "creator": ((MENU_PERSONA, MENU_MAIN),),
+}
+
+MENU_ACTIONS: dict[str, tuple[str, str]] = {
+    MENU_MAIN: ("menu", "main"),
+    MENU_REPLY: ("menu", "reply"),
+    MENU_AUTOMATION: ("menu", "automation"),
+    MENU_INSIGHTS: ("menu", "insights"),
+    MENU_X_ACCOUNTS: ("menu", "x_accounts"),
+    MENU_VIDEO: ("menu", "video"),
+    MENU_CREATOR: ("menu", "creator"),
+    MENU_HELP: ("help", ""),
+    MENU_CANCEL: ("command", "cancel"),
+    MENU_REPLY_TARGETS: ("command", "replytargets"),
+    MENU_REPLY_VIDEO: ("command", "replyvideo"),
+    MENU_WRITE_REPLY: ("command", "reply"),
+    MENU_REPLY_SCHEDULE: ("command", "replyevery"),
+    MENU_VIDEO_SCHEDULE: ("command", "videoevery"),
+    MENU_REPLY_BATCH: ("command", "replybatch"),
+    MENU_REPLY_LANGS: ("command", "replylangs"),
+    MENU_REPLY_LEARN: ("command", "replylearn"),
+    MENU_REPLY_REPORT: ("command", "replyreport"),
+    MENU_SETUP_CHECK: ("command", "setupcheck"),
+    MENU_IMPORT_COOKIE: ("command", "importcookie"),
+    MENU_X_LIST: ("command", "xaccounts"),
+    MENU_X_REMOVE: ("command", "xremove"),
+    MENU_DOWNLOAD: ("command", "download"),
+    MENU_PERSONA: ("command", "persona"),
+}
+MENU_BUTTON_PATTERN = re.compile(
+    "^(?:" + "|".join(re.escape(label) for label in MENU_ACTIONS) + ")$"
+)
 TWEETTREND_LANGUAGE_ALIASES = {
     "en": "English",
     "eng": "English",
@@ -201,14 +276,10 @@ class _PendingCommandInput:
 
 
 BOT_COMMANDS = [
-    BotCommand("start", "Show help and available commands"),
-    BotCommand("help", "Show help and available commands"),
-    BotCommand("download", "Download a public social video to Telegram"),
-    BotCommand("tweet", "Generate a Vietnamese X post with an optional image"),
-    BotCommand("tweetx", "Generate an English X post using live X search context"),
-    BotCommand("tweettrend3", "Auto-pick or choose a trend and generate 3 Vietnamese posts"),
-    BotCommand("dailybrief", "Generate daily tweet options with optional images"),
-    BotCommand("retweet", "Remix an X post with an optional image"),
+    BotCommand("start", "Open the grouped bot menu"),
+    BotCommand("menu", "Open the grouped bot menu"),
+    BotCommand("help", "Show help and the grouped menu"),
+    BotCommand("download", "Download images, videos, carousels, or Reels"),
     BotCommand("replytargets", "Auto-pick or search X posts to reply to"),
     BotCommand("replyvideo", "Find fresh viral videos with low reply competition"),
     BotCommand("persona", "Show or set creator niche, voice, and audience"),
@@ -216,14 +287,12 @@ BOT_COMMANDS = [
     BotCommand("xaccounts", "Show imported X cookie accounts"),
     BotCommand("xremove", "Remove an imported X cookie account"),
     BotCommand("reply", "Generate a witty reply from tweet text or an X post link"),
-    BotCommand("automationhere", "Send scheduled approval requests to this chat"),
     BotCommand("replyevery", "Set scheduled replytargets interval in minutes"),
     BotCommand("videoevery", "Set scheduled replyvideo interval in minutes"),
     BotCommand("replybatch", "Set replytargets or replyvideo cards per run"),
     BotCommand("replylangs", "Show, add, or remove reply-target languages"),
     BotCommand("replylearn", "Show or control automatic reply learning"),
     BotCommand("replyreport", "Show tracked post and reply performance"),
-    BotCommand("today", "Build today's prioritized creator queue"),
     BotCommand("setupcheck", "Check X, tracking, scheduling, and learning health"),
     BotCommand("cancel", "Cancel the command currently waiting for input"),
 ]
@@ -294,13 +363,9 @@ class ContentBot:
             group=-1,
         )
         app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("menu", self.start))
         app.add_handler(CommandHandler("help", self.start))
         app.add_handler(CommandHandler("download", self.download))
-        app.add_handler(CommandHandler("tweet", self.tweet))
-        app.add_handler(CommandHandler("tweetx", self.tweetx))
-        app.add_handler(CommandHandler("tweettrend3", self.tweettrend3))
-        app.add_handler(CommandHandler("dailybrief", self.dailybrief))
-        app.add_handler(CommandHandler("retweet", self.retweet))
         app.add_handler(CommandHandler("replytargets", self.replytargets))
         app.add_handler(CommandHandler("replyvideo", self.replyvideo))
         app.add_handler(CommandHandler("persona", self.persona))
@@ -308,18 +373,19 @@ class ContentBot:
         app.add_handler(CommandHandler("xaccounts", self.xaccounts))
         app.add_handler(CommandHandler("xremove", self.xremove))
         app.add_handler(CommandHandler("reply", self.reply))
-        app.add_handler(CommandHandler("automationhere", self.automationhere))
         app.add_handler(CommandHandler("replyevery", self.replyevery))
         app.add_handler(CommandHandler("videoevery", self.videoevery))
         app.add_handler(CommandHandler("replybatch", self.replybatch))
         app.add_handler(CommandHandler("replylangs", self.replylangs))
         app.add_handler(CommandHandler("replylearn", self.replylearn))
         app.add_handler(CommandHandler("replyreport", self.replyreport))
-        app.add_handler(CommandHandler("today", self.today))
         app.add_handler(CommandHandler("setupcheck", self.setupcheck))
         app.add_handler(CommandHandler("cancel", self.cancel))
         app.add_handler(
             CallbackQueryHandler(self.automation_approval, pattern=r"^automation:")
+        )
+        app.add_handler(
+            MessageHandler(filters.Regex(MENU_BUTTON_PATTERN), self.menu_action)
         )
         app.add_handler(
             MessageHandler(
@@ -331,38 +397,53 @@ class ContentBot:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
+        self._clear_pending_input(update)
         await update.effective_message.reply_text(
-            "Commands:\n"
-            "/download <video URL> - download a public social video to this chat\n"
-            "/tweet <topic> - generate a Vietnamese X post with an optional image\n"
-            "/tweetx <topic/search> - generate an English X post using live X context\n"
-            "/tweettrend3 [auto|trending|news|sport|entertainment] - generate 3 Vietnamese trend angles\n"
-            "/dailybrief [trending|news|sport|entertainment] - generate daily tweets with optional images\n"
-            "/retweet <X post link> - remix an X post with an optional image\n"
-            "/replytargets [query] - auto-pick or search posts to reply to\n"
-            "/replyvideo [topic] - find fresh viral videos with low reply competition\n"
-            "/persona - show or set niche, voice, and target audience\n"
-            "/importcookie <auth_token=...; ct0=...> - save X cookie for search\n"
-            "/xaccounts - show imported X cookie accounts\n"
-            "/xremove <account_name> - remove an imported X cookie account\n"
-            "/reply <tweet text or X post link> - generate a copy-ready reply\n"
-            "/automationhere - send scheduled approval requests to this chat\n"
-            "/replyevery <minutes> - set the scheduled /replytargets interval\n"
-            "/videoevery <minutes> - set the scheduled /replyvideo interval\n"
-            "/replybatch show|targets <2-5>|video <2-5> - set cards per run\n"
-            "/replylangs [show|add|remove|set] - manage reply-target languages\n"
-            "/replylearn [status|on|off|rollback|username @name] - control learning\n"
-            "/replyreport [7d|30d] - show tracked reply performance\n"
-            "/today [balanced|reach|qualified|relationship] - build today's queue\n"
-            "/setupcheck - check bot and X readiness\n"
-            "/cancel - cancel a command that is waiting for input\n"
-            "\n"
-            "Tip: select a command without parameters and the bot will ask for "
-            "the missing input before it runs.\n"
-            "\n"
-            "AI provider: Chrome extension bridge runs Gemini for all "
-            "content commands."
+            "✨ X Creator Assistant\n\n"
+            "Features are organized into groups. Choose an option below.\n\n"
+            "• Find viral posts or videos and write standout replies\n"
+            "• Automate /replytargets and /replyvideo independently\n"
+            "• Track performance, learn from results, and manage X accounts",
+            reply_markup=_menu_keyboard("main"),
         )
+
+    async def menu_action(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        action = MENU_ACTIONS.get(str(message.text or "").strip())
+        if action is None:
+            return
+        action_type, value = action
+        self._clear_pending_input(update)
+        if action_type == "menu":
+            titles = {
+                "main": "🏠 Main menu",
+                "reply": "🎯 Viral replies",
+                "automation": "🤖 Automation",
+                "insights": "📊 Tracking & insights",
+                "x_accounts": "🔐 X accounts",
+                "video": "🎬 Video tools",
+                "creator": "⚙️ Creator settings",
+            }
+            await message.reply_text(
+                titles[value] + "\nChoose a feature:",
+                reply_markup=_menu_keyboard(value),
+            )
+            return
+        if action_type == "help":
+            await self.start(update, context)
+            return
+        handler = getattr(self, value, None)
+        if handler is None:
+            await message.reply_text("This feature is currently unavailable.")
+            return
+        context.args = []
+        await handler(update, context)
 
     async def _command_started(
         self,
@@ -456,31 +537,38 @@ class ContentBot:
             await self._request_command_input(update, "download")
             return
 
-        status = await message.reply_text("Downloading the video...")
+        status = await message.reply_text("Downloading media from the post...")
         media: DownloadedMedia | None = None
         try:
             async with self._download_semaphore:
                 media = await asyncio.to_thread(self.media_downloader.download, source_url)
             await status.edit_text(
-                f"Downloaded {_format_file_size(media.size_bytes)}. Sending it to Telegram..."
+                f"Downloaded {len(media.paths)} {media.media_kind} "
+                f"({_format_file_size(media.size_bytes)} total). Sending to Telegram..."
             )
             await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-            caption = _truncate_text(
-                "Prepared video file\n\n"
-                f"Source reference: {media.source_url}\n"
-                "Only republish content you own or have permission to use.",
-                self.settings.telegram_caption_limit,
-            )
-            with media.path.open("rb") as document:
-                await message.reply_document(
-                    document=document,
-                    filename=media.path.name,
-                    caption=caption,
-                    read_timeout=60,
-                    write_timeout=300,
-                    connect_timeout=30,
-                    pool_timeout=30,
+            for index, path in enumerate(media.paths, start=1):
+                item_label = (
+                    f"Prepared {media.media_kind}"
+                    if len(media.paths) == 1
+                    else f"Prepared media file {index}/{len(media.paths)}"
                 )
+                caption = _truncate_text(
+                    f"{item_label}\n\n"
+                    f"Source reference: {media.source_url}\n"
+                    "Only republish content you own or have permission to use.",
+                    self.settings.telegram_caption_limit,
+                )
+                with path.open("rb") as document:
+                    await message.reply_document(
+                        document=document,
+                        filename=path.name,
+                        caption=caption,
+                        read_timeout=60,
+                        write_timeout=300,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
             await status.delete()
         except MediaDownloadError as exc:
             await status.edit_text(f"Download failed: {exc}")
@@ -536,7 +624,7 @@ class ContentBot:
             return
         if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
             await message.reply_text(
-                "Only the chat configured with /automationhere can change this schedule."
+                "Only TELEGRAM_APPROVAL_CHAT_ID can change this schedule."
             )
             return
         if not context.args:
@@ -584,7 +672,7 @@ class ContentBot:
             return
         if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
             await message.reply_text(
-                "Only the chat configured with /automationhere can change reply languages."
+                "Only TELEGRAM_APPROVAL_CHAT_ID can change reply languages."
             )
             return
         raw = " ".join(context.args).strip()
@@ -644,7 +732,7 @@ class ContentBot:
             return
         if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
             await message.reply_text(
-                "Only the chat configured with /automationhere can change reply batch sizes."
+                "Only TELEGRAM_APPROVAL_CHAT_ID can change reply batch sizes."
             )
             return
         raw = " ".join(context.args).strip().lower()
@@ -717,7 +805,7 @@ class ContentBot:
             return
         if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
             await message.reply_text(
-                "Only the chat configured with /automationhere can change this schedule."
+                "Only TELEGRAM_APPROVAL_CHAT_ID can change this schedule."
             )
             return
         if not context.args:
@@ -896,7 +984,7 @@ class ContentBot:
         elif not healthy_accounts:
             blockers.append("X account pool has no error-free active account; run /xaccounts.")
         if self.approval_chat_id is None:
-            blockers.append("Run /automationhere in the approval chat.")
+            blockers.append("Set TELEGRAM_APPROVAL_CHAT_ID in .env.")
         state = "READY" if not blockers else "NEEDS ATTENTION"
         detail = "\n".join(f"- {item}" for item in blockers) or "- No blocking setup issue found."
         await message.reply_text(
@@ -1098,7 +1186,11 @@ class ContentBot:
                     result,
                     strategy,
                     source_type="replyvideo" if video_mode else "replytargets",
-                ),
+                )
+                | {
+                    "source_summary_vi": draft.source_summary_vi,
+                    "reply_translation_vi": draft.reply_translation_vi,
+                },
             )
             await self._send_approval(approval, reason=draft.reason)
             if not video_mode:
@@ -1314,11 +1406,16 @@ class ContentBot:
                     existing.text,
                     instruction,
                 )
-                approval = self.approvals.update_text(existing.id, revised)
+                revised_text = str(getattr(revised, "reply", revised)).strip()
+                revised_translation = str(
+                    getattr(revised, "reply_translation_vi", "") or ""
+                ).strip()
+                approval = self.approvals.update_text(existing.id, revised_text)
                 self.approvals.update_metadata(
                     existing.id,
                     revision_count=int(existing.metadata.get("revision_count", 0)) + 1,
                     last_revision=decision,
+                    reply_translation_vi=revised_translation,
                 )
                 await query.edit_message_text(
                     _approval_message_text(approval, reason="Revised on request"),
@@ -1458,7 +1555,7 @@ class ContentBot:
         if self._application is None:
             raise RuntimeError("Telegram bot is not ready.")
         if self.approval_chat_id is None:
-            raise RuntimeError("No approval chat configured. Send /automationhere in Telegram first.")
+            raise RuntimeError("No approval chat configured. Set TELEGRAM_APPROVAL_CHAT_ID in .env.")
         if self._automation_running:
             active = next(iter(self._automation_running))
             return {
@@ -3243,6 +3340,17 @@ def _as_photo(image: bytes) -> BytesIO:
     return buffer
 
 
+def _menu_keyboard(menu_name: str = "main") -> ReplyKeyboardMarkup:
+    layout = MENU_LAYOUTS.get(menu_name, MENU_LAYOUTS["main"])
+    return ReplyKeyboardMarkup(
+        [list(row) for row in layout],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Choose a feature from the menu...",
+    )
+
+
 async def _set_bot_commands(app: Application) -> None:
     await app.bot.set_my_commands(BOT_COMMANDS)
 
@@ -3418,38 +3526,21 @@ def _approval_message_text(
                 f"{response_url}\n\n"
                 f"Suggested follow-up:\n{approval.text}"
             ).strip()
-        signal_parts = []
-        if metadata.get("source_type") == "replyvideo":
-            evidence_mode = str(metadata.get("video_context_quality") or "")
-            if evidence_mode == "visual_frames":
-                signal_parts.append(
-                    f"{int(metadata.get('visual_frame_count') or 0)} frames analyzed"
-                )
-            elif evidence_mode == "caption_only":
-                signal_parts.append("caption only")
-            elif evidence_mode == "grounded_text":
-                signal_parts.append("caption/media grounded")
-        if metadata.get("root_views") is not None:
-            signal_parts.append(f"{int(metadata['root_views']):,} views")
-        if metadata.get("root_replies") is not None:
-            signal_parts.append(f"{int(metadata['root_replies']):,} replies")
-        if metadata.get("reply_opportunity_score") is not None:
-            signal_parts.append(
-                f"opportunity {float(metadata['reply_opportunity_score']):.0f}/100"
-            )
-        if metadata.get("reply_strategy"):
-            signal_parts.append(str(metadata["reply_strategy"]).replace("_", " "))
-        signal_text = " | ".join(signal_parts)
-        details = "\n".join(
-            item
-            for item in (
-                approval.target_url,
-                signal_text,
-                f"Why now: {reason}" if reason else "",
-            )
-            if item
+        source_summary = _truncate_text(
+            str(metadata.get("source_summary_vi") or "").strip(),
+            700,
         )
-        return f"{details}\n\n{approval.text}".strip()
+        reply_translation = _truncate_text(
+            str(metadata.get("reply_translation_vi") or "").strip(),
+            700,
+        )
+        blocks = [approval.target_url]
+        if source_summary:
+            blocks.append(f"Tóm tắt bài viết:\n{source_summary}")
+        if reply_translation:
+            blocks.append(f"Bản dịch reply:\n{reply_translation}")
+        blocks.append(f"Reply gốc:\n{approval.text}")
+        return "\n\n".join(item for item in blocks if item).strip()
 
     context_lines = []
     if approval.target_label:

@@ -103,23 +103,7 @@
         </label>
         <p id="replyVideoScheduleStatus" class="hint"></p>
 
-        <label>
-          /tweettrend3 fixed times
-          <input id="trendTimes" spellcheck="false" placeholder="09:00, 18:30">
-        </label>
-
-        <label>
-          /tweettrend3 category
-          <select id="trendCategory">
-            <option value="auto">auto</option>
-            <option value="trending">trending</option>
-            <option value="news">news</option>
-            <option value="sport">sport</option>
-            <option value="entertainment">entertainment</option>
-          </select>
-        </label>
-
-        <p class="hint">Send <code>/automationhere</code> once in the Telegram chat that should receive approvals.</p>
+        <p class="hint">Set <code>TELEGRAM_APPROVAL_CHAT_ID</code> in <code>.env</code> for scheduled approvals.</p>
       </section>
 
       <div class="actions">

@@ -1,6 +1,7 @@
 # X Telegram Content Bot
 
-Telegram bot for creating X/Twitter posts, replies, reply targets, multi-source trend briefs, and social images for a Vietnamese audience.
+Telegram bot for discovering high-opportunity X/Twitter conversations, generating
+standout replies, tracking results, and downloading social post media.
 
 The current AI flow is:
 
@@ -30,6 +31,25 @@ Gemini produces each final draft in one browser job. The extension reuses one lo
 - `/cancel`: cancel a command that is waiting for input.
 
 The bot registers these commands with Telegram on startup.
+
+### English Telegram menu
+
+Use `/start`, `/menu`, or `/help` to open the persistent English keyboard.
+The commands remain available for direct entry, while the keyboard groups the
+most common workflows:
+
+| Menu group | Buttons |
+|---|---|
+| **Main menu** | `Viral replies`, `Automation`, `Tracking & insights`, `X accounts`, `Video tools`, `Creator settings`, `Help`, `Cancel` |
+| **Viral replies** | `Find viral posts` (`/replytargets`), `Find viral videos` (`/replyvideo`), `Write a standout reply` (`/reply`) |
+| **Automation** | `Reply-target schedule` (`/replyevery`), `Reply-video schedule` (`/videoevery`), `Replies per run` (`/replybatch`) |
+| **Tracking & insights** | `Reply languages` (`/replylangs`), `Performance learning` (`/replylearn`), `Reply report` (`/replyreport`), `System check` (`/setupcheck`) |
+| **X accounts** | `Import X cookie` (`/importcookie`), `Account list` (`/xaccounts`), `Remove account` (`/xremove`) |
+| **Video tools** | `Download video` (`/download`) |
+| **Creator settings** | `Creator persona` (`/persona`) |
+
+Every submenu includes a **Main menu** button. Selecting a button that needs an
+argument opens a private Force Reply prompt instead of running with missing input.
 
 ### Two-step command input
 
@@ -481,3 +501,10 @@ sudo journalctl -u x-content-bot -n 100 --no-pager
 - `Extension bridge timed out`: verify extension `0.8.1` or newer is loaded and Automation or Auto Run is ON. The error distinguishes a job Chrome never claimed, a claimed job whose heartbeat stopped, and a live Gemini response that exceeded the bounded extended deadline. Low-resource recovery can take up to about 60 seconds; **Run next job** remains available for an immediate check.
 - `Missing image data`: reload the extension, keep the Gemini tab visible, and confirm Gemini generated an image in an `<img>` tag.
 - `No Google/RSS/X trend context found`: check internet access, RSS feed URLs, and X cookies, or provide a topic to `/replytargets`.
+
+## BUY ME A COFFEE
+
+If this project saves you time or helps grow your X account, consider supporting
+its continued development with a coffee.
+
+[☕ Buy me a coffee](https://buymeacoffee.com/sonnta)

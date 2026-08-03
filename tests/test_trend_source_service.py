@@ -1,9 +1,10 @@
 import asyncio
 
 from src.config import Settings
-from src.models import XTrend
+from src.models import TrendSignal, XTrend
 from src.trend_source_service import (
     TrendSourceService,
+    google_news_category_rss_url,
     google_news_search_rss_url,
     google_trends_rss_url,
     niche_search_query,
@@ -40,6 +41,14 @@ def test_google_news_search_rss_url_uses_the_creator_niche() -> None:
 
     assert "q=AI+tools%2C+creator+growth" in url
     assert "gl=US" in url
+
+
+def test_google_news_category_feed_respects_geo_and_language() -> None:
+    url = google_news_category_rss_url("entertainment", "JP", "ja")
+
+    assert "/ENTERTAINMENT?" in url
+    assert "gl=JP" in url
+    assert "ceid=JP:ja" in url
 
 
 def test_niche_search_query_splits_creator_niche_into_search_lanes() -> None:
@@ -102,6 +111,30 @@ def test_rank_trend_signals_dedupes_by_title() -> None:
 
     assert len(ranked) == 1
     assert ranked[0].source == "Google Trends"
+    assert ranked[0].score > 130.0
+
+
+def test_rank_trend_signals_keeps_japanese_titles_and_rewards_confirmation() -> None:
+    ranked = rank_trend_signals(
+        [
+            TrendSignal(
+                title="AI新機能 発表",
+                source="X Trends",
+                category="trending",
+                score=90,
+            ),
+            TrendSignal(
+                title="AI新機能 発表",
+                source="Google News RSS",
+                category="trending",
+                score=100,
+            ),
+        ]
+    )
+
+    assert len(ranked) == 1
+    assert ranked[0].title == "AI新機能 発表"
+    assert ranked[0].score == 112
 
 
 def test_summarize_trend_signals_includes_source_and_url() -> None:

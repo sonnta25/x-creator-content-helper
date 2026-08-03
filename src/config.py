@@ -16,16 +16,31 @@ class Settings:
     telegram_caption_limit: int = 1024
     x_cookie: str = ""
     x_account_name: str = "telegram_bot"
+    x_owner_username: str = ""
     x_accounts_db: str = "data/twscrape_accounts.db"
     x_search_limit: int = 8
     x_search_product: str = "Top"
     x_post_char_limit: int = 2000
     reply_target_min_author_followers: int = 50_000
     reply_target_min_views: int = 500
+    reply_target_max_age_minutes: int = 360
+    reply_target_languages: str = "en,ja"
+    reply_target_metrics_path: str = ""
+    reply_learning_enabled: bool = True
+    reply_learning_path: str = "data/reply_learning.json"
+    reply_tracking_poll_minutes: int = 5
+    reply_watch_path: str = "data/reply_watchlist.json"
+    reply_target_mode: str = "balanced"
+    reply_target_batch_size: int = 3
+    reply_video_batch_size: int = 3
+    creator_daily_reply_cap: int = 40
+    creator_timezone: str = "Asia/Ho_Chi_Minh"
+    content_language: str = "Vietnamese"
+    trend_language: str = "en"
     trend_sources: str = "x,google_trends,rss"
     google_trends_geo: str = "US"
     trend_rss_urls: str = ""
-    hashtag_mode: str = "auto"
+    hashtag_mode: str = "none"
     creator_niche: str = "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products"
     creator_voice: str = "witty, practical, dry, slightly contrarian, with a sharp creator POV"
     target_audience: str = "Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools"
@@ -36,6 +51,12 @@ class Settings:
     telegram_approval_chat_id: int | None = None
     telegram_reply_targets_minutes: int | None = None
     telegram_reply_targets_updated_at: int | None = None
+    reply_video_min_views: int = 15_000
+    reply_video_max_age_minutes: int = 45
+    reply_video_frame_analysis: bool = True
+    reply_video_frame_count: int = 2
+    telegram_reply_video_minutes: int | None = None
+    telegram_reply_video_updated_at: int | None = None
     automation_approvals_path: str = ""
     download_max_file_mb: int = 45
     download_timeout_seconds: int = 180
@@ -66,6 +87,7 @@ class Settings:
             x_cookie=os.getenv("X_COOKIE", "").strip(),
             x_account_name=os.getenv("X_ACCOUNT_NAME", "telegram_bot").strip()
             or "telegram_bot",
+            x_owner_username=os.getenv("X_OWNER_USERNAME", "").strip().lstrip("@"),
             x_accounts_db=os.getenv(
                 "X_ACCOUNTS_DB", "data/twscrape_accounts.db"
             ).strip()
@@ -77,11 +99,63 @@ class Settings:
                 0, _int_env("REPLY_TARGET_MIN_AUTHOR_FOLLOWERS", 50_000)
             ),
             reply_target_min_views=max(0, _int_env("REPLY_TARGET_MIN_VIEWS", 500)),
+            reply_target_max_age_minutes=min(
+                1440,
+                max(30, _int_env("REPLY_TARGET_MAX_AGE_MINUTES", 360)),
+            ),
+            reply_target_languages=os.getenv(
+                "REPLY_TARGET_LANGUAGES",
+                "en,ja",
+            ).strip()
+            or "en,ja",
+            reply_target_metrics_path=os.getenv(
+                "REPLY_TARGET_METRICS_PATH",
+                "data/reply_target_metrics.json",
+            ).strip()
+            or "data/reply_target_metrics.json",
+            reply_learning_enabled=_bool_env("REPLY_LEARNING_ENABLED", True),
+            reply_learning_path=os.getenv(
+                "REPLY_LEARNING_PATH", "data/reply_learning.json"
+            ).strip()
+            or "data/reply_learning.json",
+            reply_tracking_poll_minutes=max(
+                1, _int_env("REPLY_TRACKING_POLL_MINUTES", 5)
+            ),
+            reply_watch_path=os.getenv(
+                "REPLY_WATCH_PATH", "data/reply_watchlist.json"
+            ).strip()
+            or "data/reply_watchlist.json",
+            reply_target_mode=_choice_env(
+                "REPLY_TARGET_MODE",
+                "balanced",
+                {"balanced", "reach", "qualified", "relationship"},
+            ),
+            reply_target_batch_size=min(
+                5,
+                max(2, _int_env("REPLY_TARGET_BATCH_SIZE", 3)),
+            ),
+            reply_video_batch_size=min(
+                5,
+                max(2, _int_env("REPLY_VIDEO_BATCH_SIZE", 3)),
+            ),
+            creator_daily_reply_cap=max(
+                1, _int_env("CREATOR_DAILY_REPLY_CAP", 40)
+            ),
+            creator_timezone=os.getenv(
+                "CREATOR_TIMEZONE", "Asia/Ho_Chi_Minh"
+            ).strip()
+            or "Asia/Ho_Chi_Minh",
+            content_language=os.getenv(
+                "CONTENT_LANGUAGE", "Vietnamese"
+            ).strip()
+            or "Vietnamese",
+            trend_language=os.getenv("TREND_LANGUAGE", "en").strip().lower()
+            or "en",
             trend_sources=os.getenv("TREND_SOURCES", "x,google_trends,rss").strip()
             or "x,google_trends,rss",
             google_trends_geo=os.getenv("GOOGLE_TRENDS_GEO", "US").strip() or "US",
             trend_rss_urls=os.getenv("TREND_RSS_URLS", "").strip(),
-            hashtag_mode=_choice_env("HASHTAG_MODE", "auto", {"none", "auto", "one"}),
+            hashtag_mode=_choice_env("HASHTAG_MODE", "none", {"none", "auto", "one"}),
             creator_niche=os.getenv(
                 "CREATOR_NICHE",
                 "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products",
@@ -115,6 +189,24 @@ class Settings:
             ),
             telegram_reply_targets_updated_at=_optional_int_env(
                 "TELEGRAM_REPLY_TARGETS_UPDATED_AT"
+            ),
+            reply_video_min_views=max(0, _int_env("REPLY_VIDEO_MIN_VIEWS", 15_000)),
+            reply_video_max_age_minutes=min(
+                180,
+                max(15, _int_env("REPLY_VIDEO_MAX_AGE_MINUTES", 45)),
+            ),
+            reply_video_frame_analysis=_bool_env(
+                "REPLY_VIDEO_FRAME_ANALYSIS", True
+            ),
+            reply_video_frame_count=min(
+                4,
+                max(2, _int_env("REPLY_VIDEO_FRAME_COUNT", 2)),
+            ),
+            telegram_reply_video_minutes=_optional_int_env(
+                "TELEGRAM_REPLY_VIDEO_MINUTES"
+            ),
+            telegram_reply_video_updated_at=_optional_int_env(
+                "TELEGRAM_REPLY_VIDEO_UPDATED_AT"
             ),
             automation_approvals_path=os.getenv(
                 "AUTOMATION_APPROVALS_PATH",

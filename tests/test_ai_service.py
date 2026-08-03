@@ -2,15 +2,20 @@ import asyncio
 import json
 import time
 
+import pytest
+
+import src.extension_bridge as extension_bridge_module
 from src.ai_service import create_ai_service
 from src.config import Settings
 from src.extension_bridge import (
     JOB_LEASE_SECONDS,
     ExtensionBridgeJob,
     ExtensionBridgeServer,
+    _attachment_payloads,
     _clean_final_image_prompt,
 )
 from src.extension_bridge_service import ExtensionBridgeService
+from src.models import ImageAttachment
 
 
 def test_extension_bridge_provider_is_selected() -> None:
@@ -135,6 +140,64 @@ def test_bridge_requeues_a_job_after_its_extension_lease_expires() -> None:
     asyncio.run(exercise())
 
 
+def test_bridge_active_heartbeat_extends_soft_timeout(monkeypatch) -> None:
+    async def exercise() -> None:
+        monkeypatch.setattr(
+            extension_bridge_module,
+            "JOB_TIMEOUT_MIN_GRACE_SECONDS",
+            0.5,
+        )
+        server = ExtensionBridgeServer(
+            Settings(
+                telegram_bot_token="123:ABC",
+                extension_bridge_timeout_seconds=0.05,
+            )
+        )
+        job = ExtensionBridgeJob(
+            id="job-active",
+            kind="text",
+            original_prompt="Reply task",
+            phase="final_running",
+            final_prompt="Write one reply.",
+            last_heartbeat_at=time.monotonic(),
+            claim_attempts=1,
+        )
+        server._jobs[job.id] = job
+
+        waiter = asyncio.create_task(server._wait_for_job(job))
+        await asyncio.sleep(0.08)
+        job.future.set_result("Finished after the original timeout")
+
+        assert await waiter == "Finished after the original timeout"
+
+    asyncio.run(exercise())
+
+
+def test_bridge_timeout_explains_when_chrome_never_claimed_job() -> None:
+    async def exercise() -> None:
+        server = ExtensionBridgeServer(
+            Settings(
+                telegram_bot_token="123:ABC",
+                extension_bridge_timeout_seconds=0.01,
+            )
+        )
+        job = ExtensionBridgeJob(
+            id="job-unclaimed",
+            kind="text",
+            original_prompt="Reply task",
+            phase="final_pending",
+            final_prompt="Write one reply.",
+        )
+        server._jobs[job.id] = job
+
+        with pytest.raises(RuntimeError, match="Chrome never claimed"):
+            await server._wait_for_job(job)
+
+        assert job.future.cancelled() is False
+
+    asyncio.run(exercise())
+
+
 def test_bridge_routes_scheduled_trigger_to_automation_handler() -> None:
     class FakeAutomation:
         async def get_automation_config(self):
@@ -142,6 +205,9 @@ def test_bridge_routes_scheduled_trigger_to_automation_handler() -> None:
 
         async def trigger_replytargets(self, payload):
             return {"ok": True, "query": payload.get("query", "")}
+
+        async def trigger_replyvideo(self, payload):
+            return {"ok": True, "video_query": payload.get("query", "")}
 
         async def trigger_tweettrend3(self, payload):
             return {"ok": True}
@@ -171,6 +237,56 @@ def test_bridge_routes_scheduled_trigger_to_automation_handler() -> None:
 
         assert response.startswith(b"HTTP/1.1 202 Accepted")
         assert b'"query": "AI agents"' in response
+
+        video_response = await server._route(
+            {
+                "method": "POST",
+                "target": "/automation/triggers/replyvideo",
+                "headers": {"x-extension-bridge-token": "test-token"},
+                "body": b'{"query":"football"}',
+            }
+        )
+        assert video_response.startswith(b"HTTP/1.1 202 Accepted")
+        assert b'"video_query": "football"' in video_response
+
+    asyncio.run(exercise())
+
+
+def test_bridge_serializes_bounded_image_attachments() -> None:
+    payloads = _attachment_payloads(
+        [ImageAttachment("candidate 1.jpg", "image/jpeg", b"x" * 200)]
+    )
+
+    assert payloads[0]["name"] == "candidate1.jpg"
+    assert payloads[0]["mime_type"] == "image/jpeg"
+    assert payloads[0]["data_url"].startswith("data:image/jpeg;base64,")
+
+
+def test_next_text_job_exposes_frame_attachments_to_extension() -> None:
+    async def exercise() -> None:
+        server = ExtensionBridgeServer(Settings(telegram_bot_token="123:ABC"))
+        job = ExtensionBridgeJob(
+            id="visual-job",
+            kind="text",
+            original_prompt="Analyze frames",
+            phase="final_pending",
+            final_prompt="Write grounded replies",
+            attachments=[
+                {
+                    "name": "candidate-1-frame-01.jpg",
+                    "mime_type": "image/jpeg",
+                    "data_url": "data:image/jpeg;base64," + ("eA==" * 30),
+                }
+            ],
+        )
+        server._jobs[job.id] = job
+
+        response = await server._next_job()
+        payload = json.loads(response.split(b"\r\n\r\n", 1)[1])
+
+        assert payload["job"]["attachments"][0]["name"] == (
+            "candidate-1-frame-01.jpg"
+        )
 
     asyncio.run(exercise())
 

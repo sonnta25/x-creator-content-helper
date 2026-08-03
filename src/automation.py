@@ -21,6 +21,8 @@ class AutomationApproval:
     target_label: str = ""
     status: str = "pending"
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    decided_at: datetime | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
     error: str = ""
 
     @property
@@ -55,6 +57,7 @@ class AutomationApprovalStore:
         approver_user_id: int | None = None,
         target_url: str = "",
         target_label: str = "",
+        metadata: dict[str, object] | None = None,
     ) -> AutomationApproval:
         if kind not in {"reply", "post"}:
             raise RuntimeError(f"Unsupported approval kind: {kind}")
@@ -71,6 +74,7 @@ class AutomationApprovalStore:
             ),
             target_url=str(target_url or "").strip(),
             target_label=str(target_label or "").strip(),
+            metadata=dict(metadata or {}),
         )
         self._items[approval.id] = approval
         self.prune()
@@ -83,6 +87,8 @@ class AutomationApprovalStore:
             "completed",
             "rejected",
             "mobile_approved",
+            "published",
+            "not_found",
         }:
             approval.status = "expired"
             self._save()
@@ -119,6 +125,7 @@ class AutomationApprovalStore:
             approval.status = "mobile_approved" if destination == "mobile" else "approved"
         else:
             approval.status = "rejected"
+        approval.decided_at = datetime.now(UTC)
         self._save()
         return approval
 
@@ -130,9 +137,60 @@ class AutomationApprovalStore:
         return any(
             approval.target_url == clean_url
             and approval.status
-            in {"pending", "approved", "dispatching", "completed", "mobile_approved"}
+            in {
+                "pending",
+                "approved",
+                "dispatching",
+                "completed",
+                "mobile_approved",
+                "published",
+            }
             for approval in self._items.values()
         )
+
+    def items(self) -> list[AutomationApproval]:
+        self.prune()
+        return list(self._items.values())
+
+    def update_text(self, approval_id: str, text: str) -> AutomationApproval:
+        approval = self.get(approval_id)
+        if approval is None:
+            raise RuntimeError("Unknown approval request.")
+        if approval.status != "pending":
+            raise RuntimeError("Only a pending approval can be revised.")
+        clean = str(text or "").strip()
+        if not clean:
+            raise RuntimeError("Approval text cannot be empty.")
+        approval.text = clean
+        self._save()
+        return approval
+
+    def update_metadata(
+        self,
+        approval_id: str,
+        **values: object,
+    ) -> AutomationApproval:
+        approval = self.get(approval_id)
+        if approval is None:
+            raise RuntimeError("Unknown approval request.")
+        approval.metadata.update(values)
+        self._save()
+        return approval
+
+    def finish_mobile(
+        self,
+        approval_id: str,
+        *,
+        published: bool,
+    ) -> AutomationApproval:
+        approval = self.get(approval_id)
+        if approval is None:
+            raise RuntimeError("Unknown approval request.")
+        if approval.status not in {"mobile_approved", "completed"}:
+            return approval
+        approval.status = "published" if published else "not_found"
+        self._save()
+        return approval
 
     def claim_next(self) -> AutomationApproval | None:
         self.prune()
@@ -164,7 +222,15 @@ class AutomationApprovalStore:
             key
             for key, approval in self._items.items()
             if approval.status
-            in {"completed", "rejected", "expired", "failed", "mobile_approved"}
+            in {
+                "completed",
+                "rejected",
+                "expired",
+                "failed",
+                "mobile_approved",
+                "published",
+                "not_found",
+            }
         ]
         for key in removable[: max(0, len(self._items) - keep)]:
             self._items.pop(key, None)
@@ -194,6 +260,16 @@ class AutomationApprovalStore:
                     target_label=str(row.get("target_label", "")),
                     status=str(row.get("status", "pending")),
                     created_at=datetime.fromisoformat(str(row["created_at"])),
+                    decided_at=(
+                        datetime.fromisoformat(str(row["decided_at"]))
+                        if row.get("decided_at")
+                        else None
+                    ),
+                    metadata=(
+                        dict(row.get("metadata", {}))
+                        if isinstance(row.get("metadata", {}), dict)
+                        else {}
+                    ),
                     error=str(row.get("error", "")),
                 )
             except (KeyError, TypeError, ValueError):
@@ -216,6 +292,10 @@ class AutomationApprovalStore:
                     "target_label": approval.target_label,
                     "status": approval.status,
                     "created_at": approval.created_at.isoformat(),
+                    "decided_at": (
+                        approval.decided_at.isoformat() if approval.decided_at else None
+                    ),
+                    "metadata": approval.metadata,
                     "error": approval.error,
                 }
                 for approval in self._items.values()

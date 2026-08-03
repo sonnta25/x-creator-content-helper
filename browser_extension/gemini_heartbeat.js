@@ -2,7 +2,9 @@
   if (globalThis.__xContentBotRuntimeHeartbeat) return;
   globalThis.__xContentBotRuntimeHeartbeat = true;
 
-  const HEARTBEAT_INTERVAL_MS = 25000;
+  // The extension alarms are the primary scheduler. This low-frequency page
+  // heartbeat is only a recovery path when Chrome drops an MV3 alarm.
+  const HEARTBEAT_INTERVAL_MS = 60000;
 
   function wakeExtensionRuntime() {
     try {

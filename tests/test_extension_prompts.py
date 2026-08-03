@@ -28,7 +28,9 @@ def test_gemini_single_pass_prompt_combines_task_and_reply_quality_rules() -> No
 
     assert original in prompt
     assert "SINGLE-PASS WRITING AND QA" in prompt
-    assert "Sarcasm, a dry joke, or a jab" in prompt
+    assert "Sarcasm, slang, a dry joke, or a jab" in prompt
+    assert "specific source-grounded observation" in prompt
+    assert "question-only reply is invalid" in prompt
     assert "Return only the final answer required by the original task." in prompt
 
 
@@ -38,8 +40,11 @@ def test_gemini_single_pass_reply_prompt_keeps_replytargets_human() -> None:
     )
 
     assert "same language and register as the source post" in prompt
-    assert "optional tools, not a default personality" in prompt
+    assert "optional tools, not a default" in prompt
+    assert "could not be pasted under an unrelated post" in prompt
+    assert "answer about one decision" in prompt
     assert "every `reply` field" in prompt
+    assert "concrete read or comparison first" in prompt
 
 
 def test_gemini_single_pass_tweet_prompt_avoids_forced_lessons_and_hallucinated_facts() -> None:
@@ -129,7 +134,8 @@ def test_gemini_reply_humanizer_contains_user_style_rules() -> None:
     assert "Your job is NOT to write a new reply from scratch" in GEMINI_REPLY_HUMANIZER_INSTRUCTIONS
     assert "slightly messier" in GEMINI_REPLY_HUMANIZER_INSTRUCTIONS
     assert "lowkey" in GEMINI_REPLY_HUMANIZER_INSTRUCTIONS
-    assert "dry, snarky, lightly sarcastic" in GEMINI_REPLY_HUMANIZER_INSTRUCTIONS
+    assert "Default to clear, distinctive, and conversational" in GEMINI_REPLY_HUMANIZER_INSTRUCTIONS
+    assert "only when the source and draft naturally support it" in GEMINI_REPLY_HUMANIZER_INSTRUCTIONS
 
 
 def test_gemini_humanize_prompt_uses_tweet_humanizer_for_single_tweet() -> None:

@@ -15,6 +15,7 @@ from src.content_service import (
     _parse_json,
     _parse_reply_targets,
     _parse_single_reply,
+    _reply_is_question_only,
     _parse_trend_variants,
     _remove_ai_art_terms,
     _realistic_image_prompt,
@@ -23,7 +24,7 @@ from src.content_service import (
     _tweet_engine_prompt,
 )
 from src.config import Settings
-from src.models import GeneratedContent
+from src.models import GeneratedContent, ImageAttachment
 
 
 def test_limit_x_text_keeps_complete_sentences() -> None:
@@ -91,7 +92,10 @@ def test_reply_engine_is_text_only() -> None:
     )
     assert "Return only ONE final reply" in prompt
     assert "Shared reply-family rules" in prompt
-    assert "dry, snarky, or lightly sarcastic" in prompt
+    assert "Humor and sarcasm are optional tools, never the default" in prompt
+    assert "one distinctive" in prompt
+    assert "question-only reply is invalid" in prompt
+    assert "concrete read first" in prompt
 
 
 def test_tweet_engine_prompt_is_shared_for_tweet_family() -> None:
@@ -297,6 +301,44 @@ def test_generate_reply_from_text_rejects_prompt_leak() -> None:
         raise AssertionError("Expected prompt leak to be rejected")
 
 
+def test_generate_reply_from_text_repairs_question_only_draft() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return "What changed the rollout decision?"
+            return (
+                "The slower sequence makes retention look more important than launch speed. "
+                "What changed the rollout decision?"
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    generated = asyncio.run(
+        service.generate_reply_from_text("We changed the rollout plan after the first cohort.")
+    )
+
+    assert len(service.prompts) == 2
+    assert "question without first contributing value" in service.prompts[1]
+    assert generated.text.startswith("The slower sequence makes retention")
+
+
+def test_reply_question_only_detector_accepts_observation_then_question() -> None:
+    assert _reply_is_question_only("Why did the timing change?") is True
+    assert _reply_is_question_only("どうして介入を早めたのでしょうか？") is True
+    assert _reply_is_question_only("介入の基準が気になります") is True
+    assert (
+        _reply_is_question_only(
+            "The slower sequence makes retention the real constraint. What changed?"
+        )
+        is False
+    )
+    assert _reply_is_question_only("初動より継続率を優先した判断に見えます。基準は何でしたか？") is False
+
+
 def test_parse_single_reply_accepts_plain_text_and_removes_label() -> None:
     reply = _parse_single_reply("Final reply: Yep, give it three tabs and suddenly it's enterprise software.")
 
@@ -359,8 +401,8 @@ def test_reply_prompt_requires_source_matched_natural_voice() -> None:
     )
 
     assert "match the source post's language" in prompt
-    assert "Do not force a clever jab" in prompt
-    assert "one narrow reaction" in prompt
+    assert "Humor and sarcasm are optional tools, never the default" in prompt
+    assert "source-grounded contribution" in prompt
 
 
 def test_replytargets_prompt_does_not_force_creator_niche() -> None:
@@ -391,11 +433,73 @@ def test_replytargets_prompt_does_not_force_creator_niche() -> None:
         )
     )
 
-    assert "large accounts" in service.last_prompt
-    assert "Do not force the creator's content niche" in service.last_prompt
+    assert "posts with real current momentum" in service.last_prompt
+    assert "fully supported by the visible post" in service.last_prompt
+    assert "background assumptions that are not explicitly present" in service.last_prompt
+    assert "creator's content niche into an unrelated conversation" in service.last_prompt
+    assert "natural Japanese for a Japanese post" in service.last_prompt
+    assert "same language as its candidate post" in service.last_prompt
+    assert "original author can actually answer" in service.last_prompt
     assert "gold and crypto only" not in service.last_prompt
     assert "gold investors only" not in service.last_prompt
     assert "readers already participating in the source post's conversation" in service.last_prompt
+
+
+def test_replyvideo_prompt_is_grounded_and_does_not_claim_full_video_access() -> None:
+    class VideoReplyService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/video/status/1",'
+                '"target":"@video clip","reason":"Fresh and uncrowded",'
+                '"reply":"The timing is the whole story here—one beat later and the moment disappears."}]}'
+            )
+
+    service = VideoReplyService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "viral video lanes",
+            "URL: https://x.com/video/status/1\nCaption: a perfectly timed save",
+            video_mode=True,
+        )
+    )
+
+    assert "unordered samples" in service.last_prompt
+    assert "never infer motion between frames" in service.last_prompt
+    assert "usually avoid a trailing question" in service.last_prompt
+
+
+def test_replyvideo_passes_visual_attachments_to_provider() -> None:
+    class VisualReplyService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.names: list[str] = []
+
+        async def _generate_text_with_images(self, prompt, attachments):
+            self.names = [item.name for item in attachments]
+            return (
+                '{"targets":[{"url":"https://x.com/video/status/1",'
+                '"target":"@video clip","reason":"Fresh thread",'
+                '"reply":"That frame makes the scale of it obvious."}]}'
+            )
+
+    service = VisualReplyService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "viral video lanes",
+            "URL: https://x.com/video/status/1\nEvidence mode: visual_frames",
+            video_mode=True,
+            visual_attachments=[
+                ImageAttachment("candidate-1-frame-01.jpg", "image/jpeg", b"x" * 200)
+            ],
+        )
+    )
+
+    assert service.names == ["candidate-1-frame-01.jpg"]
 
 
 def test_looks_like_prompt_leak_detects_user_reported_output() -> None:
@@ -624,6 +728,222 @@ def test_generate_reply_targets_repairs_an_empty_first_response() -> None:
     assert len(service.prompts) == 2
     assert "repairing an unusable reply-target response" in service.prompts[1]
     assert targets[0].url == "https://x.com/large/status/999"
+
+
+def test_generate_reply_targets_repairs_batch_with_only_one_of_two_candidates() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return (
+                    '{"targets":[{"url":"https://x.com/first/status/1",'
+                    '"target":"@first","reason":"Fast growth",'
+                    '"reply":"The second update changes how the first result reads."}]}'
+                )
+            return (
+                '{"targets":['
+                '{"url":"https://x.com/first/status/1","target":"@first",'
+                '"reason":"Fast growth","reply":"The second update changes how the first result reads."},'
+                '{"url":"https://x.com/second/status/2","target":"@second",'
+                '"reason":"Open thread","reply":"The smaller reply load leaves the useful comparison visible."}'
+                ']}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "current topics",
+            (
+                "1. URL: https://x.com/first/status/1\nPost: First update\n\n"
+                "2. URL: https://x.com/second/status/2\nPost: Second update"
+            ),
+        )
+    )
+
+    assert len(service.prompts) == 2
+    assert "exactly 2\ndistinct targets" in service.prompts[1]
+    assert [target.url for target in targets] == [
+        "https://x.com/first/status/1",
+        "https://x.com/second/status/2",
+    ]
+
+
+def test_generate_reply_targets_requires_every_selected_candidate_up_to_five() -> None:
+    class FourTargetService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":['
+                + ",".join(
+                    "{"
+                    f'\"url\":\"https://x.com/source/status/{index}\",'
+                    f'\"target\":\"@source{index}\",'
+                    f'\"reason\":\"Fresh opening {index}\",'
+                    f'\"reply\":\"Specific useful observation number {index}.\"'
+                    "}"
+                    for index in range(1, 5)
+                )
+                + "]}"
+            )
+
+    service = FourTargetService(Settings(telegram_bot_token="123:ABC"))
+    context = "\n\n".join(
+        f"{index}. URL: https://x.com/source/status/{index}\nPost: Update {index}"
+        for index in range(1, 5)
+    )
+
+    targets = asyncio.run(service.generate_reply_targets("news", context))
+
+    assert len(targets) == 4
+    assert "Return exactly 4 distinct targets" in service.last_prompt
+
+
+def test_generate_reply_targets_includes_selected_learning_strategy() -> None:
+    class StrategyService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/88",'
+                '"target":"@source","reason":"Early opening",'
+                '"reply":"The slower rollout makes retention look like the real constraint. Which tradeoff mattered most here?"}]}'
+            )
+
+    service = StrategyService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "product launch",
+            "URL: https://x.com/source/status/88\nPost: We changed the rollout plan.",
+            strategy="author_specific_question",
+        )
+    )
+
+    assert "lead with one concrete source-grounded observation" in service.last_prompt
+
+
+def test_generate_reply_targets_repairs_question_only_reply() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return (
+                    '{"targets":[{"url":"https://x.com/source/status/90",'
+                    '"target":"@source","reason":"Early opening",'
+                    '"reply":"What changed the rollout decision?"}]}'
+                )
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/90",'
+                '"target":"@source","reason":"Early opening",'
+                '"reply":"The slower sequence makes retention look like the constraint. What changed the decision?"}]}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "product launch",
+            "URL: https://x.com/source/status/90\nPost: We changed the rollout plan.",
+        )
+    )
+
+    assert len(service.prompts) == 2
+    assert "question-only reply is invalid" in service.prompts[1]
+    assert targets[0].reply.startswith("The slower sequence")
+
+
+def test_generate_reply_targets_assigns_strategy_per_candidate_url() -> None:
+    class StrategyService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/88",'
+                '"target":"@source","reason":"Early opening",'
+                '"strategy":"natural_humor",'
+                '"reply":"The quiet part just got its own launch plan."}]}'
+            )
+
+    service = StrategyService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "product launch",
+            "URL: https://x.com/source/status/88\nPost: We changed the rollout plan.",
+            strategy_by_url={
+                "https://x.com/source/status/88": "natural_humor",
+            },
+        )
+    )
+
+    assert "https://x.com/source/status/88: natural_humor" in service.last_prompt
+    assert targets[0].strategy == "natural_humor"
+
+
+def test_generate_trend_posts_batch_uses_one_job_for_multiple_topics() -> None:
+    class BatchService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            return """
+            {"posts":[
+              {"topic":"Gold","text":"Gold moved after the policy detail, not the headline.",
+               "image_prompt":"A square realistic photo of gold bars on a market desk"},
+              {"topic":"AI","text":"The useful AI update is the boring one: fewer handoffs.",
+               "image_prompt":"A square realistic photo of a clean automation workspace"}
+            ]}
+            """
+
+    service = BatchService(Settings(telegram_bot_token="123:ABC"))
+    posts = asyncio.run(
+        service.generate_trend_posts_batch(
+            [
+                ("Gold", "Policy detail and price context"),
+                ("AI", "Workflow release context"),
+            ]
+        )
+    )
+
+    assert len(service.prompts) == 1
+    assert [post.topic for post in posts] == ["Gold", "AI"]
+    assert "Return exactly 2 posts" in service.prompts[0]
+
+
+def test_generate_reply_revision_returns_copy_ready_text() -> None:
+    class RevisionService(ContentService):
+        async def _generate_text(self, prompt: str) -> str:
+            assert "Make it shorter" in prompt
+            assert "Current reply:" in prompt
+            return '{"reply":"The rollout tradeoff matters more than the launch date."}'
+
+    service = RevisionService(Settings(telegram_bot_token="123:ABC"))
+    revised = asyncio.run(
+        service.generate_reply_revision(
+            "We changed the rollout plan.",
+            "This is a much longer current reply about the rollout.",
+            "Make it shorter.",
+        )
+    )
+
+    assert revised == "The rollout tradeoff matters more than the launch date"
 
 
 def test_parse_reply_targets_recovers_all_items_from_unescaped_reply_quotes() -> None:

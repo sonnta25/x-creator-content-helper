@@ -31,6 +31,12 @@
       </label>
 
       <div class="toggle-row">
+        <span>Low-resource mode</span>
+        <button id="lowResourceMode" class="toggle" type="button" aria-pressed="true">ON</button>
+      </div>
+      <p class="hint">Uses 60-second idle polling and fewer DOM/heartbeat checks for small VPS instances.</p>
+
+      <div class="toggle-row">
         <span>Auto Run</span>
         <button id="autoRun" class="toggle" type="button" aria-pressed="false">OFF</button>
       </div>
@@ -55,15 +61,47 @@
         </div>
 
         <label>
-          /replytargets interval + max post age (minutes)
+          Creator timezone
+          <input id="creatorTimezone" spellcheck="false" placeholder="Asia/Ho_Chi_Minh">
+        </label>
+        <p class="hint">Active hours and fixed trend times use this IANA timezone, not the VPS clock.</p>
+
+        <label>
+          /replytargets scan interval (minutes)
           <input id="replyTargetsMinutes" type="number" min="5" step="1">
         </label>
+
+        <label>
+          /replytargets maximum post age (minutes)
+          <input id="replyTargetsMaxAgeMinutes" type="number" min="30" max="1440" step="15">
+        </label>
+
+        <label>
+          /replytargets languages
+          <input id="replyTargetsLanguages" spellcheck="false" placeholder="en,ja">
+        </label>
+        <p class="hint">Comma-separated X language codes. /replylangs in Telegram is the source of truth and syncs this field. No country filter is applied.</p>
         <p id="replyScheduleStatus" class="hint"></p>
 
         <label>
           /replytargets query (optional)
           <input id="replyTargetsQuery" spellcheck="false" placeholder="blank = auto">
         </label>
+
+        <label>
+          /replyvideo scan interval (minutes)
+          <input id="replyVideoMinutes" type="number" min="3" step="1">
+        </label>
+
+        <label>
+          /replyvideo topic (optional)
+          <input id="replyVideoQuery" spellcheck="false" placeholder="blank = global + Vietnamese">
+        </label>
+        <label>
+          /replyvideo active windows
+          <input id="replyVideoWindows" spellcheck="false" placeholder="08:00-11:00,12:00-14:00,19:00-22:00">
+        </label>
+        <p id="replyVideoScheduleStatus" class="hint"></p>
 
         <label>
           /tweettrend3 fixed times

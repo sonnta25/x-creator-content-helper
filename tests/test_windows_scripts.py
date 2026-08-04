@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -71,8 +72,20 @@ def test_setup_preserves_active_reply_settings_and_drops_removed_post_settings()
         assert removed not in script
 
 
+def test_setup_preserves_every_documented_env_setting_and_uses_runtime_cap() -> None:
+    script = (WINDOWS_SCRIPTS / "setup.ps1").read_text(encoding="utf-8-sig")
+    example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8-sig")
+    assignment = re.compile(r"^([A-Z][A-Z0-9_]*)=", re.MULTILINE)
+
+    assert set(assignment.findall(example)) <= set(assignment.findall(script))
+    assert 'CREATOR_DAILY_REPLY_CAP=$(Get-EnvValue "CREATOR_DAILY_REPLY_CAP" "500")' in script
+
+
 def test_vps_package_excludes_development_and_private_runtime_files() -> None:
     script = (WINDOWS_SCRIPTS / "package.ps1").read_text(encoding="utf-8-sig")
 
     for excluded in ('".env"', '".gitignore"', '".github"', '"tests"'):
         assert excluded in script
+    for sensitive in ('".env.*"', '"*cookie*"', '"auth_token*"', '"ct0*"', '"*.pem"', '"*.key"'):
+        assert sensitive in script
+    assert 'if ($File.Name -eq ".env.example") { return $false }' in script

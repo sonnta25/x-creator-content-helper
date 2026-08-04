@@ -28,6 +28,25 @@ $excludedDirs = @(
     "tests"
 )
 $excludedFiles = @(".env", ".gitignore")
+$excludedSensitivePatterns = @(
+    ".env.*",
+    "*cookie*",
+    "auth_token*",
+    "ct0*",
+    "*.pem",
+    "*.key"
+)
+
+function Test-ExcludedFile {
+    param([System.IO.FileInfo] $File)
+
+    if ($excludedFiles -contains $File.Name) { return $true }
+    if ($File.Name -eq ".env.example") { return $false }
+    foreach ($pattern in $excludedSensitivePatterns) {
+        if ($File.Name -like $pattern) { return $true }
+    }
+    return $false
+}
 
 function Get-PackageFiles {
     param([string] $Path)
@@ -49,7 +68,7 @@ function Get-PackageFiles {
             continue
         }
 
-        if ($excludedFiles -contains $child.Name) {
+        if (Test-ExcludedFile -File $child) {
             continue
         }
 

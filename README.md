@@ -132,6 +132,13 @@ posts that accelerate several hours later. Reply competition is scored separatel
 crowded threads and dominant existing replies reduce opportunity even when the root
 post is viral.
 
+`REPLY_TARGET_MIN_VIEWS` is the normal selection baseline, not an unconditional hard
+gate. When fewer than two posts survive, the bot re-ranks the same fresh results with
+bounded momentum and view-floor fallbacks. The final tier can accept any visible view
+signal, but it still keeps the freshness, root-post, active-card, deduplication, and
+monetization-safety checks. If fewer than two real candidates remain, no tweet or URL
+is invented and no Gemini batch is spent.
+
 Priority authors are searched before generic trend lanes. Their posts still pass the
 same freshness, public-momentum, reply-competition, deduplication, and safety gates;
 watching an author is a ranking advantage, not an automatic approval.
@@ -293,12 +300,12 @@ From PowerShell in the extracted project folder:
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\windows\setup.ps1
-.\scripts\windows\start.ps1
 ```
 
 `setup.ps1` creates `.venv`, installs dependencies, asks for the Telegram token, and
-creates `.env`. `start.ps1` checks dependency changes before starting one hidden bot
-process.
+creates or updates `.env` while preserving supported operator settings. It then starts
+one hidden bot process, so a separate `start.ps1` call is not needed after setup.
+`start.ps1` is used for later routine starts and checks dependency changes first.
 
 Operational commands:
 
@@ -409,8 +416,9 @@ Create a clean deployment ZIP with:
 .\scripts\windows\package.ps1
 ```
 
-The package excludes `.env`, cookies, `data/`, logs, tests, virtual environments, and
-Git metadata.
+The package excludes `.env` variants except `.env.example`, cookie files,
+`auth_token`/`ct0` exports, private key files, `data/`, logs, tests, virtual
+environments, and Git metadata.
 
 Run validation locally with:
 

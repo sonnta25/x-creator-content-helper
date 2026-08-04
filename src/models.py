@@ -75,6 +75,10 @@ class XSearchResult:
     root_author_has_replied: bool = False
     audience_affinity_score: float = 0.0
     relationship_score: float = 0.0
+    rankability_score: float = 0.0
+    premium_audience_score: float = 0.0
+    verified_replier_ratio: float = 0.0
+    goal_score: float = 0.0
 
 
 @dataclass(frozen=True)

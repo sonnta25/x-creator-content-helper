@@ -11,9 +11,12 @@ from src.bot import (
     ContentBot,
     MENU_ACTIONS,
     MENU_LAYOUTS,
+    MENU_INBOX,
     MENU_REPLY_BATCH,
     MENU_REPLY_TARGETS,
     MENU_REPLY_VIDEO,
+    MENU_SESSION,
+    MENU_SETTINGS,
     MENU_VIDEO_SCHEDULE,
     _command_payload,
     _dedupe_queries,
@@ -36,8 +39,10 @@ from src.bot import (
     _reply_video_search_queries,
     _video_context_quality,
     _is_reliable_video_context_text,
+    _is_semantic_duplicate,
     _select_reply_draft_batch,
     _select_reply_video_mix,
+    _select_session_mix,
     _updated_reply_target_languages,
     _x_account_error_notifications,
 )
@@ -99,11 +104,15 @@ def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
     assert {
         "start", "menu", "help", "download", "replytargets", "replyvideo",
         "reply", "replyevery", "videoevery", "replybatch", "replylangs",
-        "replylearn", "replyreport", "setupcheck", "cancel",
+        "replylearn", "replyreport", "setupcheck", "cancel", "session",
+        "inbox", "replygoal", "replycap",
     }.issubset(commands)
 
 
 def test_grouped_menu_keeps_replyvideo_and_automation_controls() -> None:
+    assert MENU_SESSION in MENU_LAYOUTS["main"][0]
+    assert MENU_INBOX in MENU_LAYOUTS["main"][1]
+    assert MENU_SETTINGS in MENU_LAYOUTS["main"][2]
     assert MENU_REPLY_TARGETS in MENU_LAYOUTS["reply"][0]
     assert MENU_REPLY_VIDEO in MENU_LAYOUTS["reply"][0]
     assert MENU_VIDEO_SCHEDULE in MENU_LAYOUTS["automation"][0]
@@ -112,12 +121,147 @@ def test_grouped_menu_keeps_replyvideo_and_automation_controls() -> None:
     assert MENU_ACTIONS[MENU_VIDEO_SCHEDULE] == ("command", "videoevery")
 
 
-def test_menu_keyboard_is_persistent() -> None:
+def test_menu_keyboard_hides_after_a_selection() -> None:
     from src.bot import _menu_keyboard
 
     keyboard = _menu_keyboard("main")
     assert isinstance(keyboard, ReplyKeyboardMarkup)
-    assert keyboard.is_persistent is True
+    assert keyboard.is_persistent is False
+    assert keyboard.one_time_keyboard is True
+
+
+def test_session_mix_prefers_video_but_keeps_text_lane() -> None:
+    def candidate(tweet_id: int, *, video: bool, score: float) -> XSearchResult:
+        return XSearchResult(
+            id=tweet_id,
+            username=f"user{tweet_id}",
+            display_name="User",
+            text="Candidate",
+            created_at=datetime.now(UTC).isoformat(),
+            url=f"https://x.com/user{tweet_id}/status/{tweet_id}",
+            has_video=video,
+            goal_score=score,
+            rankability_score=score,
+        )
+
+    videos = [candidate(index, video=True, score=90 - index) for index in range(1, 4)]
+    targets = [candidate(index, video=False, score=80 - index) for index in range(10, 13)]
+
+    selected = _select_session_mix(targets, videos, max_items=5)
+
+    assert len(selected) == 5
+    assert sum(item.has_video for item in selected) == 3
+    assert sum(not item.has_video for item in selected) == 2
+
+
+def test_duplicate_guard_rejects_near_copypasta_only() -> None:
+    existing = ["The real bottleneck here is distribution, not model quality."]
+
+    assert _is_semantic_duplicate(
+        "The real bottleneck here is distribution not model quality",
+        existing,
+    )
+    assert not _is_semantic_duplicate(
+        "Cheap inference changes which workflows can run continuously.",
+        existing,
+    )
+
+
+def test_earn_goal_rewards_verified_audience_proxy() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC", creator_goal="earn"))
+    common = dict(
+        display_name="User",
+        text="A useful AI launch",
+        created_at=datetime.now(UTC).isoformat(),
+        language="en",
+        viral_score=70,
+        reply_opportunity_score=70,
+        thread_availability_score=80,
+        reply_saturation_penalty=10,
+    )
+    verified = XSearchResult(
+        id=1,
+        username="verified",
+        url="https://x.com/verified/status/1",
+        author_verified=True,
+        verified_replier_ratio=0.5,
+        **common,
+    )
+    regular = XSearchResult(
+        id=2,
+        username="regular",
+        url="https://x.com/regular/status/2",
+        **common,
+    )
+
+    ranked = bot._apply_reply_target_mode([regular, verified], "balanced")
+
+    assert ranked[0].username == "verified"
+    assert ranked[0].premium_audience_score > ranked[1].premium_audience_score
+
+
+def test_session_queue_sends_one_unsent_card_at_a_time(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    for index in range(2):
+        bot.approvals.create(
+            kind="reply",
+            text=f"Reply {index}",
+            chat_id=1,
+            target_url=f"https://x.com/source/status/{index + 1}",
+            metadata={
+                "reply_session_id": "session-1",
+                "reply_session_index": index,
+                "session_card_sent": False,
+            },
+        )
+    sent = []
+
+    async def send(approval):
+        sent.append(approval.text)
+
+    bot._send_approval = send
+
+    assert asyncio.run(bot._send_next_session_approval("session-1")) is True
+    assert sent == ["Reply 0"]
+    assert asyncio.run(bot._send_next_session_approval("session-1")) is True
+    assert sent == ["Reply 0", "Reply 1"]
+    assert asyncio.run(bot._send_next_session_approval("session-1")) is False
+
+
+def test_final_opportunity_check_rejects_a_suddenly_saturated_thread() -> None:
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    timestamp = int(datetime.now(UTC).timestamp())
+    original = XSearchResult(
+        id=44,
+        username="source",
+        display_name="Source",
+        text="Fast post",
+        created_at=datetime.now(UTC).isoformat(),
+        created_at_timestamp=timestamp,
+        url="https://x.com/source/status/44",
+        reply_count=5,
+        view_count=10_000,
+    )
+    saturated = XSearchResult(
+        **{
+            **original.__dict__,
+            "reply_count": 120,
+            "view_count": 12_000,
+        }
+    )
+
+    class XSearch:
+        async def tweet_by_id(self, _tweet_id):
+            return saturated
+
+    bot.x_search = XSearch()
+
+    assert asyncio.run(bot._opportunity_still_open(original, video_mode=False)) is False
 
 
 def test_command_payload_preserves_plain_follow_up_text() -> None:
@@ -368,6 +512,9 @@ def test_automation_config_exposes_telegram_reply_interval() -> None:
         "creator_timezone": "Asia/Ho_Chi_Minh",
         "reply_target_languages": "en,ja",
         "extension_bridge_timeout_seconds": 360,
+        "creator_goal": "qualify",
+        "daily_reply_cap": 500,
+        "author_daily_reply_cap": 5,
     }
     bot._automation_running.add("replytargets")
     assert asyncio.run(bot.get_automation_config())["automation_running"] is True

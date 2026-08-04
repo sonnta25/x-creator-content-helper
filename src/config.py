@@ -28,9 +28,14 @@ class Settings:
     reply_tracking_poll_minutes: int = 5
     reply_watch_path: str = "data/reply_watchlist.json"
     reply_target_mode: str = "balanced"
+    creator_goal: str = "qualify"
     reply_target_batch_size: int = 3
     reply_video_batch_size: int = 3
-    creator_daily_reply_cap: int = 40
+    reply_session_minutes: int = 20
+    reply_author_daily_cap: int = 5
+    stale_mobile_approval_hours: int = 6
+    reply_daily_digest_hour: int = 22
+    creator_daily_reply_cap: int = 500
     creator_timezone: str = "Asia/Ho_Chi_Minh"
     creator_niche: str = "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products"
     creator_voice: str = "witty, practical, dry, slightly contrarian, with a sharp creator POV"
@@ -109,6 +114,11 @@ class Settings:
                 "balanced",
                 {"balanced", "reach", "qualified", "relationship"},
             ),
+            creator_goal=_choice_env(
+                "CREATOR_GOAL",
+                "qualify",
+                {"qualify", "earn", "network"},
+            ),
             reply_target_batch_size=min(
                 5,
                 max(2, _int_env("REPLY_TARGET_BATCH_SIZE", 3)),
@@ -118,7 +128,23 @@ class Settings:
                 max(2, _int_env("REPLY_VIDEO_BATCH_SIZE", 3)),
             ),
             creator_daily_reply_cap=max(
-                1, _int_env("CREATOR_DAILY_REPLY_CAP", 40)
+                1, _int_env("CREATOR_DAILY_REPLY_CAP", 500)
+            ),
+            reply_session_minutes=min(
+                120,
+                max(10, _int_env("REPLY_SESSION_MINUTES", 20)),
+            ),
+            reply_author_daily_cap=min(
+                25,
+                max(1, _int_env("REPLY_AUTHOR_DAILY_CAP", 5)),
+            ),
+            stale_mobile_approval_hours=min(
+                72,
+                max(2, _int_env("STALE_MOBILE_APPROVAL_HOURS", 6)),
+            ),
+            reply_daily_digest_hour=min(
+                23,
+                max(0, _int_env("REPLY_DAILY_DIGEST_HOUR", 22)),
             ),
             creator_timezone=os.getenv(
                 "CREATOR_TIMEZONE", "Asia/Ho_Chi_Minh"

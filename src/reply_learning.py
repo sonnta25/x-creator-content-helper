@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.automation import AutomationApproval
 from src.models import XSearchResult
@@ -57,7 +59,7 @@ class ReplyLearningStore:
     @staticmethod
     def _default_data(enabled: bool) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "enabled": bool(enabled),
             "strategy_weights": dict(DEFAULT_STRATEGY_WEIGHTS),
             "strategy_cursor": 0,
@@ -67,6 +69,7 @@ class ReplyLearningStore:
             "last_tuned_sample_count": 0,
             "records": {},
             "feedback_events": [],
+            "last_digest_date": "",
         }
 
     @property
@@ -123,8 +126,19 @@ class ReplyLearningStore:
             "language": str(metadata.get("language") or ""),
             "root_author": str(metadata.get("root_author") or ""),
             "root_author_id": metadata.get("root_author_id"),
+            "root_author_verified": bool(metadata.get("root_author_verified")),
             "root_views_at_approval": metadata.get("root_views"),
             "root_replies_at_approval": metadata.get("root_replies"),
+            "source_type": str(metadata.get("source_type") or "replytargets"),
+            "has_video": bool(metadata.get("has_video")),
+            "rankability_score": float(metadata.get("rankability_score") or 0.0),
+            "premium_audience_score": float(
+                metadata.get("premium_audience_score") or 0.0
+            ),
+            "creator_goal": str(metadata.get("creator_goal") or "qualify"),
+            "creator_timezone": str(
+                metadata.get("creator_timezone") or "Asia/Ho_Chi_Minh"
+            ),
             "approved_at": (
                 approval.decided_at or approval.created_at
             ).astimezone(UTC).isoformat(),
@@ -179,6 +193,11 @@ class ReplyLearningStore:
                 "reply_url": reply.url,
                 "actual_text": reply.text,
                 "posted_at": _result_datetime(reply).isoformat(),
+                "posted_hour_utc": _result_datetime(reply).hour,
+                "posted_hour_local": _local_hour(
+                    _result_datetime(reply),
+                    str(record.get("creator_timezone") or "Asia/Ho_Chi_Minh"),
+                ),
                 "language": reply.language or record.get("language", ""),
                 "owner_followers_at_posting": reply.author_followers_count,
                 "edit_similarity": _text_similarity(
@@ -403,12 +422,104 @@ class ReplyLearningStore:
                 "approval_id": approval.id,
                 "strategy": strategy,
                 "language": str((approval.metadata or {}).get("language") or ""),
+                "source_type": str(
+                    (approval.metadata or {}).get("source_type") or "replytargets"
+                ),
+                "revision": str(
+                    (approval.metadata or {}).get("last_revision") or "first"
+                ),
+                "revision_count": int(
+                    (approval.metadata or {}).get("revision_count") or 0
+                ),
                 "approved": bool(approved),
                 "created_at": datetime.now(UTC).isoformat(),
             }
         )
         self.data["feedback_events"] = events[-1000:]
         self._save()
+
+    @property
+    def last_digest_date(self) -> str:
+        return str(self.data.get("last_digest_date") or "")
+
+    def mark_digest_sent(self, date_value: str) -> None:
+        self.data["last_digest_date"] = str(date_value or "")
+        self._save()
+
+    def style_examples(
+        self,
+        *,
+        language: str = "",
+        source_type: str = "",
+        limit: int = 3,
+    ) -> list[str]:
+        """Return top real posted replies as bounded prompt examples."""
+        clean_language = language.strip().lower()
+        clean_source = source_type.strip().lower()
+        rows = []
+        for row in self.records("tracking", "measured"):
+            text = str(row.get("actual_text") or "").strip()
+            if not text:
+                continue
+            if clean_language and str(row.get("language") or "").lower() != clean_language:
+                continue
+            if clean_source and str(row.get("source_type") or "").lower() != clean_source:
+                continue
+            rows.append(row)
+        rows.sort(
+            key=lambda row: (
+                float(row.get("final_score") or 0.0),
+                float(row.get("edit_similarity") or 0.0),
+                str(row.get("posted_at") or ""),
+            ),
+            reverse=True,
+        )
+        examples: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            text = str(row.get("actual_text") or "").strip()
+            normalized = re.sub(r"\W+", " ", text.casefold()).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            examples.append(text[:280])
+            if len(examples) >= max(0, limit):
+                break
+        return examples
+
+    def performance_adjustment(
+        self,
+        *,
+        language: str,
+        source_type: str,
+        hour_utc: int | None = None,
+    ) -> float:
+        """Bayesian-smoothed multiplier for language/source/time allocation."""
+        measured = [
+            row
+            for row in self.records("measured")
+            if row.get("final_score") is not None
+        ]
+        if len(measured) < 5:
+            return 1.0
+        global_mean = sum(float(row["final_score"]) for row in measured) / len(measured)
+        selected = [
+            row
+            for row in measured
+            if str(row.get("language") or "").lower() == language.strip().lower()
+            and str(row.get("source_type") or "").lower()
+            == source_type.strip().lower()
+            and (
+                hour_utc is None
+                or abs(int(row.get("posted_hour_utc") or 0) - int(hour_utc)) <= 2
+            )
+        ]
+        if not selected:
+            return 1.0
+        shrunk = (
+            sum(float(row["final_score"]) for row in selected) + 6 * global_mean
+        ) / (len(selected) + 6)
+        return round(max(0.85, min(1.15, shrunk / max(1.0, global_mean))), 3)
 
     def relationship_strength(
         self,
@@ -553,6 +664,17 @@ class ReplyLearningStore:
                     else 0.0
                 ),
             }
+        views = [
+            int((row.get("snapshots") or [{}])[-1].get("views") or 0)
+            for row in measured
+            if row.get("snapshots")
+        ]
+        feedback = [
+            row
+            for row in self.data.get("feedback_events", [])
+            if isinstance(row, dict)
+            and _parse_datetime(row.get("created_at")) >= cutoff
+        ]
         return {
             "days": days,
             "posted": len(rows),
@@ -563,7 +685,25 @@ class ReplyLearningStore:
                 if measured
                 else 0.0
             ),
+            "median_views": int(statistics.median(views)) if views else 0,
+            "over_5k": sum(value >= 5_000 for value in views),
+            "over_20k": sum(value >= 20_000 for value in views),
+            "over_50k": sum(value >= 50_000 for value in views),
+            "author_response_rate": (
+                sum(bool(row.get("author_replied")) for row in rows) / len(rows)
+                if rows
+                else 0.0
+            ),
+            "approval_rate": (
+                sum(bool(row.get("approved")) for row in feedback) / len(feedback)
+                if feedback
+                else 0.0
+            ),
             "by_strategy": by_strategy,
+            "by_language": _dimension_report(measured, "language"),
+            "by_source": _dimension_report(measured, "source_type"),
+            "by_hour_utc": _dimension_report(measured, "posted_hour_utc"),
+            "by_hour_local": _dimension_report(measured, "posted_hour_local"),
             "posts": sum(row.get("kind") == "post" for row in rows),
             "replies": sum(row.get("kind") == "reply" for row in rows),
             "follower_window_lift": _follower_window_lift(rows),
@@ -631,6 +771,44 @@ def match_posted_content(
 def _text_similarity(left: str, right: str) -> float:
     normalize = lambda value: re.sub(r"\W+", " ", value.casefold()).strip()
     return SequenceMatcher(None, normalize(left), normalize(right)).ratio()
+
+
+def _dimension_report(
+    rows: list[dict[str, Any]],
+    key: str,
+) -> dict[str, dict[str, float | int]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        value = str(row.get(key) if row.get(key) not in {None, ""} else "unknown")
+        groups.setdefault(value, []).append(row)
+    report: dict[str, dict[str, float | int]] = {}
+    for value, selected in groups.items():
+        scores = [float(row.get("final_score") or 0.0) for row in selected]
+        views = [
+            int((row.get("snapshots") or [{}])[-1].get("views") or 0)
+            for row in selected
+            if row.get("snapshots")
+        ]
+        report[value] = {
+            "count": len(selected),
+            "average_score": round(sum(scores) / max(1, len(scores)), 1),
+            "median_views": int(statistics.median(views)) if views else 0,
+            "author_response_rate": round(
+                sum(bool(row.get("author_replied")) for row in selected)
+                / max(1, len(selected)),
+                3,
+            ),
+        }
+    return dict(
+        sorted(
+            report.items(),
+            key=lambda item: (
+                float(item[1]["average_score"]),
+                int(item[1]["count"]),
+            ),
+            reverse=True,
+        )
+    )
 
 
 def _outcome_score(record: dict[str, Any], snapshot: dict[str, Any]) -> float:
@@ -713,3 +891,11 @@ def _parse_datetime(value: Any) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _local_hour(value: datetime, timezone_name: str) -> int:
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone = UTC
+    return value.astimezone(timezone).hour

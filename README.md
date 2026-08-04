@@ -1,471 +1,374 @@
-# X Telegram Content Bot
+# X Creator Reply Bot
 
-Telegram bot for discovering high-opportunity X/Twitter conversations, generating
-standout replies, tracking results, and downloading social post media.
+Telegram bot for finding reply opportunities on X, drafting source-grounded replies
+with Gemini in normal Chrome, tracking public outcomes, and downloading social-post
+media. It does not require the official X API or periodic X Analytics CSV imports.
 
-The current AI flow is:
+Final posting always remains manual: the bot prepares and tracks replies, but the
+user reviews the X composer and presses **Reply**.
+
+## How the bot works
 
 ```text
-Telegram bot -> local extension bridge -> one Gemini job -> Telegram bot
+X discovery with twscrape
+        ↓
+Candidate ranking and watch reservoir
+        ↓
+Gemini job through the local Chrome extension
+        ↓
+Telegram approval card
+        ↓
+User reviews and posts manually on X
+        ↓
+Bot discovers the posted reply and tracks public results
 ```
 
-Gemini produces each final reply in one browser job. The extension reuses one logged-in tab but starts a clean Gemini conversation for every job, preventing context from one command leaking into the next. It hard-recycles that tab after 10 successful jobs, or immediately after a provider/DOM failure, so a long-running VPS does not retain Gemini's old page heap indefinitely. The bot does not use Ollama, Pollinations, Playwright, or official Gemini APIs.
+The normal daily workflow is:
+
+1. Run `/setupcheck` after deployment or cookie changes.
+2. Choose a goal with `/replygoal qualify`, `earn`, or `network`.
+3. Run `/session` to build a guided queue of posts and videos.
+4. Review one Telegram card at a time. Use **Alternative** or **Shorter** only when
+   needed.
+5. Tap **Approve on mobile**, then **Open X on phone**, review the filled composer,
+   and submit manually.
+6. Use `/inbox` when an original author responds and `/replyreport 7d` to review
+   performance.
+
+`/replytargets` and `/replyvideo` remain available when a specific discovery lane is
+needed. Scheduled scans can run both lanes automatically.
+
+## Telegram menu
+
+Use `/start`, `/menu`, or `/help` to open the English menu. The main menu provides:
+
+- **Start reply session**
+- **Author replies**
+- **Performance**
+- **Settings**
+- **Help** and **Cancel**
+
+The keyboard is not permanent. It hides after one selection so it does not cover the
+Telegram composer while reply cards are being reviewed. Use `/menu` to open it again.
+
+**Settings** contains the less-frequent controls for viral discovery, schedules,
+tracking, X accounts, downloads, persona, languages, batch sizes, limits, and creator
+goals. Buttons such as **Alternative**, **Shorter**, **Copy draft**, and
+**Approve on mobile** are attached directly to an approval card and are independent
+of the menu keyboard.
+
+When a menu action requires a value, the bot opens a private reply prompt. The prompt
+expires after five minutes and can be closed with `/cancel`. Direct command forms,
+such as `/replytargets AI agents`, continue to work.
 
 ## Commands
 
-- `/download <post URL>`: download images, carousels, videos, or Reels and send the original media files to Telegram.
-- `/reply <tweet text or X post link>`: create one copy-ready text reply only.
-- `/setupcheck`: check the X cookie pool, tracking username, approval chat, schedule, timezone, and stale approvals without exposing secrets.
-- `/replyevery <minutes>`: configure the scheduled `/replytargets` interval from Telegram (5-1440 minutes).
-- `/videoevery <minutes>`: configure the scheduled `/replyvideo` interval from Telegram (3-1440 minutes; default 5).
-- `/replybatch show|targets <2-5>|video <2-5>`: inspect or change approval cards requested per run; persists to `.env` immediately.
-- `/replylangs [show|add|remove|set]`: manage up to six X languages and persist them to `.env`.
-- `/replytargets [query]`: scan emerging and late-breakout conversations across configured languages; first sightings are normally watched before a Gemini draft is spent.
-- `/replyvideo [topic]`: hunt fresh viral videos in global, English, Japanese, and Vietnamese lanes, then create a configurable 2-5 low-competition reply cards.
-- `/replylearn [status|on|off|rollback|username @name]`: configure automatic tracking and bounded strategy learning.
-- `/replyreport [7d|30d]`: inspect tracked post/reply outcomes and the account-level follower-window proxy.
-- `/importcookie [account_name] <auth_token=...; ct0=...>`: import an X cookie for search.
-- `/xaccounts`: list imported X cookie accounts without exposing cookies.
-- `/xremove <account_name>`: remove an imported X cookie account from the twscrape pool.
-- `/persona`: show or update creator niche, voice, and audience.
-- `/cancel`: cancel a command that is waiting for input.
+### Daily workflow
 
-The bot registers these commands with Telegram on startup.
+- `/session [10-120|status|stop]` — build, inspect, or stop a guided reply queue.
+- `/inbox` — reopen pending follow-ups after original-author responses.
+- `/replytargets [topic|auto]` — find viral posts and create reply cards.
+- `/replyvideo [topic]` — find fresh viral videos with low reply competition.
+- `/reply <text or X URL>` — write one standalone reply.
+- `/replyreport [7d|30d]` — show tracked reply performance.
+- `/download <post URL>` — download images, carousels, videos, or Reels.
 
-### English Telegram menu
+### Strategy and automation
 
-Use `/start`, `/menu`, or `/help` to open the persistent English keyboard.
-The commands remain available for direct entry, while the keyboard groups the
-most common workflows:
+- `/replygoal show|qualify|earn|network` — change the ranking objective.
+- `/replyevery <5-1440>` — set the scheduled post-reply interval in minutes.
+- `/videoevery <3-1440>` — set the scheduled video-reply interval.
+- `/replybatch show|targets <2-5>|video <2-5>` — set cards requested per run.
+- `/replycap show|daily <1-2000>|author <1-25>` — set daily and per-author ceilings.
+- `/replylangs show|add|remove|set` — manage up to six X language codes.
+- `/replylearn status|on|off|rollback|username @name` — control tracking and bounded
+  learning.
+- `/persona` — show or update niche, voice, and audience.
 
-| Menu group | Buttons |
-|---|---|
-| **Main menu** | `Viral replies`, `Automation`, `Tracking & insights`, `X accounts`, `Video tools`, `Creator settings`, `Help`, `Cancel` |
-| **Viral replies** | `Find viral posts` (`/replytargets`), `Find viral videos` (`/replyvideo`), `Write a standout reply` (`/reply`) |
-| **Automation** | `Reply-target schedule` (`/replyevery`), `Reply-video schedule` (`/videoevery`), `Replies per run` (`/replybatch`) |
-| **Tracking & insights** | `Reply languages` (`/replylangs`), `Performance learning` (`/replylearn`), `Reply report` (`/replyreport`), `System check` (`/setupcheck`) |
-| **X accounts** | `Import X cookie` (`/importcookie`), `Account list` (`/xaccounts`), `Remove account` (`/xremove`) |
-| **Video tools** | `Download video` (`/download`) |
-| **Creator settings** | `Creator persona` (`/persona`) |
+### X account and health
 
-Every submenu includes a **Main menu** button. Selecting a button that needs an
-argument opens a private Force Reply prompt instead of running with missing input.
+- `/importcookie [name] <auth_token=...; ct0=...>` — add an authenticated X session.
+- `/xaccounts` — list cookie accounts without exposing cookie values.
+- `/xremove <name>` — remove an account from the twscrape pool.
+- `/setupcheck` — inspect X access, owner username, schedules, reservoir, learning,
+  timezone, approval chat, and stale approvals.
+- `/cancel` — cancel a command waiting for input.
 
-### Two-step command input
+Removed post-generation commands such as `/tweet`, `/xtweet`, `/today`,
+`/dailybrief`, `/tweettrend3`, `/retweet`, and `/automationhere` are not part of the
+current bot.
 
-Commands that need input no longer run immediately when selected from Telegram's
-grouped menu. Select `/download`, `/replytargets`, `/replyvideo`, `/reply`,
-`/persona`, `/importcookie`, `/xremove`, `/replyevery`, `/videoevery`, or `/replybatch`, and the bot
-opens a reply field with a short prompt. Send the requested value as the next
-message to run the command.
+## Discovery and reply generation
 
-The direct form still works, for example `/replytargets AI agents` or
-`/download https://...`. Pending input is isolated per chat and Telegram user,
-expires after five minutes, and can be stopped with `/cancel`. Selecting a
-different command replaces the previous pending request. Use `auto` when the
-`/replytargets` prompt should choose its own topic, and `show` to inspect
-`/persona` or `/replyevery`.
+### `/replytargets`
 
-### Post media downloads
+The bot searches authenticated X `Top` and `Latest` results, current trends, broad
+language lanes, and an optional creator-niche lane. It excludes replies and reposts;
+original and quote posts can remain eligible.
 
-Send a public post, video, or Reel link:
+`REPLY_TARGET_LANGUAGES` controls language, not country. No country filter is applied
+because reliable location metadata is absent from most posts. Japanese, English,
+Korean, Vietnamese, and other supported X language codes can therefore be mixed.
+
+The first observation of a candidate is normally stored in
+`data/reply_watchlist.json`. Later scans re-fetch watched tweet IDs and measure recent
+view and engagement movement, allowing the bot to catch both early breakouts and
+posts that accelerate several hours later. Reply competition is scored separately:
+crowded threads and dominant existing replies reduce opportunity even when the root
+post is viral.
+
+Scheduled scans with no ready opportunity are silent and do not spend a Gemini job.
+Authentication, rate-limit, bridge, or provider failures are still reported.
+
+### `/replyvideo`
+
+The video lane prioritizes fresh global viral video and low reply competition. When
+caption or X media text is reliable, the reply is grounded only in that text. When it
+is not reliable and `REPLY_VIDEO_FRAME_ANALYSIS=true`, the bot downloads the video,
+extracts a small number of representative frames, sends them to Gemini, and removes
+temporary media after processing.
+
+Frames are evidence samples, not full audio or motion analysis. The prompt forbids
+inventing speech, timing, identity, location, intent, or outcomes that are not visible
+or stated.
+
+### Reply safety and batch recovery
+
+Replies follow the source language and must add a concrete observation, implication,
+comparison, caveat, or reason. Generic agreement and question-only replies are
+rejected.
+
+Gemini is asked for 2-5 drafts. If one draft is malformed, the bot preserves good
+drafts and repairs only unresolved URLs. A blank URL is recovered only when its
+`@author` uniquely matches a permitted candidate URL; URLs are never guessed by list
+position. If fewer than two safe replies remain, one small rescue job requests only
+the missing slot. The bot never invents a second tweet merely to fill a batch.
+
+## Approval cards and tracking
+
+A reply card contains only the information needed for a decision:
+
+- target X URL;
+- concise Vietnamese source summary;
+- Vietnamese translation of the proposed reply;
+- original copy-ready reply in the source language.
+
+Views, competition, velocity, strategy, and opportunity scores remain internal for
+ranking and learning instead of cluttering the Telegram card.
+
+After **Approve on mobile**, Telegram shows **Open X on phone**. This two-step design
+is required because one Telegram button cannot both record a callback and open X.
+Long replies that do not fit safely in a Web Intent remain available through
+**Copy draft** or normal copy/paste.
+
+Set the real posting username with:
 
 ```text
-/download https://www.tiktok.com/@creator/video/123
+/replylearn username @your_x_username
 ```
 
-The bot downloads the post media and uploads it to the same Telegram chat as documents,
-so the file can be saved directly to a phone or computer without relying on a
-short-lived platform CDN link. The downloader supports sites handled by `yt-dlp`,
-including common TikTok, Douyin, Xiaohongshu, Facebook/Instagram Reels, and X
-public-video URLs. If the URL is an image post or carousel, `gallery-dl` is used
-as a bounded fallback and returns up to ten media files. The combined download
-must remain within `DOWNLOAD_MAX_FILE_MB`. Profile and timeline URLs are not
-intended for bulk downloads.
+The bot then looks for the manually posted reply on that public timeline; users do
+not need to send the reply URL back. It samples public metrics around 15 minutes,
+1 hour, 6 hours, and 24 hours. Original-author responses are checked more frequently
+and immediately create a Telegram follow-up card with **Continue conversation** and
+**Stop here**.
 
-Delivered files use neutral names such as
-`creator-video-20260727-101112-a1b2c3.mp4` or
-`creator-image-20260727-101112-a1b2c3-01.jpg`; the source title and platform video ID
-are not used in the filename or Telegram caption. The downloader also disables
-description, info JSON, thumbnail, comment, and subtitle sidecar files. Telegram
-keeps the source URL in the message caption for permission and provenance checks,
-but it is not embedded in the delivered filename. These cleanup steps do not make
-copied content original or bypass copyright/reused-content checks.
+Learning is bounded. It adjusts strategy allocation using real approvals, edits,
+public outcomes, language, source type, and posting hour. Strong real posted replies
+may supply short style examples, but the prompt forbids copying their wording or
+claims. The bot does not rewrite its source code or base prompt automatically.
 
-Downloads are processed one at a time, use a 180-second deadline, and default to a
-45 MB cap to stay below the public Telegram Bot API upload limit. Configure these in
-`.env`:
+## Limits and goals
+
+Defaults are designed for higher-volume reply workflows:
 
 ```env
-DOWNLOAD_MAX_FILE_MB=45
-DOWNLOAD_TIMEOUT_SECONDS=180
-DOWNLOAD_COOKIES_FILE=data/download-cookies.txt
-DOWNLOAD_COOKIES_FROM_BROWSER=chrome
-DOWNLOAD_BROWSER_PROFILE=Default
+CREATOR_GOAL=qualify
+CREATOR_DAILY_REPLY_CAP=500
+REPLY_AUTHOR_DAILY_CAP=5
+REPLY_SESSION_MINUTES=20
+REPLY_TARGET_BATCH_SIZE=3
+REPLY_VIDEO_BATCH_SIZE=3
 ```
 
-Some private, age-gated, regional, or anti-bot-protected videos require cookies.
-Export a Netscape-format cookie file on the bot machine and set
-`DOWNLOAD_COOKIES_FILE` to its path. For automatic refresh, set
-`DOWNLOAD_COOKIES_FROM_BROWSER` to `chrome` and optionally identify a profile such
-as `Default` or `Profile 1` with `DOWNLOAD_BROWSER_PROFILE`.
+- `qualify` emphasizes reach and reply visibility.
+- `earn` adds public verified/Premium-audience proxies; it cannot see X private
+  monetization or subscriber-ranking data.
+- `network` emphasizes author responses and repeat relationships.
 
-When both sources are configured, the bot first uses the cookie file. If the
-website returns an authentication, cookie, CAPTCHA, 401, or 403 error, the bot
-loads current cookies from that browser profile, merges them into the cookie jar,
-and retries the download once. Browser extraction requires the bot and browser to
-run under the same Windows user. It cannot restore a logged-out or revoked session;
-open the website, sign in or complete CAPTCHA, and retry. Cookie freshness and
-upstream site changes can still make a URL fail. Only download content you are
-authorized to save.
+The daily value is an approval-card ceiling, not a guaranteed posting quota.
+Available candidates, deduplication, quality checks, batch size, X limits, and manual
+submission still determine actual volume.
 
-## Creator Flow
+## Windows VPS setup
 
-1. Run `/setupcheck` once after deployment and resolve any reported blocker.
-2. Use `/replytargets` for broad conversations or `/replyvideo` for the video-first lane.
-3. Add a topic only when you want to force a specific conversation lane.
-4. Tap **Alternative** or **Shorter** only when a reply needs revision.
-5. Approve in Telegram, review the pre-filled composer, and submit manually on X.
+Requirements:
 
-General X search commands add `lang:en` automatically unless the query already includes a `lang:` filter. `/replytargets` is separate: it expands auto and plain-topic searches across `REPLY_TARGET_LANGUAGES` (default `en,ja`) and writes each reply in the source post's language.
+- Windows 10/11 or Windows Server with Python 3.11+;
+- normal Google Chrome running under the same Windows user as the bot;
+- logged-in Gemini and X sessions;
+- a Telegram bot token from BotFather.
 
-Manage languages without editing the VPS manually:
-
-```text
-/replylangs show
-/replylangs add ko es
-/replylangs remove ja
-/replylangs set en ja ko id
-```
-
-The bot validates X language codes, keeps at least one and at most six, writes the result to `.env`, applies it immediately to `/replytargets`, and syncs it to scheduled Chrome scans within about 60 seconds in low-resource mode.
-
-With extension **Auto Run** OFF, click **Run next job** for the queued batch; with **Auto Run** ON, the extension picks it up automatically on its polling interval.
-
-Extension `0.8.2` waits for Gemini's composer to be visible before inserting a prompt. It can also upload bounded representative video frames before submitting `/replyvideo`, including Gemini layouts that require opening the attachment menu and then choosing the separate Upload files action. Low-resource mode is enabled by default: idle job and schedule checks run at most once per minute, the watchdog runs every two minutes, the managed-tab recovery heartbeat runs every 60 seconds, claimed-job heartbeats run every 20 seconds, and Gemini response DOM checks back off to four seconds until output appears. Alarm repair no longer performs an extra job poll or schedule scan. The prompt is inserted atomically and verified before submission. Provider failures recycle only the bot-managed Gemini tab, and the bridge retains bounded heartbeat-based timeout recovery.
-
-Automatic `/replytargets` discovery uses the authenticated X trends timeline plus localized broad and creator-niche search lanes. Its scan interval and `REPLY_TARGET_MAX_AGE_MINUTES` lookback are independent. Repeated scans persist metric snapshots so ranking can use recent deltas and acceleration rather than lifetime averages alone.
-
-## Setup
-
-### Windows
+From PowerShell in the extracted project folder:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-Copy-Item .env.example .env
-```
-
-`start.ps1` compares `pyproject.toml` with the dependencies installed in `.venv`.
-After extracting an updated ZIP over an existing installation, starting the bot
-automatically installs newly added packages such as `yt-dlp` before checking or
-launching the polling process:
-
-```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\windows\setup.ps1
 .\scripts\windows\start.ps1
 ```
 
-### Ubuntu
+`setup.ps1` creates `.venv`, installs dependencies, asks for the Telegram token, and
+creates `.env`. `start.ps1` checks dependency changes before starting one hidden bot
+process.
 
-```bash
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3.11-dev unzip
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
+Operational commands:
+
+```powershell
+.\scripts\windows\status.ps1
+.\scripts\windows\stop.ps1
+.\scripts\windows\start.ps1
 ```
 
-Edit `.env`:
+Logs are written to `logs/bot.out.log` and `logs/bot.err.log`.
+
+## Chrome extension setup
+
+1. Open `chrome://extensions`.
+2. Enable **Developer mode**.
+3. Choose **Load unpacked** and select `browser_extension/`.
+4. Log in to Gemini and X in the same normal Chrome profile.
+5. Open the extension popup and make its bridge URL and token match `.env`.
+6. Enable **Auto Run** for queued Gemini work and **Automation** for schedules.
+7. Keep low-resource mode enabled on a small VPS.
+
+The required extension version is `0.8.4`. After replacing project files, press
+**Reload** on the extension card whenever `browser_extension/` changed.
+
+Version `0.8.4` allows up to 60 seconds for Gemini's editor to accept and submit a
+large reply-target prompt on a low-spec VPS, while still bounding frame upload and
+DOM-read operations. It also
+reduces expensive shadow-DOM scans; fails a no-progress Gemini response after four
+minutes; and reclaims an interrupted job after the bridge lease expires. It cannot
+restart the entire Chrome process if Chrome itself is closed or crashes.
+
+## Important `.env` settings
+
+Keep `.env` private. A practical configuration starts with:
 
 ```env
-TELEGRAM_BOT_TOKEN=...
-
-DOWNLOAD_MAX_FILE_MB=45
-DOWNLOAD_TIMEOUT_SECONDS=180
-DOWNLOAD_COOKIES_FILE=data/download-cookies.txt
-DOWNLOAD_COOKIES_FROM_BROWSER=chrome
-DOWNLOAD_BROWSER_PROFILE=Default
+TELEGRAM_BOT_TOKEN=replace_me
+TELEGRAM_APPROVAL_CHAT_ID=replace_me
 
 CONTENT_PROVIDER=extension_bridge
 EXTENSION_BRIDGE_HOST=127.0.0.1
 EXTENSION_BRIDGE_PORT=8765
-EXTENSION_BRIDGE_TOKEN=choose-a-private-token
+EXTENSION_BRIDGE_TOKEN=replace_with_a_private_local_token
 EXTENSION_BRIDGE_TIMEOUT_SECONDS=360
 
-X_COOKIE=
-X_ACCOUNT_NAME=telegram_bot
+X_OWNER_USERNAME=your_x_username
 X_ACCOUNTS_DB=data/twscrape_accounts.db
-X_SEARCH_LIMIT=8
-X_SEARCH_PRODUCT=Top
-REPLY_TARGET_MIN_AUTHOR_FOLLOWERS=50000
-REPLY_TARGET_MIN_VIEWS=500
-REPLY_TARGET_MAX_AGE_MINUTES=360
+
 REPLY_TARGET_LANGUAGES=en,ja
 REPLY_TARGET_MODE=balanced
-REPLY_WATCH_PATH=data/reply_watchlist.json
-CREATOR_DAILY_REPLY_CAP=40
+CREATOR_GOAL=qualify
+CREATOR_TIMEZONE=Asia/Ho_Chi_Minh
+
+CREATOR_DAILY_REPLY_CAP=500
+REPLY_AUTHOR_DAILY_CAP=5
 REPLY_TARGET_BATCH_SIZE=3
 REPLY_VIDEO_BATCH_SIZE=3
-REPLY_TARGET_METRICS_PATH=data/reply_target_metrics.json
-REPLY_VIDEO_MIN_VIEWS=15000
-REPLY_VIDEO_MAX_AGE_MINUTES=45
+
 REPLY_VIDEO_FRAME_ANALYSIS=true
 REPLY_VIDEO_FRAME_COUNT=2
-TELEGRAM_REPLY_VIDEO_MINUTES=5
 REPLY_LEARNING_ENABLED=true
-REPLY_LEARNING_PATH=data/reply_learning.json
 REPLY_TRACKING_POLL_MINUTES=5
-CREATOR_TIMEZONE=Asia/Ho_Chi_Minh
-CREATOR_NICHE=gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products
-CREATOR_VOICE=witty, practical, dry, slightly contrarian, with a sharp creator POV
-TARGET_AUDIENCE=Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools
+REPLY_DAILY_DIGEST_HOUR=22
 ```
 
-## Chrome Extension
+Prefer `/importcookie`, `/replylangs`, `/replygoal`, `/replycap`, `/replybatch`,
+`/replyevery`, and `/videoevery` for settings supported from Telegram. Those commands
+update the running bot immediately and persist supported values to `.env`.
 
-Use this when you have Gemini web access but no API keys.
+Do not increase the bridge timeout simply to hide a stuck provider tab. Extension
+`0.8.4` should fail and recycle a stalled tab earlier.
 
-1. Open Chrome.
-2. Log in to `https://gemini.google.com`.
-3. Open `chrome://extensions`.
-4. Enable **Developer mode**.
-5. Click **Load unpacked**.
-6. Select the repo folder `browser_extension`.
-7. Open the extension popup and set:
-   - Bridge URL: `http://127.0.0.1:8765`
-   - Token: same value as `EXTENSION_BRIDGE_TOKEN`
-   - Auto Run: ON if you want jobs to run automatically
+## Media downloads
 
-When Auto Run is OFF, click **Run next job** after sending a Telegram command. When Auto Run is ON, low-resource mode checks pending jobs about every 60 seconds while Chrome is open. The popup can disable low-resource mode when faster 30-second pickup matters more than VPS load. A two-minute watchdog recreates missing alarms and the open Gemini tab sends a lightweight recovery heartbeat every 60 seconds.
+`/download` uses `yt-dlp` for supported video platforms and `gallery-dl` as a bounded
+image/carousel fallback. Common public TikTok, Douyin, Xiaohongshu/RedNote,
+Facebook/Instagram Reel, and X URLs may work, subject to platform changes,
+authentication, regional restrictions, and anti-bot checks.
 
-Gemini prompts are compacted at the bot layer and submitted once. Each job starts a clean conversation in the same warm tab. After 10 completed Gemini jobs, the extension opens a fresh Gemini tab, waits for its composer, and then closes the old Gemini tabs to release their DOM/JavaScript heap. Provider timeouts and DOM failures trigger the same recycle immediately. Response DOM checks use a four-second idle interval and shorten only after output appears; volatile status and the recycle counter stay in memory-backed session storage.
+Optional downloader settings:
 
-### Normal Chrome on a low-spec VPS
+```env
+DOWNLOAD_MAX_FILE_MB=45
+DOWNLOAD_TIMEOUT_SECONDS=180
+DOWNLOAD_COOKIES_FILE=data/download-cookies.txt
+DOWNLOAD_COOKIES_FROM_BROWSER=chrome
+DOWNLOAD_BROWSER_PROFILE=Default
+```
 
-The project supports your normal signed-in Chrome directly and contains no alternate browser-profile launcher, CPU-affinity tool, or browser watchdog. Run Chrome under the same Windows account as the bot. Keep **Low-resource mode** ON and **Poll seconds** at 60 in the popup.
+Browser-cookie extraction requires Chrome and the bot to run under the same Windows
+user. Cookies preserve an authorized session; they do not bypass CAPTCHA or restore
+a revoked login. Only download media you are authorized to save.
 
-The extension tracks one managed Gemini tab in session storage. If exactly one Gemini tab already exists, it reuses it. If several Gemini tabs are open, it creates one dedicated automation tab and leaves the others untouched. Heartbeat injection, conversation reset, and ten-job recycling apply only to that managed tab; the extension never bulk-closes user-owned Gemini tabs.
+## Updating and packaging
 
-For a small VPS, close unrelated tabs and Chrome windows, remove unused extensions, and keep only one normal Chrome process/profile running for this bot. Increase the Windows page file if the machine has 2 GB RAM. `DOWNLOAD_COOKIES_FROM_BROWSER=chrome` reads the normal Chrome profile; set `DOWNLOAD_BROWSER_PROFILE=Default` or the profile name shown by `chrome://version`. Chrome and the bot must run under the same Windows user.
+To update an existing VPS installation:
 
-### Scheduled Telegram approvals
+1. Stop the bot.
+2. Extract the new ZIP over the project directory.
+3. Preserve the existing `.env` and `data/` directory.
+4. Reload the Chrome extension if its files changed.
+5. Start the bot; dependency synchronization runs automatically.
 
-The extension can schedule content generation while keeping the final X action manual:
-
-1. Set `TELEGRAM_APPROVAL_CHAT_ID` in `.env` to the private Telegram chat that should receive approvals, then restart the bot.
-2. Reload `browser_extension/` from `chrome://extensions` after updating the project.
-3. Open the extension popup and configure **Scheduled approvals**:
-   - **Creator timezone**: IANA timezone such as `Asia/Ho_Chi_Minh`; schedules no longer depend on the VPS locale.
-   - **Active from / Active until**: the daily activity window in the creator timezone. Overnight windows such as `22:00` to `02:00` are supported.
-   - **/replytargets scan interval**: how often Chrome triggers a scan; the minimum is 5 and the default is 15 minutes.
-   - **/replytargets maximum post age**: independent lookback; the default is 360 minutes.
-   - **/replytargets languages**: comma-separated X language codes; the default is `en,ja`.
-   - **/replytargets query**: optional; leave blank for automatic topic selection.
-   - **/replyvideo scan interval**: independent viral-video scan; minimum 3 and default 5 minutes.
-   - **/replyvideo topic**: optional; blank scans global/English/Japanese/Vietnamese video lanes.
-   - **/replyvideo active windows**: defaults to `08:00-11:00,12:00-14:00,19:00-22:00` in the creator timezone.
-4. Turn **Automation** ON and keep Chrome, the Telegram bot, and the Gemini/X login sessions running.
-
-You can also change schedules from the private Telegram approval chat with `/replyevery 30` and `/videoevery 5`. Set per-run output with `/replybatch targets 3` and `/replybatch video 3`; `/replybatch show` displays both current values. Batch sizes are limited to 2-5, saved to `.env`, and applied immediately to manual and scheduled runs without restarting the bot. Every schedule command writes a schedule revision, even when the numeric value did not change. Low-resource mode picks it up within about 60 seconds and resets the next run from that moment. The popup shows both **Last trigger** and **Next run**.
-
-For both manual commands and scheduled runs, Telegram sends approval cards. Reply cards add **Alternative** and **Shorter**. Only the Telegram user who requested a manual draft can approve it.
-
-`/replytargets` and `/replyvideo` cards show the target link, a concise Vietnamese summary of the source, a Vietnamese translation of the proposed reply, and the original copy-ready reply in the source language. Views, reply counts, opportunity score, strategy, evidence mode, and why-now reasoning remain available internally for ranking and learning but are hidden from the approval card. Auto discovery uses the authenticated account's current X trends plus localized broad queries. When Japanese is enabled, one protected discovery lane covers hot Japanese conversations in economics, current affairs, sports, anime/games, and technology/AI, so personalized trends cannot consume the whole six-query budget. `balanced` and `qualified` modes also add a creator-niche lane; `reach` prioritizes distribution; `relationship` favors authors who have responded before. The trends timeline can reflect the logged-in account's locale/personalization and is not claimed to be a global chart. Search applies language filters but no country filter because most X posts do not carry reliable place metadata.
-
-Up to six topic/language queries run as serialized search lanes so a small cookie pool is not exhausted by concurrent `SearchTimeline` leases. Every query still searches both `Top` and `Latest`, sequentially, with at most eight results from each product. `Top` supplies confirmed distribution while `Latest` supplies earlier breakout candidates. `-is:reply -is:retweet` is added at search time, and parsed results are checked again; original and quote posts remain eligible. An explicit `/replytargets <topic>` stays inside that topic but expands it across configured languages unless the user supplies a `lang:` operator.
-
-The first time a normal candidate is seen, it is persisted in `data/reply_watchlist.json` rather than immediately spending a Gemini job. Each later auto scan actively re-fetches up to six persisted `watching` or undrafted `ready` tweets by ID, so confirmation no longer depends on a tweet appearing in Top/Latest search again. Watch rows expire when they exceed the configured reply-target lookback. An exceptional first observation can enter reply-now immediately. Japanese candidates that already pass discovery quality checks use slightly earlier first-observation thresholds, helping the bot enter fast-moving local conversations before the thread fills up. Metric snapshots in `data/reply_target_metrics.json` use view, weighted-engagement, direct-reply, and reply/quote deltas plus acceleration. This avoids treating a fixed 15-minute window as a final viral verdict and still catches two-to-six-hour breakouts.
-
-Viral confidence and reply opportunity are separate. Reply activity remains a capped viral signal, but crowded threads are penalized. The bot samples visible replies for top-reply likes and whether the root author participates, then combines that context with recent views per reply, total reply load, new-reply pressure, audience fit, and prior author-response rate. A dominant top reply lowers opportunity because a new reply is less likely to surface.
-
-This design favors a post that is still gaining distribution while its root reply section remains open, including two-to-six-hour late breakouts. The 500-view minimum remains a hard floor whenever X exposes view count. The configured 50,000-follower value is a small capped reach bonus rather than a hard gate. Replies match the source language and must first add one source-grounded observation, implication, comparison, caveat, or reason. A precise question may follow, but question-only replies are automatically rewritten once and rejected if they still fail. Japanese replies prefer a concrete first sentence plus an optional precise question, rather than polite-only endings such as `気になります` or `どう思いますか`. Generic agreement, recap, unsupported context, generic engagement questions, and forced sarcasm are rejected.
-
-Reply-target generation uses a minimum batch size of two and requests the configured `REPLY_TARGET_BATCH_SIZE` (default 3, range 2-5) when enough candidates and daily capacity are available. When fewer than two candidates are fully confirmed, the bot first fills from the strongest first-observation candidates. If the standard pool still contains fewer than two posts, it re-ranks the already fetched pool with relaxed momentum requirements, then a volume fallback view floor of the configured minimum divided by four (normally no lower than 100 views), and finally a minimum-batch tier that accepts any still-fresh root post with a visible view signal. Freshness, original-post-only, active-approval, language, and deduplication checks remain active. Gemini must return exactly one draft for every candidate supplied in the selected batch, up to five. If X truly returns fewer than two real eligible posts or the remaining daily capacity contains only one slot, the bot waits instead of inventing a target or spending a Gemini job on a one-reply batch. Search-lane failures are reported as X cookie/rate-limit/network failures rather than as an empty market, and Telegram status identifies the fallback tier used.
-
-`/replyvideo` is a separate fast lane. Each scan searches `filter:videos` in global, English, Japanese, and Vietnamese lanes using `Top` and `Latest`. It requests `REPLY_VIDEO_BATCH_SIZE` candidates (default 3, range 2-5), while preserving a global-first mix with Vietnamese candidates when available. Strict selection uses `REPLY_VIDEO_MAX_AGE_MINUTES=45`, `REPLY_VIDEO_MIN_VIEWS=15000`, and at least 300 lifetime/recent views per minute. If fewer than two distinct videos remain, a warm tier keeps the 45-minute window with a lower view floor; a final fill tier can expand to 90 minutes and 500 views. It never invents a second target. Reply competition receives 34% of the opportunity score, so a slightly smaller video with five replies can outrank a larger video with hundreds of replies.
-
-Before generation, the bot classifies evidence as `grounded_text`, `caption_only`, or `visual_required`. Emoji-only captions, generic phrases such as `watch this`, X attachment boilerplate, URLs, and very short/repetitive descriptions do not count as reliable context and are removed from the model context. `caption_only` replies are forbidden from claiming visual details. A `visual_required` candidate is downloaded with the existing authenticated yt-dlp path, sampled at up to four positions around 8%, 34%, 66%, and 92% of its duration using the bundled `imageio-ffmpeg` binary, and uploaded to Gemini before the prompt. The five-image job limit reserves enough capacity to analyze at least two captionless candidates when necessary. If download, extraction, or Gemini attachment confirmation fails, that candidate is skipped rather than guessed.
-
-Representative frames improve grounding but are not full temporal or audio analysis. The prompt maps exact frame filenames to each candidate and allows only details directly visible in those frames. It forbids inferences about motion between frames, timing, audio, spoken lines, identity, location, intent, or final outcome unless caption/media text explicitly supports them. Low-resource mode defaults to two 720px frames per visual candidate, with a 600 KB limit per frame; the hard job ceiling remains five images and 4 MB. Set `REPLY_VIDEO_FRAME_COUNT=3..4` only when the VPS has enough memory, or use `REPLY_VIDEO_FRAME_ANALYSIS=false` to disable downloads entirely.
-
-### Automatic reply tracking and learning
-
-Post and reply tracking are enabled by default. Set the real posting account once with
-`/replylearn username @yourname` or `X_OWNER_USERNAME=yourname`. This value is
-not `X_ACCOUNT_NAME`: the latter is only the local twscrape cookie-account label.
-After an approval is opened and you manually submit on X, the bot scans that
-account's public timeline through twscrape and matches the new item by parent,
-posting window, and text similarity. You do not send the published URL back.
-
-The tracker captures public metrics at approximately 15 minutes, 1 hour, 6 hours,
-and 24 hours. Author-response detection is separate: while a reply is being tracked,
-the bot checks direct responses every five minutes in the first hour, every 15 minutes
-through hour six, and hourly afterward, even when a metrics checkpoint is not due.
-Reply scores combine:
-
-- reply views relative to new root-post views;
-- reply engagement per view, with replies, reposts, and quotes weighted above likes;
-- whether the original root author directly replied.
-
-When a root author directly responds, the bot immediately creates a manual-approval
-follow-up card showing the author's response, its URL, and a suggested draft. Use
-**Continue conversation** to approve the follow-up or **Stop here** to end that
-exchange. Stop decisions are persisted and reduce that author's relationship score.
-Original-post scores use public views relative
-to the account follower count and engagement per view. `/replyreport` also shows
-the follower-count change during tracked post windows as an account-level proxy;
-it does not attribute a follower to one specific post.
-
-The scores are strategy-comparison heuristics, not X impression guarantees.
-Use `/replyreport 7d` or `/replyreport 30d` to inspect results. Use
-`/replylearn status`, `on`, `off`, or `rollback` to control it.
-
-The bot rotates among five fixed strategies: a specific observation, practical
-implication, respectful counterpoint, author-specific question, and natural humor.
-Relationship strength is stored per root author and combines actual response rate,
-conversation count, response latency, recency, and explicit Stop decisions. It is
-used directly by `relationship` mode and as a smaller signal in `balanced` mode.
-Approve/reject decisions provide an early preference signal; posted outcomes are
-weighted by how closely the published text matches the draft. Automatic adjustment
-starts after either 20 feedback events or 60 completed 24-hour samples. Later
-revisions require new samples and are limited to once per seven days; every
-strategy weight can move by at most 10% relative to its prior value. Low-sample
-results are shrunk toward the global average. Weight versions are stored in
-`data/reply_learning.json`, and rollback restores the previous version. The bot
-changes only bounded strategy weights. It never rewrites source code or its base
-prompt.
-
-This workflow does not use the official X API and does not import X Analytics CSV
-files. It relies on twscrape-visible public data, the account's public timeline,
-Telegram approval/edit feedback, and bounded local learning. Cookies are session
-persistence, not a CAPTCHA bypass; refresh or replace an account when `/setupcheck`
-reports pool errors.
-
-The project requires `twscrape>=0.19.2`. That release includes current X client-transaction-ID and GraphQL compatibility fixes; older `0.19.1` builds can fail before search and misleadingly produce an empty candidate pool.
-
-If Gemini returns an empty target array or changes common JSON field names, `/replytargets` normalizes the response and automatically queues one repair job using the same candidate URLs. Scheduled automation remains active while that repair job is pending, so the extension picks it up on the next automation check. If both attempts fail, the Telegram error includes short response previews for diagnosis.
-
-Mobile approval is deliberately two-step because one Telegram button cannot both record a callback and open another app:
-
-1. Tap **Approve on mobile**. The bot records the approval and removes the decision buttons.
-2. Tap **Open X on phone**. The official mobile-friendly X Web Intent opens the matching reply or post composer and pre-populates the draft when the URL is short enough. For a long post, Telegram rejects a URL containing the full encoded draft; the bot instead opens the X composer safely and keeps the draft above for you to copy and paste.
-
-Once a reply target is pending, approved, or confirmed published, the bot skips the same target to avoid duplicate approval cards. This history is persisted in `data/automation_approvals.json`, so deduplication survives bot restarts. `CREATOR_DAILY_REPLY_CAP` limits daily reply cards in `CREATOR_TIMEZONE`; the default is 40 to support a 30-50 reply/day workflow, but it is a ceiling rather than a guaranteed quota and every final X submission remains manual. Scheduled status messages distinguish an exhausted daily cap from candidates that still need confirmation and show both current-scan and persisted-watching counts.
-
-- **Open X on phone** uses the official mobile-friendly X Web Intent.
-- **Copy draft** uses Telegram's native clipboard button for drafts up to 256 characters. For longer drafts that cannot safely fit in an encoded X URL, copy the message text and paste it into the composer opened by **Open X on phone**.
-
-Review or edit the filled draft in X, then submit it yourself. A pending approval expires after 30 minutes. `Auto Run` still controls whether Gemini jobs from manually entered Telegram commands run automatically; when it is OFF, use **Run next job** before approving the returned draft.
-
-The first scheduled run may wait for the configured interval. While a scheduled workflow is active, automation processes one Gemini job per check, which keeps CPU use steadier on small VPS plans. When no scheduled workflow is active, it does not poll `/jobs/next`; manual commands still obey the separate `Auto Run` switch.
-
-If Gemini asks for human verification, solve it manually in Chrome and run the job again. This bridge depends on the web UI, so reload the extension after changing files in `browser_extension/`.
-
-## Run
-
-Windows:
+Create a clean deployment ZIP with:
 
 ```powershell
-.\.venv\Scripts\python.exe -m src.main
+.\scripts\windows\package.ps1
 ```
 
-Ubuntu:
+The package excludes `.env`, cookies, `data/`, logs, tests, virtual environments, and
+Git metadata.
 
-```bash
-source .venv/bin/activate
-python -m src.main
-```
-
-Bridge health check:
+Run validation locally with:
 
 ```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:8765/health
-```
-
-or:
-
-```bash
-curl http://127.0.0.1:8765/health
-```
-
-Expected provider: `extension_bridge`.
-
-## X Cookie Search
-
-To enable `/replytargets`, `/replyvideo`, and `/reply` live X context:
-
-1. Open `x.com` in a logged-in browser.
-2. Open DevTools > Application > Cookies.
-3. Copy `auth_token` and `ct0`.
-4. Send this to the Telegram bot:
-
-```text
-/importcookie auth_token=YOUR_AUTH_TOKEN; ct0=YOUR_CT0
-```
-
-For multiple accounts:
-
-```text
-/importcookie account2 auth_token=ACCOUNT_2_AUTH_TOKEN; ct0=ACCOUNT_2_CT0
-/importcookie account3 auth_token=ACCOUNT_3_AUTH_TOKEN; ct0=ACCOUNT_3_CT0
-/xaccounts
-```
-
-If an account starts returning X/twscrape errors, the bot sends a Telegram warning
-with recovery commands. Remove a bad account with:
-
-```text
-/xremove account2
-```
-
-The default cookie is written to `.env`. Named accounts are stored in `data/twscrape_accounts.db`. Keep `.env` and `data/` private.
-
-## Ubuntu Service
-
-Example systemd unit:
-
-```ini
-[Unit]
-Description=X Content Telegram Bot
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/x-content-bot
-EnvironmentFile=/opt/x-content-bot/.env
-ExecStart=/opt/x-content-bot/.venv/bin/python -m src.main
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Install:
-
-```bash
-sudo nano /etc/systemd/system/x-content-bot.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now x-content-bot
-sudo systemctl status x-content-bot --no-pager
-```
-
-Logs:
-
-```bash
-sudo journalctl -u x-content-bot -n 100 --no-pager
+.\.venv\Scripts\python.exe -m pytest -q
+node --check browser_extension\background.js
 ```
 
 ## Troubleshooting
 
-- `Missing required environment variable: TELEGRAM_BOT_TOKEN`: edit `.env` in the project root.
-- `Could not connect to the local Chrome extension bridge`: start the bot, open Chrome, confirm the extension Bridge URL/token match `.env`.
-- `Extension bridge timed out`: verify extension `0.8.2` or newer is loaded and Automation or Auto Run is ON. The error distinguishes a job Chrome never claimed, a claimed job whose heartbeat stopped, and a live Gemini response that exceeded the bounded extended deadline. Low-resource recovery can take up to about 60 seconds; **Run next job** remains available for an immediate check.
+- **No reply-ready posts:** run `/setupcheck` and `/xaccounts`; refresh X cookies if
+  the pool reports authentication, challenge, or rate-limit errors.
+- **Chrome never claimed the job:** reload extension `0.8.4`, verify the bridge URL
+  and token, and enable Auto Run or click **Run next job**.
+- **Heartbeat stopped:** keep Chrome open. Version `0.8.4` can recover an interrupted
+  MV3 worker or tab operation, but not a terminated Chrome process.
+- **Gemini made no readable progress:** inspect the managed Gemini tab for login,
+  verification, quota, or usage-limit messages.
+- **Video frame upload failed:** confirm Gemini is logged in and reload the extension;
+  set `REPLY_VIDEO_FRAME_ANALYSIS=false` if the VPS cannot handle frame analysis.
+- **Dependency import traceback:** run `setup.ps1` again if `.venv` is missing or
+  damaged. Normal updates only require `start.ps1`.
+- **Telegram `Conflict: terminated by other getUpdates request`:** stop duplicate bot
+  processes and keep exactly one polling instance.
+- **Old menu remains visible:** restart the updated bot, send `/menu` once, then select
+  a command; the one-time keyboard will collapse.
+
+## Data and security
+
+- `.env`, X cookies, download cookies, `data/`, and Chrome profiles are private.
+- Never commit or share live Telegram tokens, `auth_token`, or `ct0` values.
+- The deployment ZIP intentionally excludes runtime credentials and history.
+- Public metrics from twscrape are useful signals, not guaranteed X Analytics data.
+- X and Gemini web interfaces can change; keep the extension and dependencies current.
 
 ## BUY ME A COFFEE
 
-If this project saves you time or helps grow your X account, consider supporting
-its continued development with a coffee.
+If this project saves time or helps grow your X account, you can support continued
+development here:
 
 [☕ Buy me a coffee](https://buymeacoffee.com/sonnta)

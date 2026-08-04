@@ -299,3 +299,67 @@ def test_author_response_builds_relationship_strength_and_stop_signal(tmp_path) 
     )
     assert store.records("tracking")[0]["conversation_stopped"] is True
     assert strength_after_stop < strength_before_stop
+
+
+def test_style_memory_and_multidimensional_report_use_real_posted_replies(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+    for index in range(5):
+        approval = _approval(
+            f"style-{index}",
+            target_id=500 + index,
+            approved_at=now - timedelta(days=1),
+        )
+        approval.text = f"Specific draft {index}"
+        approval.metadata.update(
+            {
+                "language": "ja" if index < 3 else "en",
+                "source_type": "replyvideo" if index < 3 else "replytargets",
+                "creator_timezone": "Asia/Ho_Chi_Minh",
+            }
+        )
+        store.register_approval(approval)
+        posted = _result(
+            800 + index,
+            target_id=500 + index,
+            text=f"Real posted reply {index}",
+            created_at=now - timedelta(hours=20 - index),
+            views=25_000 if index < 3 else 1_000,
+            likes=20,
+        )
+        posted = XSearchResult(**{**posted.__dict__, "language": approval.metadata["language"]})
+        store.mark_discovered(approval.id, posted)
+        store.add_snapshot(
+            approval.id,
+            checkpoint_minutes=1440,
+            reply=posted,
+            root=_result(500 + index, views=100_000, username="source"),
+            captured_at=now,
+        )
+
+    examples = store.style_examples(
+        language="ja",
+        source_type="replyvideo",
+        limit=2,
+    )
+    report = store.report(now=now + timedelta(minutes=1))
+
+    assert len(examples) == 2
+    assert all(text.startswith("Real posted reply") for text in examples)
+    assert report["median_views"] > 0
+    assert report["over_20k"] == 3
+    assert report["by_language"]["ja"]["count"] == 3
+    assert report["by_source"]["replyvideo"]["count"] == 3
+    assert report["by_hour_local"]
+    assert store.performance_adjustment(
+        language="ja",
+        source_type="replyvideo",
+    ) > 1.0
+
+
+def test_daily_digest_marker_persists(tmp_path) -> None:
+    path = tmp_path / "learning.json"
+    store = ReplyLearningStore(path)
+    store.mark_digest_sent("2026-08-03")
+
+    assert ReplyLearningStore(path).last_digest_date == "2026-08-03"

@@ -23,9 +23,14 @@ def test_settings_defaults() -> None:
     assert settings.reply_tracking_poll_minutes == 5
     assert settings.reply_watch_path == "data/reply_watchlist.json"
     assert settings.reply_target_mode == "balanced"
-    assert settings.creator_daily_reply_cap == 40
+    assert settings.creator_goal == "qualify"
+    assert settings.creator_daily_reply_cap == 500
     assert settings.reply_target_batch_size == 3
     assert settings.reply_video_batch_size == 3
+    assert settings.reply_session_minutes == 20
+    assert settings.reply_author_daily_cap == 5
+    assert settings.stale_mobile_approval_hours == 6
+    assert settings.reply_daily_digest_hour == 22
     assert settings.creator_timezone == "Asia/Ho_Chi_Minh"
     assert "gold markets" in settings.creator_niche
     assert "ChatGPT" in settings.creator_niche

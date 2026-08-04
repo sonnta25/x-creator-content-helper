@@ -108,6 +108,7 @@ class ContentService:
         strategy_by_url: dict[str, str] | None = None,
         video_mode: bool = False,
         visual_attachments: list[ImageAttachment] | None = None,
+        style_examples: list[str] | None = None,
     ) -> list[ReplyTargetDraft]:
         candidate_urls = _extract_reply_target_urls(x_context)
         required_targets = max(1, min(5, len(candidate_urls)))
@@ -123,8 +124,10 @@ class ContentService:
                 )
             )
         video_instruction = (
-            "These are viral-video reply targets. Optimize for a short reply that is "
-            "immediately legible below a fast-moving video: lead with a crisp reaction, "
+            "Some or all supplied candidates are viral-video reply targets. Apply the "
+            "following evidence rules only to candidates whose context marks them as video. "
+            "For those candidates, optimize for a short reply that is immediately legible "
+            "below a fast-moving video: lead with a crisp reaction, "
             "specific observation, surprising implication, or compact joke with a real point. "
             "Caption, X-provided media description, metrics, and sometimes representative "
             "frame attachments may be present. Use an attached frame only for the candidate "
@@ -138,6 +141,16 @@ class ContentService:
             if video_mode
             else ""
         )
+        style_memory = ""
+        if style_examples:
+            style_memory = (
+                "Style memory from this account's stronger real posted replies follows. "
+                "Learn only their brevity, specificity, rhythm, and confidence. Never copy "
+                "their wording, factual claims, names, or topic:\n"
+                + "\n".join(
+                    f"- {example.strip()}" for example in style_examples[:3] if example.strip()
+                )
+            )
         prompt = _reply_engine_prompt(
             self.settings,
             task=(
@@ -156,6 +169,7 @@ class ContentService:
                 "assumption, or tradeoff the "
                 "original author can actually answer; never append a generic engagement hook. "
                 f"{video_instruction}"
+                f"{style_memory}\n"
                 f"Return exactly {required_targets} distinct targets from the supplied candidates. "
                 f"For this batch, use this reply strategy when no per-URL strategy is assigned: "
                 f"{strategy_instruction}\n{allocation}"
@@ -168,17 +182,28 @@ class ContentService:
             prompt,
             visual_attachments or [],
         )
+        first_targets: list[ReplyTargetDraft] = []
         try:
-            targets = _parse_reply_targets(raw, allowed_urls=candidate_urls)
-            _validate_value_bearing_targets(targets)
-            _validate_reply_target_count(targets, required_targets)
-            return targets
+            first_targets = _parse_reply_targets(raw, allowed_urls=candidate_urls)
+            _validate_value_bearing_targets(first_targets)
+            _validate_reply_target_count(first_targets, required_targets)
+            return first_targets
         except RuntimeError as first_error:
+            safe_first = _merge_value_bearing_reply_targets(
+                candidate_urls,
+                primary=first_targets,
+                repaired=[],
+            )
+            safe_first_urls = {target.url for target in safe_first}
+            unresolved_urls = [
+                url for url in candidate_urls if url not in safe_first_urls
+            ]
             repair_prompt = _reply_targets_repair_prompt(
                 query=query,
                 x_context=x_context,
                 failed_output=raw,
-                required_targets=required_targets,
+                required_targets=len(unresolved_urls),
+                required_urls=unresolved_urls,
             )
             if video_mode:
                 repair_prompt += (
@@ -191,21 +216,91 @@ class ContentService:
                 repair_prompt,
                 visual_attachments or [],
             )
+            repaired_targets: list[ReplyTargetDraft] = []
             try:
-                targets = _parse_reply_targets(repaired, allowed_urls=candidate_urls)
-                _validate_value_bearing_targets(targets)
-                _validate_reply_target_count(targets, required_targets)
-                return targets
+                repaired_targets = _parse_reply_targets(
+                    repaired,
+                    allowed_urls=unresolved_urls,
+                )
+                _validate_value_bearing_targets(repaired_targets)
+                _validate_reply_target_count(
+                    repaired_targets,
+                    len(unresolved_urls),
+                )
+                combined = _merge_value_bearing_reply_targets(
+                    candidate_urls,
+                    primary=safe_first,
+                    repaired=repaired_targets,
+                )
+                _validate_reply_target_count(combined, required_targets)
+                return combined
             except RuntimeError as repair_error:
+                salvaged = _merge_value_bearing_reply_targets(
+                    candidate_urls,
+                    primary=safe_first,
+                    repaired=repaired_targets,
+                )
+                minimum_safe_targets = 1 if required_targets == 1 else 2
+                if len(salvaged) >= minimum_safe_targets:
+                    return salvaged[:required_targets]
+                salvaged_urls = {target.url for target in salvaged}
+                rescue_urls = [
+                    url
+                    for url in candidate_urls
+                    if url not in salvaged_urls
+                ][: minimum_safe_targets - len(salvaged)]
+                rescue_prompt = _reply_targets_repair_prompt(
+                    query=query,
+                    x_context=x_context,
+                    failed_output=repaired,
+                    required_targets=len(rescue_urls),
+                    required_urls=rescue_urls,
+                )
+                if video_mode:
+                    rescue_prompt += (
+                        "\n\nVideo evidence boundary: any attached images are unordered "
+                        "representative frames, not the full motion/audio. Match frame filenames "
+                        "to the candidate context. Do not infer motion, timing, audio, spoken lines, "
+                        "identity, location, intent, or outcome beyond explicit supplied evidence."
+                    )
+                rescued = await self._generate_text_with_images(
+                    rescue_prompt,
+                    visual_attachments or [],
+                )
+                rescued_targets: list[ReplyTargetDraft] = []
+                try:
+                    rescued_targets = _parse_reply_targets(
+                        rescued,
+                        allowed_urls=rescue_urls,
+                    )
+                    _validate_value_bearing_targets(rescued_targets)
+                except RuntimeError as rescue_error:
+                    final_error = rescue_error
+                else:
+                    salvaged = _merge_value_bearing_reply_targets(
+                        candidate_urls,
+                        primary=salvaged,
+                        repaired=rescued_targets,
+                    )
+                    if len(salvaged) >= minimum_safe_targets:
+                        return salvaged[:required_targets]
+                    final_error = RuntimeError(
+                        "Minimum-batch rescue returned too few distinct safe targets."
+                    )
                 first_preview = _compact_error_text(raw, 220) if raw.strip() else "<empty>"
                 repair_preview = (
                     _compact_error_text(repaired, 220) if repaired.strip() else "<empty>"
                 )
+                rescue_preview = (
+                    _compact_error_text(rescued, 220) if rescued.strip() else "<empty>"
+                )
                 raise RuntimeError(
-                    "AI returned no usable reply targets after one automatic repair. "
+                    "AI returned too few usable reply targets after a targeted repair "
+                    "and minimum-batch rescue. "
                     f"First response: {first_preview}. Repair response: {repair_preview}. "
-                    f"Parser details: {first_error}; {repair_error}"
-                ) from repair_error
+                    f"Rescue response: {rescue_preview}. Parser details: "
+                    f"{first_error}; {repair_error}; {final_error}"
+                ) from final_error
 
     async def _generate_text(self, prompt: str) -> str:
         raise NotImplementedError("ContentService requires a concrete text provider.")
@@ -345,12 +440,21 @@ def _reply_targets_repair_prompt(
     x_context: str,
     failed_output: str,
     required_targets: int = 1,
+    required_urls: list[str] | None = None,
 ) -> str:
+    exact_url_rule = ""
+    if required_urls:
+        exact_url_rule = (
+            "\nThe only permitted target URLs for this repair are:\n"
+            + "\n".join(f"- {url}" for url in required_urls)
+            + "\nReturn each listed URL exactly once. Do not return or rewrite any other URL."
+        )
     return f"""
 You are a Twitter/X Reply Engine repairing an unusable reply-target response.
 
 Return JSON only with one top-level `targets` array. Return exactly {required_targets}
 distinct targets.
+{exact_url_rule}
 Each object must contain: url, target, reply, source_summary_vi, reply_translation_vi.
 Copy each url exactly from Candidate X posts. Never invent or omit a URL.
 Write one short, natural reply for each selected candidate. Do not return an empty array.
@@ -403,10 +507,40 @@ def _single_reply_value_repair_prompt(
 
 
 def _validate_value_bearing_targets(targets: list[ReplyTargetDraft]) -> None:
-    if any(_reply_is_question_only(target.reply) for target in targets):
+    invalid_urls = [
+        target.url
+        for target in targets
+        if _reply_is_question_only(target.reply)
+    ]
+    if invalid_urls:
         raise RuntimeError(
-            "AI response contained a question-only reply without a value-bearing statement."
+            "AI response contained a question-only reply without a value-bearing statement. "
+            f"Invalid target URLs: {', '.join(invalid_urls)}."
         )
+
+
+def _merge_value_bearing_reply_targets(
+    candidate_urls: list[str],
+    *,
+    primary: list[ReplyTargetDraft],
+    repaired: list[ReplyTargetDraft],
+) -> list[ReplyTargetDraft]:
+    """Keep the best safe draft for each URL across the original and repair attempts."""
+    usable_by_url: dict[str, ReplyTargetDraft] = {}
+    for attempt in (repaired, primary):
+        for target in attempt:
+            if (
+                not target.url
+                or target.url in usable_by_url
+                or _reply_is_question_only(target.reply)
+            ):
+                continue
+            usable_by_url[target.url] = target
+    return [
+        usable_by_url[url]
+        for url in candidate_urls
+        if url in usable_by_url
+    ]
 
 
 def _validate_reply_target_count(
@@ -536,14 +670,18 @@ def _parse_reply_targets(
         raise RuntimeError("AI response missed required targets list.")
 
     targets: list[ReplyTargetDraft] = []
-    allowed = {
-        _clean_reply_target_url(url)
-        for url in (allowed_urls or [])
-        if _clean_reply_target_url(url)
-    }
+    allowed_ordered = list(
+        dict.fromkeys(
+            _clean_reply_target_url(url)
+            for url in (allowed_urls or [])
+            if _clean_reply_target_url(url)
+        )
+    )
+    allowed = set(allowed_ordered)
     for item in raw_targets[:5]:
         if not isinstance(item, dict):
             continue
+        target_label = str(item.get("target", "")).strip()
         url = _clean_reply_target_url(
             _first_text_value(
                 item,
@@ -555,6 +693,11 @@ def _parse_reply_targets(
                 "link",
             )
         )
+        if not url and allowed_ordered:
+            url = _recover_allowed_url_from_target_label(
+                target_label,
+                allowed_ordered,
+            )
         reply = _limit_x_text(
             _first_text_value(
                 item,
@@ -575,7 +718,7 @@ def _parse_reply_targets(
         targets.append(
             ReplyTargetDraft(
                 url=url,
-                target=str(item.get("target", "")).strip(),
+                target=target_label,
                 reply=reply,
                 source_summary_vi=_first_text_value(
                     item,
@@ -685,6 +828,30 @@ def _clean_reply_target_url(value: str) -> str:
         return markdown.group(2).strip()
     match = re.search(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/[^\s)\]]+", text, re.I)
     return match.group(0).rstrip(".,;:") if match else text
+
+
+def _recover_allowed_url_from_target_label(
+    target_label: str,
+    allowed_urls: list[str],
+) -> str:
+    """Recover a blank model URL only when @author uniquely matches an allowed URL."""
+    handles = {
+        handle.casefold()
+        for handle in re.findall(r"@([A-Za-z0-9_]{1,15})", str(target_label or ""))
+    }
+    if len(handles) != 1:
+        return ""
+    handle = next(iter(handles))
+    matches = []
+    for url in allowed_urls:
+        match = re.match(
+            r"https?://(?:www\.)?(?:x\.com|twitter\.com)/([^/?#]+)/status/\d+",
+            url,
+            flags=re.IGNORECASE,
+        )
+        if match and match.group(1).casefold() == handle:
+            matches.append(url)
+    return matches[0] if len(matches) == 1 else ""
 
 
 def _parse_single_reply(raw: str) -> str:

@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from src.content_service import (
     ContentService,
     _reply_engine_prompt,
@@ -416,7 +418,9 @@ def test_generate_reply_targets_repairs_batch_with_only_one_of_two_candidates() 
     )
 
     assert len(service.prompts) == 2
-    assert "exactly 2\ndistinct targets" in service.prompts[1]
+    assert "exactly 1\ndistinct targets" in service.prompts[1]
+    assert "- https://x.com/second/status/2" in service.prompts[1]
+    assert "Do not return or rewrite any other URL" in service.prompts[1]
     assert [target.url for target in targets] == [
         "https://x.com/first/status/1",
         "https://x.com/second/status/2",
@@ -483,6 +487,35 @@ def test_generate_reply_targets_includes_selected_learning_strategy() -> None:
     assert "lead with one concrete source-grounded observation" in service.last_prompt
 
 
+def test_generate_reply_targets_uses_style_memory_without_copy_instruction() -> None:
+    class StyleService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/89",'
+                '"target":"@source - launch","reply":"The rollout speed makes retention the useful signal.",'
+                '"source_summary_vi":"Bài viết nói về kế hoạch ra mắt.",'
+                '"reply_translation_vi":"Tốc độ triển khai khiến khả năng giữ chân trở thành tín hiệu hữu ích."}]}'
+            )
+
+    service = StyleService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "product launch",
+            "URL: https://x.com/source/status/89\nPost: We changed the rollout plan.",
+            style_examples=["Distribution is the constraint hiding in plain sight."],
+        )
+    )
+
+    assert "Style memory from this account's stronger real posted replies" in service.last_prompt
+    assert "Never copy their wording" in service.last_prompt
+    assert "Distribution is the constraint" in service.last_prompt
+
+
 def test_generate_reply_targets_repairs_question_only_reply() -> None:
     class RepairingService(ContentService):
         def __init__(self, settings: Settings) -> None:
@@ -514,6 +547,176 @@ def test_generate_reply_targets_repairs_question_only_reply() -> None:
     assert len(service.prompts) == 2
     assert "question-only reply is invalid" in service.prompts[1]
     assert targets[0].reply.startswith("The slower sequence")
+
+
+def test_generate_reply_targets_merges_safe_drafts_from_both_attempts() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.calls = 0
+
+        async def _generate_text(self, prompt: str) -> str:
+            del prompt
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    '{"targets":['
+                    '{"url":"https://x.com/first/status/1","target":"@first",'
+                    '"reply":"The revision from 3.9 to 4.3 is the detail worth watching."},'
+                    '{"url":"https://x.com/second/status/2","target":"@second",'
+                    '"reply":"Why did the timing change?"},'
+                    '{"url":"https://x.com/third/status/3","target":"@third",'
+                    '"reply":"The smaller reply load leaves the useful detail visible."}'
+                    ']}'
+                )
+            return (
+                '{"targets":['
+                '{"url":"https://x.com/first/status/1","target":"@first",'
+                '"reply":"Why did the estimate change?"},'
+                '{"url":"https://x.com/second/status/2","target":"@second",'
+                '"reply":"The later timing makes the second update more useful."},'
+                '{"url":"https://x.com/third/status/3","target":"@third",'
+                '"reply":"What changed after the first update?"}'
+                ']}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    context = "\n\n".join(
+        f"{index}. URL: https://x.com/{name}/status/{index}\nPost: Update {index}"
+        for index, name in enumerate(("first", "second", "third"), start=1)
+    )
+
+    targets = asyncio.run(service.generate_reply_targets("news", context))
+
+    assert service.calls == 2
+    assert [target.url for target in targets] == [
+        "https://x.com/first/status/1",
+        "https://x.com/second/status/2",
+        "https://x.com/third/status/3",
+    ]
+    assert targets[0].reply.startswith("The revision")
+    assert targets[1].reply.startswith("The later timing")
+    assert targets[2].reply.startswith("The smaller reply load")
+
+
+def test_generate_reply_targets_salvages_two_safe_drafts_after_repair() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.calls = 0
+
+        async def _generate_text(self, prompt: str) -> str:
+            del prompt
+            self.calls += 1
+            return (
+                '{"targets":['
+                '{"url":"https://x.com/first/status/1","target":"@first",'
+                '"reply":"The estimate change is the useful signal here."},'
+                '{"url":"https://x.com/second/status/2","target":"@second",'
+                '"reply":"The low reply count leaves room for the comparison."},'
+                '{"url":"https://x.com/third/status/3","target":"@third",'
+                '"reply":"Why did the timing change?"}'
+                ']}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    context = "\n\n".join(
+        f"{index}. URL: https://x.com/{name}/status/{index}\nPost: Update {index}"
+        for index, name in enumerate(("first", "second", "third"), start=1)
+    )
+
+    targets = asyncio.run(service.generate_reply_targets("news", context))
+
+    assert service.calls == 2
+    assert [target.url for target in targets] == [
+        "https://x.com/first/status/1",
+        "https://x.com/second/status/2",
+    ]
+
+
+def test_generate_reply_targets_runs_small_rescue_when_only_one_safe_draft_remains() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.calls = 0
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.calls += 1
+            if self.calls == 3:
+                assert "exactly 1\ndistinct targets" in prompt
+                assert "- https://x.com/second/status/2" in prompt
+                return (
+                    '{"targets":[{"url":"https://x.com/second/status/2",'
+                    '"target":"@second","reply":"The revised probability makes the market split the useful signal."}]}'
+                )
+            return (
+                '{"targets":['
+                '{"url":"https://x.com/first/status/1","target":"@first",'
+                '"reply":"The estimate change is the useful signal here."},'
+                '{"url":"https://x.com/second/status/2","target":"@second",'
+                '"reply":"Why did the probability change?"}'
+                ']}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "markets",
+            (
+                "1. URL: https://x.com/first/status/1\nPost: Estimate changed.\n\n"
+                "2. URL: https://x.com/second/status/2\nPost: Probability changed."
+            ),
+        )
+    )
+
+    assert service.calls == 3
+    assert [target.url for target in targets] == [
+        "https://x.com/first/status/1",
+        "https://x.com/second/status/2",
+    ]
+
+
+def test_question_only_error_identifies_the_invalid_target_url() -> None:
+    class InvalidService(ContentService):
+        async def _generate_text(self, prompt: str) -> str:
+            del prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/90",'
+                '"target":"@source","reply":"Why did the timing change?"}]}'
+            )
+
+    service = InvalidService(Settings(telegram_bot_token="123:ABC"))
+    with pytest.raises(RuntimeError, match=r"Invalid target URLs: .*status/90"):
+        asyncio.run(
+            service.generate_reply_targets(
+                "news",
+                "URL: https://x.com/source/status/90\nPost: Timing changed.",
+            )
+        )
+
+
+def test_parse_reply_targets_recovers_blank_url_from_unique_target_handle() -> None:
+    targets = _parse_reply_targets(
+        (
+            '{"targets":[{"url":"","target":"@EqAlarm - 緊急地震速報第4報",'
+            '"reply":"第1報から第4報への修正幅が備えを見直す具体的な手掛かりになります。"}]}'
+        ),
+        allowed_urls=[
+            "https://x.com/EqAlarm/status/2084506447011099087",
+            "https://x.com/other/status/2",
+        ],
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url == "https://x.com/EqAlarm/status/2084506447011099087"
+
+
+def test_parse_reply_targets_does_not_guess_blank_url_for_unknown_handle() -> None:
+    with pytest.raises(RuntimeError, match="did not contain usable reply targets"):
+        _parse_reply_targets(
+            '{"targets":[{"url":"","target":"@unknown","reply":"Useful detail."}]}',
+            allowed_urls=["https://x.com/EqAlarm/status/1"],
+        )
 
 
 def test_generate_reply_targets_assigns_strategy_per_candidate_url() -> None:

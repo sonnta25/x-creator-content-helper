@@ -205,7 +205,7 @@ def test_gemini_tab_wakes_the_extension_runtime_when_alarms_disappear() -> None:
     assert "content_scripts" not in manifest
     assert 'message.action === "runtime-heartbeat"' in background_js
     assert 'chrome.runtime.sendMessage({ action: "runtime-heartbeat" }' in heartbeat_js
-    assert "HEARTBEAT_INTERVAL_MS = 60000" in heartbeat_js
+    assert "HEARTBEAT_INTERVAL_MS = 20000" in heartbeat_js
     assert "ensureGeminiHeartbeatInjected()" in background_js
     assert 'files: ["gemini_heartbeat.js"]' in background_js
     assert "await injectGeminiHeartbeat(tab.id)" in background_js
@@ -228,6 +228,13 @@ def test_low_resource_mode_avoids_bootstrap_work_and_reduces_dom_polling() -> No
     assert "setInterval(tick, 20000)" in background_js
     assert "HEARTBEAT_INJECTION_MIN_INTERVAL_MS = 5 * 60 * 1000" in background_js
     assert "lastHeartbeatInjectionAt" in background_js
+    assert "TAB_SCRIPT_TIMEOUT_MS = 15000" in background_js
+    assert "ATTACHMENT_SCRIPT_TIMEOUT_MS = 45000" in background_js
+    assert "PROMPT_SUBMISSION_TIMEOUT_MS = 60000" in background_js
+    assert "PROVIDER_NO_PROGRESS_TIMEOUT_MS = 240000" in background_js
+    assert "async function executeTabScript" in background_js
+    assert "pollCount % 4 === 0" in background_js
+    assert "allowDeepScan" in background_js
 
     auto_alarm = background_js.split("async function ensureAutoAlarm", 1)[1].split(
         "async function ensureAutomationAlarm", 1
@@ -237,3 +244,16 @@ def test_low_resource_mode_avoids_bootstrap_work_and_reduces_dom_polling() -> No
     )[1].split("async function automationTick", 1)[0]
     assert "runJobs(" not in auto_alarm
     assert "automationTick(" not in automation_alarm
+
+
+def test_interrupted_provider_job_is_reclaimed_after_its_lease() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'const PROVIDER_RECOVERY_ALARM = "x-content-bot-provider-recovery"' in background_js
+    assert 'const ACTIVE_PROVIDER_JOB_ID_KEY = "activeProviderJobId"' in background_js
+    assert "await recoverInterruptedProviderJob();" in background_js
+    assert "delayInMinutes: 1.5" in background_js
+    assert "runJobs({ force: true, maxJobs: 1 })" in background_js
+    assert "[ACTIVE_PROVIDER_JOB_ID_KEY]: job.id" in background_js

@@ -29,12 +29,18 @@ const AUTO_ALARM = "x-content-bot-auto-run";
 const AUTOMATION_ALARM = "x-content-bot-scheduled-approvals";
 const RUNTIME_WATCHDOG_ALARM = "x-content-bot-runtime-watchdog";
 const FOLLOW_UP_ALARM = "x-content-bot-follow-up";
+const PROVIDER_RECOVERY_ALARM = "x-content-bot-provider-recovery";
 const BRIDGE_FETCH_TIMEOUT_MS = 15000;
+const TAB_SCRIPT_TIMEOUT_MS = 15000;
+const ATTACHMENT_SCRIPT_TIMEOUT_MS = 45000;
+const PROMPT_SUBMISSION_TIMEOUT_MS = 60000;
+const PROVIDER_NO_PROGRESS_TIMEOUT_MS = 240000;
 const FINAL_PROVIDER_URL = "https://gemini.google.com/app";
 const FINAL_PROVIDER_NAME = "Gemini";
 const PROVIDER_RECYCLE_AFTER_JOBS = 10;
 const PROVIDER_JOB_COUNT_KEY = "providerSuccessfulJobs";
 const PROVIDER_TAB_ID_KEY = "managedProviderTabId";
+const ACTIVE_PROVIDER_JOB_ID_KEY = "activeProviderJobId";
 const HEARTBEAT_INJECTION_MIN_INTERVAL_MS = 5 * 60 * 1000;
 let running = false;
 let lastStatusCache = "";
@@ -100,6 +106,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     runJobs({ force: false, maxJobs: 1 })
       .catch((error) => setStatus(`Follow-up error: ${error.message || error}`));
   }
+  if (alarm.name === PROVIDER_RECOVERY_ALARM) {
+    runJobs({ force: true, maxJobs: 1 })
+      .catch((error) => setStatus(`Provider recovery error: ${error.message || error}`));
+  }
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -129,12 +139,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.action === "runtime-heartbeat") {
-    chromeStorageSessionSet({ lastRuntimeHeartbeatAt: Date.now() })
-      .then(() => (
-        Date.now() - lastRuntimeBootstrapAt >= 120000
-          ? bootstrapRuntime()
-          : null
-      ))
+    loadConfig()
+      .then(async (config) => {
+        await chromeStorageSessionSet({ lastRuntimeHeartbeatAt: Date.now() });
+        if (Date.now() - lastRuntimeBootstrapAt >= 120000) {
+          await bootstrapRuntime(config);
+        }
+        await recoverInterruptedProviderJob();
+      })
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
     return true;
@@ -164,6 +176,21 @@ async function initializeRuntime() {
   await ensureGeminiHeartbeatInjected();
   const config = await loadConfig();
   await bootstrapRuntime(config);
+  await recoverInterruptedProviderJob();
+}
+
+async function recoverInterruptedProviderJob() {
+  if (running) return false;
+  const session = await chromeStorageSessionGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" });
+  const interruptedJobId = String(session[ACTIVE_PROVIDER_JOB_ID_KEY] || "");
+  if (!interruptedJobId) return false;
+  await chromeStorageSessionSet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" });
+  chrome.alarms.create(PROVIDER_RECOVERY_ALARM, { delayInMinutes: 1.5 });
+  await setStatus(
+    `Detected interrupted Gemini job ${interruptedJobId}. ` +
+    "It will be reclaimed after the bridge lease expires."
+  );
+  return true;
 }
 
 async function ensureGeminiHeartbeatInjected() {
@@ -190,10 +217,13 @@ async function ensureGeminiHeartbeatInjected() {
 
 async function injectGeminiHeartbeat(tabId) {
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["gemini_heartbeat.js"]
-    });
+    await executeTabScript(
+      {
+        target: { tabId },
+        files: ["gemini_heartbeat.js"]
+      },
+      { timeoutMs: TAB_SCRIPT_TIMEOUT_MS, label: "Gemini heartbeat injection" }
+    );
   } catch (_error) {
     // The managed tab can navigate or close between lookup and injection. The
     // next provider job or recovery pass will select one tab and retry.
@@ -520,6 +550,7 @@ async function runOneJob(config) {
 async function runGeminiTextJob(config, job, { reportError = true } = {}) {
   let providerStarted = false;
   let providerCompleted = false;
+  await chromeStorageSessionSet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: job.id });
   const stopHeartbeat = startJobHeartbeat(config, job.id);
   try {
     const finalPrompt = job.final_prompt;
@@ -558,6 +589,10 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
     throw error;
   } finally {
     stopHeartbeat();
+    const session = await chromeStorageSessionGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" });
+    if (String(session[ACTIVE_PROVIDER_JOB_ID_KEY] || "") === String(job.id)) {
+      await chromeStorageSessionSet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" });
+    }
   }
 }
 
@@ -595,17 +630,36 @@ async function reportJobError(config, jobId, error) {
   }
 }
 
+async function executeTabScript(details, { timeoutMs = TAB_SCRIPT_TIMEOUT_MS, label = "Tab script" } = {}) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      chrome.scripting.executeScript(details),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} did not respond within ${Math.round(timeoutMs / 1000)} seconds.`));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 async function runProviderPrompt(url, prompt, timeoutSeconds, attachments = []) {
   const tab = await prepareProviderTab(url);
   const provider = providerNameFromUrl(url);
   const submittedPrompt = provider === "Gemini" ? compactPromptForSingleInput(prompt) : prompt;
   if (attachments.length) {
     await setStatus(`Uploading ${attachments.length} representative frame(s) to ${provider}...`);
-    const [attachmentResult] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: injectedAttachImages,
-      args: [attachments]
-    });
+    const [attachmentResult] = await executeTabScript(
+      {
+        target: { tabId: tab.id },
+        func: injectedAttachImages,
+        args: [attachments]
+      },
+      { timeoutMs: ATTACHMENT_SCRIPT_TIMEOUT_MS, label: "Gemini frame upload" }
+    );
     const upload = attachmentResult ? attachmentResult.result : null;
     if (!upload || !upload.ok) {
       const detail = upload && upload.error ? upload.error : "Image attachment upload failed.";
@@ -615,11 +669,14 @@ async function runProviderPrompt(url, prompt, timeoutSeconds, attachments = []) 
   }
   await setStatus(`Submitting prompt to ${provider}...`);
 
-  const [submitResult] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: injectedSubmitPrompt,
-    args: [submittedPrompt]
-  });
+  const [submitResult] = await executeTabScript(
+    {
+      target: { tabId: tab.id },
+      func: injectedSubmitPrompt,
+      args: [submittedPrompt]
+    },
+    { timeoutMs: PROMPT_SUBMISSION_TIMEOUT_MS, label: "Gemini prompt submission" }
+  );
   const submit = submitResult ? submitResult.result : null;
   if (!submit || !submit.ok) {
     const error = submit && submit.error ? submit.error : `Could not submit prompt to ${provider}.`;
@@ -638,14 +695,23 @@ async function runProviderPrompt(url, prompt, timeoutSeconds, attachments = []) 
   let stableSince = Date.now();
   let lastStatusAt = 0;
   let lastDebug = "";
+  let pollCount = 0;
 
   while (Date.now() - started < timeoutMs) {
-    const [readResult] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: injectedReadProviderResponse,
-      args: [submittedPrompt, submit.before || ""]
-    });
+    pollCount += 1;
+    const allowDeepScan = Boolean(best) || pollCount % 4 === 0;
+    const [readResult] = await executeTabScript(
+      {
+        target: { tabId: tab.id },
+        func: injectedReadProviderResponse,
+        args: [submittedPrompt, submit.before || "", allowDeepScan]
+      },
+      { timeoutMs: TAB_SCRIPT_TIMEOUT_MS, label: "Gemini response DOM read" }
+    );
     const value = readResult ? readResult.result : null;
+    if (value && value.fatalError) {
+      throw new Error(`Gemini stopped the job: ${value.fatalError}`);
+    }
     if (value && value.ok && String(value.text || "").trim()) {
       const current = String(value.text).trim();
       if (current && current !== submit.before) {
@@ -667,6 +733,12 @@ async function runProviderPrompt(url, prompt, timeoutSeconds, attachments = []) 
         `Waiting for ${provider} response...\n${lastDebug || "No readable candidate yet."}`
       );
       lastStatusAt = Date.now();
+    }
+    if (!best && Date.now() - started >= PROVIDER_NO_PROGRESS_TIMEOUT_MS) {
+      throw new Error(
+        `Gemini produced no readable progress for ${Math.round(PROVIDER_NO_PROGRESS_TIMEOUT_MS / 1000)} seconds. ` +
+        `${lastDebug || "The provider tab may be stuck or rate limited."}`
+      );
     }
     await delay(best ? 2500 : 4000);
   }
@@ -701,10 +773,13 @@ async function diagnoseProviderDom(url) {
   const tab = await getOrCreateTab(url);
   await chromeTabsUpdate(tab.id, { active: true });
   await waitForTabComplete(tab.id);
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: injectedDiagnoseDom
-  });
+  const [result] = await executeTabScript(
+    {
+      target: { tabId: tab.id },
+      func: injectedDiagnoseDom
+    },
+    { timeoutMs: TAB_SCRIPT_TIMEOUT_MS, label: "Gemini DOM diagnosis" }
+  );
   const report = result ? result.result : "";
   if (!report) {
     throw new Error(`No DOM diagnostic report from ${url}`);
@@ -767,10 +842,13 @@ async function prepareProviderTab(url) {
     await waitForProviderReady(tab.id);
   }
 
-  const [resetResult] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: injectedStartFreshChat
-  });
+  const [resetResult] = await executeTabScript(
+    {
+      target: { tabId: tab.id },
+      func: injectedStartFreshChat
+    },
+    { timeoutMs: TAB_SCRIPT_TIMEOUT_MS, label: "Gemini fresh-chat reset" }
+  );
   if (resetResult && resetResult.result) {
     await delay(1000);
     await waitForTabComplete(tab.id);
@@ -878,10 +956,13 @@ async function waitForProviderReady(tabId, timeoutMs = 30000) {
   let lastUrl = "";
   while (Date.now() - started < timeoutMs) {
     try {
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: injectedProviderReady
-      });
+      const [result] = await executeTabScript(
+        {
+          target: { tabId },
+          func: injectedProviderReady
+        },
+        { timeoutMs: 5000, label: "Gemini readiness check" }
+      );
       const state = result ? result.result : null;
       if (state && state.ready) {
         return state;
@@ -1388,7 +1469,7 @@ async function injectedSubmitPrompt(prompt) {
   };
 }
 
-function injectedReadProviderResponse(prompt, before) {
+function injectedReadProviderResponse(prompt, before, allowDeepScan = false) {
   const compactText = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const stripProviderAttribution = (value) => compactText(value).replace(
     /^(?:gemini|chatgpt|grok)\s+(?:said|says|đã\s+nói|đã\s+nói|nói|noi)\s*[:\-–—]?\s*/iu,
@@ -1407,6 +1488,45 @@ function injectedReadProviderResponse(prompt, before) {
     const rect = el.getBoundingClientRect();
     return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
   };
+
+  const providerFatalError = () => {
+    const selectors = [
+      "[role='alert']",
+      "[aria-live='assertive']",
+      "[data-testid*='error']",
+      "[class*='error-message']",
+      "[class*='ErrorMessage']"
+    ];
+    const markers = [
+      "you've reached your limit",
+      "you have reached your limit",
+      "usage limit",
+      "rate limit",
+      "something went wrong",
+      "couldn't generate",
+      "could not generate",
+      "try again later",
+      "network error",
+      "Ä‘Ã£ Ä‘áº¡t giá»›i háº¡n",
+      "thá»­ láº¡i sau"
+    ];
+    for (const selector of selectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        if (!isVisible(el)) continue;
+        const text = compactText(el.innerText || el.textContent || "");
+        const normalized = text.toLowerCase();
+        if (text.length >= 4 && markers.some((marker) => normalized.includes(marker))) {
+          return text.slice(0, 240);
+        }
+      }
+    }
+    return "";
+  };
+
+  const fatalError = providerFatalError();
+  if (fatalError) {
+    return { ok: false, fatalError, debug: `providerError=${fatalError}` };
+  }
 
   // Gemini's answer body is sometimes rendered inside open shadow roots. Normal
   // querySelectorAll does not cross that boundary, even though the surrounding
@@ -1535,13 +1655,16 @@ function injectedReadProviderResponse(prompt, before) {
 
   if (!candidates.length) {
     for (const selector of selectors) {
-      for (const el of deepElements(document.body, selector)) {
+      const elements = allowDeepScan
+        ? deepElements(document.body, selector)
+        : Array.from(document.querySelectorAll(selector));
+      for (const el of elements) {
         pushCandidate(el);
       }
     }
   }
 
-  if (!candidates.length && isGemini) {
+  if (!candidates.length && isGemini && allowDeepScan) {
     // Gemini does not consistently expose assistant attributes. Try
     // likely response containers first, including plain-text replies such as /reply.
     const responseSelectors = [
@@ -1562,7 +1685,7 @@ function injectedReadProviderResponse(prompt, before) {
     }
   }
 
-  if (!candidates.length && isGemini) {
+  if (!candidates.length && isGemini && allowDeepScan) {
     // Last-resort DOM scan. The previous JSON-only heuristic could never read a
     // plain Gemini reply. Keep this narrow enough to avoid navigation and page shells.
     for (const el of deepElements(document.body, "div, p, span")) {

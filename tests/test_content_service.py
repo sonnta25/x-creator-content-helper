@@ -220,6 +220,34 @@ def test_replytargets_prompt_does_not_force_creator_niche() -> None:
     assert "readers already participating in the source post's conversation" in service.last_prompt
 
 
+def test_replytargets_prompt_applies_per_url_format_experiment() -> None:
+    class ReplyTargetService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/7",'
+                '"target":"@source launch","reply":"The distribution edge is the real moat."}]}'
+            )
+
+    service = ReplyTargetService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "AI",
+            "1. URL: https://x.com/source/status/7\nPost: New launch",
+            experiment_by_url={
+                "https://x.com/source/status/7": "concise_statement"
+            },
+        )
+    )
+
+    assert "Run the assigned format experiment" in service.last_prompt
+    assert "under 140 characters" in service.last_prompt
+
+
 def test_replyvideo_prompt_is_grounded_and_does_not_claim_full_video_access() -> None:
     class VideoReplyService(ContentService):
         def __init__(self, settings: Settings) -> None:

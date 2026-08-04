@@ -12,7 +12,7 @@ user reviews the X composer and presses **Reply**.
 ```text
 X discovery with twscrape
         ↓
-Candidate ranking and watch reservoir
+Candidate ranking, monetization safety, and watch reservoir
         ↓
 Gemini job through the local Chrome extension
         ↓
@@ -35,6 +35,11 @@ The normal daily workflow is:
 6. Use `/inbox` when an original author responds and `/replyreport 7d` to review
    performance.
 
+For a revenue-oriented setup, run `/money status` once and keep `/pace adaptive`
+plus `/risk balanced` enabled. The bot learns priority authors from tracked results;
+use `/watchauthor add @name` only when an account should be permanently pinned.
+Payouts can be entered once per payout period; no Analytics CSV is required.
+
 `/replytargets` and `/replyvideo` remain available when a specific discovery lane is
 needed. Scheduled scans can run both lanes automatically.
 
@@ -43,7 +48,7 @@ needed. Scheduled scans can run both lanes automatically.
 Use `/start`, `/menu`, or `/help` to open the English menu. The main menu provides:
 
 - **Start reply session**
-- **Author replies**
+- **Conversation inbox**
 - **Performance**
 - **Settings**
 - **Help** and **Cancel**
@@ -66,11 +71,12 @@ such as `/replytargets AI agents`, continue to work.
 ### Daily workflow
 
 - `/session [10-120|status|stop]` — build, inspect, or stop a guided reply queue.
-- `/inbox` — reopen pending follow-ups after original-author responses.
+- `/inbox` — reopen pending original-author and verified-audience follow-ups.
 - `/replytargets [topic|auto]` — find viral posts and create reply cards.
 - `/replyvideo [topic]` — find fresh viral videos with low reply competition.
 - `/reply <text or X URL>` — write one standalone reply.
 - `/replyreport [7d|30d]` — show tracked reply performance.
+- `/wins [7d|30d|90d]` — show the strongest real reply angles as an insight bank.
 - `/download <post URL>` — download images, carousels, videos, or Reels.
 
 ### Strategy and automation
@@ -80,10 +86,19 @@ such as `/replytargets AI agents`, continue to work.
 - `/videoevery <3-1440>` — set the scheduled video-reply interval.
 - `/replybatch show|targets <2-5>|video <2-5>` — set cards requested per run.
 - `/replycap show|daily <1-2000>|author <1-25>` — set daily and per-author ceilings.
+- `/pace show|conservative|adaptive|high|pause|resume` — control adaptive hourly
+  card ceilings and health backoff.
 - `/replylangs show|add|remove|set` — manage up to six X language codes.
 - `/replylearn status|on|off|rollback|username @name` — control tracking and bounded
   learning.
+- `/experiments status|on|off` — rotate and compare grounded reply formats.
 - `/persona` — show or update niche, voice, and audience.
+- `/watchauthor list|add @name|pin @name|remove @name|block @name|unblock @name|auto on|off|status`
+  — inspect and control pinned, automatically learned, and blocked priority authors.
+- `/risk show|strict|balanced|open` — control monetization-safety filtering.
+- `/money status|report [90d]|payout YYYY-MM-DD amount [USD]|set ...` — maintain
+  monetization readiness and the payout feedback loop without CSV imports.
+- `/profileaudit` — check whether the public profile converts reply viewers.
 
 ### X account and health
 
@@ -116,6 +131,32 @@ view and engagement movement, allowing the bot to catch both early breakouts and
 posts that accelerate several hours later. Reply competition is scored separately:
 crowded threads and dominant existing replies reduce opportunity even when the root
 post is viral.
+
+Priority authors are searched before generic trend lanes. Their posts still pass the
+same freshness, public-momentum, reply-competition, deduplication, and safety gates;
+watching an author is a ranking advantage, not an automatic approval.
+
+Automatic author learning is enabled by default and uses only the bot's own tracked
+public outcomes. An author becomes eligible after at least two replies, a strong safe-
+content history, and evidence such as 20,000 median reply views, an original-author
+response, or a strong relationship score. The bot keeps at most 20 learned authors
+and can retire one after 30 days without interaction or after a sustained weak sample.
+Authors added with `/watchauthor add` or `pin` are permanent and never auto-demoted.
+`remove` allows later relearning; `block` removes the author and prevents relearning.
+
+Each discovery scan rotates through the watchlist and, when both groups exist,
+reserves query capacity for both pinned and learned authors. It does not repeatedly
+search only the first four usernames. Use `/watchauthor auto off` to disable automatic
+promotion and demotion without removing existing entries.
+
+Every candidate receives a conservative monetization assessment. Green means no known
+restricted category was detected from the supplied text or media metadata. Yellow marks
+potentially restricted topics such as disasters, conflict, controversial political or
+social issues, or strong language. Red marks high-risk categories such as betting,
+gambling, explicit adult material, or obvious scam promotion. `earn` always excludes red;
+`balanced` excludes red and downranks yellow; `strict` excludes both. `open` can retain
+red only outside `earn`, with a visible warning. This classifier is not a legal
+determination or a private X monetization decision.
 
 Scheduled scans with no ready opportunity are silent and do not spend a Gemini job.
 Authentication, rate-limit, bridge, or provider failures are still reported.
@@ -155,6 +196,8 @@ A reply card contains only the information needed for a decision:
 
 Views, competition, velocity, strategy, and opportunity scores remain internal for
 ranking and learning instead of cluttering the Telegram card.
+Tap **Why?** to inspect rankability, post age, verified-audience proxy, experiment
+bucket, author-watch status, and revenue-safety reasons only when needed.
 
 After **Approve on mobile**, Telegram shows **Open X on phone**. This two-step design
 is required because one Telegram button cannot both record a callback and open X.
@@ -173,10 +216,43 @@ not need to send the reply URL back. It samples public metrics around 15 minutes
 and immediately create a Telegram follow-up card with **Continue conversation** and
 **Stop here**.
 
+One verified direct response to the user's reply may also enter `/inbox`. This broadens
+the conversation workflow without drafting for every low-value notification. Follower
+count is sampled across reply as well as legacy post windows, so follower lift no longer
+depends on removed post-generation commands.
+
 Learning is bounded. It adjusts strategy allocation using real approvals, edits,
 public outcomes, language, source type, and posting hour. Strong real posted replies
 may supply short style examples, but the prompt forbids copying their wording or
 claims. The bot does not rewrite its source code or base prompt automatically.
+
+Format experiments rotate concise statements, insight-then-question, confident
+implications, and natural humor across different target posts. The bot never sends
+multiple experimental replies to the same post. `/session` learns a bounded video/text
+allocation and retains exploration plus relationship opportunities instead of using a
+permanent 70% video mix.
+
+## Revenue operations and account safety
+
+`/money` stores only values deliberately entered by the user: checklist state,
+verified-follower count, and occasional payout totals. It combines those values with
+public tracked reply views to show a period-level efficiency proxy. It cannot see
+verified Home Timeline impressions, subscriber tier, private organic-impression
+eligibility, profile visits, or exact revenue attributable to one reply.
+
+```text
+/money set premium on
+/money set stripe on
+/money set identity on
+/money set 2fa on
+/money set verified_followers 540
+/money payout 2026-08-01 125.40 USD
+```
+
+`/pace adaptive` converts the daily cap into a rolling hourly ceiling. Three new
+X-account errors inside one hour pause new card generation while tracking continues.
+After checking `/setupcheck`, use `/pace resume`. `high` raises capacity but never
+auto-posts and is not a guarantee that a volume is safe under X policy.
 
 ## Limits and goals
 
@@ -192,13 +268,16 @@ REPLY_VIDEO_BATCH_SIZE=3
 ```
 
 - `qualify` emphasizes reach and reply visibility.
-- `earn` adds public verified/Premium-audience proxies; it cannot see X private
+- `earn` adds a public verified-audience proxy and monetization safety; it cannot see X private
   monetization or subscriber-ranking data.
 - `network` emphasizes author responses and repeat relationships.
 
 The daily value is an approval-card ceiling, not a guaranteed posting quota.
 Available candidates, deduplication, quality checks, batch size, X limits, and manual
 submission still determine actual volume.
+
+The legacy `premium_audience_score` field remains for data compatibility, but new UI
+calls it a **verified-audience proxy**. It must not be interpreted as a payout score.
 
 ## Windows VPS setup
 
@@ -267,6 +346,7 @@ EXTENSION_BRIDGE_TIMEOUT_SECONDS=360
 
 X_OWNER_USERNAME=your_x_username
 X_ACCOUNTS_DB=data/twscrape_accounts.db
+REVENUE_OPS_PATH=data/revenue_ops.json
 
 REPLY_TARGET_LANGUAGES=en,ja
 REPLY_TARGET_MODE=balanced
@@ -364,6 +444,9 @@ node --check browser_extension\background.js
 - Never commit or share live Telegram tokens, `auth_token`, or `ct0` values.
 - The deployment ZIP intentionally excludes runtime credentials and history.
 - Public metrics from twscrape are useful signals, not guaranteed X Analytics data.
+- `data/revenue_ops.json` may contain payout totals and is excluded from the ZIP/repository.
+- Manual final posting reduces automation risk but does not remove the policy or account
+  risk of non-official X collection. Do not treat a configured volume ceiling as a safe quota.
 - X and Gemini web interfaces can change; keep the extension and dependencies current.
 
 ## BUY ME A COFFEE

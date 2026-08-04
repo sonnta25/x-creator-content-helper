@@ -25,6 +25,7 @@ class Settings:
     reply_target_metrics_path: str = ""
     reply_learning_enabled: bool = True
     reply_learning_path: str = "data/reply_learning.json"
+    revenue_ops_path: str = "data/revenue_ops.json"
     reply_tracking_poll_minutes: int = 5
     reply_watch_path: str = "data/reply_watchlist.json"
     reply_target_mode: str = "balanced"
@@ -102,6 +103,10 @@ class Settings:
                 "REPLY_LEARNING_PATH", "data/reply_learning.json"
             ).strip()
             or "data/reply_learning.json",
+            revenue_ops_path=os.getenv(
+                "REVENUE_OPS_PATH", "data/revenue_ops.json"
+            ).strip()
+            or "data/revenue_ops.json",
             reply_tracking_poll_minutes=max(
                 1, _int_env("REPLY_TRACKING_POLL_MINUTES", 5)
             ),

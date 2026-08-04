@@ -132,6 +132,32 @@ class XSearchService:
         except Exception as exc:
             raise RuntimeError(f"X owner timeline lookup failed: {exc}") from exc
 
+    async def user_profile(self, username: str) -> dict[str, Any]:
+        api = await self._get_api()
+        clean_username = username.strip().lstrip("@")
+        if not clean_username:
+            raise RuntimeError("X username is empty.")
+        try:
+            user = await api.user_by_login(clean_username)
+        except Exception as exc:
+            raise RuntimeError(f"X user profile lookup failed: {exc}") from exc
+        if user is None:
+            raise RuntimeError(f"X user @{clean_username} was not found.")
+        pinned = getattr(user, "pinnedIds", None) or []
+        if not isinstance(pinned, (list, tuple, set)):
+            pinned = [pinned]
+        return {
+            "username": str(getattr(user, "username", "") or clean_username),
+            "display_name": str(getattr(user, "displayname", "") or ""),
+            "description": str(getattr(user, "rawDescription", "") or getattr(user, "description", "") or ""),
+            "followers": int(getattr(user, "followersCount", 0) or 0),
+            "following": int(getattr(user, "friendsCount", 0) or 0),
+            "verified": bool(getattr(user, "verified", False) or getattr(user, "blue", False)),
+            "profile_image": str(getattr(user, "profileImageUrl", "") or ""),
+            "profile_banner": str(getattr(user, "profileBannerUrl", "") or ""),
+            "pinned_ids": [int(value) for value in pinned if str(value).isdigit()],
+        }
+
     async def tweet_replies(
         self,
         tweet_id: int,

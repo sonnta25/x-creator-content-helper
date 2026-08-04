@@ -28,6 +28,7 @@ def test_settings_defaults() -> None:
     assert settings.reply_target_batch_size == 3
     assert settings.reply_video_batch_size == 3
     assert settings.reply_session_minutes == 20
+    assert settings.revenue_ops_path == "data/revenue_ops.json"
     assert settings.reply_author_daily_cap == 5
     assert settings.stale_mobile_approval_hours == 6
     assert settings.reply_daily_digest_hour == 22
@@ -77,6 +78,7 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
         "X_OWNER_USERNAME=@real_owner\n"
         "REPLY_LEARNING_ENABLED=false\n"
         "REPLY_LEARNING_PATH=data/test-reply-learning.json\n"
+        "REVENUE_OPS_PATH=data/test-revenue-ops.json\n"
         "REPLY_TRACKING_POLL_MINUTES=3\n"
         "REPLY_WATCH_PATH=data/test-reply-watch.json\n"
         "REPLY_TARGET_MODE=relationship\n"
@@ -111,6 +113,7 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
     assert settings.x_owner_username == "real_owner"
     assert settings.reply_learning_enabled is False
     assert settings.reply_learning_path == "data/test-reply-learning.json"
+    assert settings.revenue_ops_path == "data/test-revenue-ops.json"
     assert settings.reply_tracking_poll_minutes == 3
     assert settings.reply_watch_path == "data/test-reply-watch.json"
     assert settings.reply_target_mode == "relationship"

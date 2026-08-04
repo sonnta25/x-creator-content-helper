@@ -106,6 +106,7 @@ class ContentService:
         *,
         strategy: str = "specific_observation",
         strategy_by_url: dict[str, str] | None = None,
+        experiment_by_url: dict[str, str] | None = None,
         video_mode: bool = False,
         visual_attachments: list[ImageAttachment] | None = None,
         style_examples: list[str] | None = None,
@@ -151,6 +152,16 @@ class ContentService:
                     f"- {example.strip()}" for example in style_examples[:3] if example.strip()
                 )
             )
+        experiment_allocation = ""
+        if experiment_by_url:
+            experiment_allocation = (
+                "Run the assigned format experiment for each URL without weakening factual "
+                "grounding. The experiment is a writing constraint, not permission to invent:\n"
+                + "\n".join(
+                    f"- {url}: {name} — {_reply_experiment_instruction(name)}"
+                    for url, name in experiment_by_url.items()
+                )
+            )
         prompt = _reply_engine_prompt(
             self.settings,
             task=(
@@ -172,7 +183,7 @@ class ContentService:
                 f"{style_memory}\n"
                 f"Return exactly {required_targets} distinct targets from the supplied candidates. "
                 f"For this batch, use this reply strategy when no per-URL strategy is assigned: "
-                f"{strategy_instruction}\n{allocation}"
+                f"{strategy_instruction}\n{allocation}\n{experiment_allocation}"
             ),
             context=f"Candidate X posts:\n{x_context}",
             output_contract=_reply_targets_output_contract(required_targets),
@@ -205,6 +216,15 @@ class ContentService:
                 required_targets=len(unresolved_urls),
                 required_urls=unresolved_urls,
             )
+            if experiment_by_url:
+                repair_prompt += (
+                    "\n\nPreserve these format experiments for the unresolved URLs:\n"
+                    + "\n".join(
+                        f"- {url}: {_reply_experiment_instruction(experiment_by_url[url])}"
+                        for url in unresolved_urls
+                        if url in experiment_by_url
+                    )
+                )
             if video_mode:
                 repair_prompt += (
                     "\n\nVideo evidence boundary: any attached images are unordered "
@@ -333,6 +353,27 @@ def _reply_strategy_instruction(strategy: str) -> str:
         ),
     }
     return instructions.get(strategy, instructions["specific_observation"])
+
+
+def _reply_experiment_instruction(variant: str) -> str:
+    instructions = {
+        "concise_statement": (
+            "Use one compact value-bearing statement, normally under 140 characters; "
+            "do not end with a question."
+        ),
+        "insight_then_question": (
+            "Use two short sentences: first add a concrete insight, then ask one specific "
+            "answerable question."
+        ),
+        "confident_implication": (
+            "State one supported implication confidently and avoid a trailing question."
+        ),
+        "natural_humor": (
+            "Use one natural, source-specific humorous observation that still adds a real point."
+        ),
+        "adaptive": "Choose the clearest source-grounded format for this candidate.",
+    }
+    return instructions.get(variant, instructions["adaptive"])
 
 
 def _reply_engine_prompt(

@@ -363,3 +363,98 @@ def test_daily_digest_marker_persists(tmp_path) -> None:
     store.mark_digest_sent("2026-08-03")
 
     assert ReplyLearningStore(path).last_digest_date == "2026-08-03"
+
+
+def test_reply_windows_contribute_to_follower_lift_and_experiment_report(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    now = datetime(2026, 8, 4, 12, tzinfo=UTC)
+    approval = _approval("reply-lift", target_id=900, approved_at=now - timedelta(days=1))
+    approval.metadata.update(
+        {
+            "experiment_variant": "concise_statement",
+            "approval_latency_seconds": 45,
+            "verified_audience_proxy": 70,
+        }
+    )
+    store.register_approval(approval)
+    posted = _result(
+        901,
+        target_id=900,
+        created_at=now - timedelta(hours=23),
+        views=25_000,
+        followers=1_000,
+    )
+    store.mark_discovered(approval.id, posted)
+    later = _result(
+        901,
+        target_id=900,
+        created_at=now - timedelta(hours=23),
+        views=25_000,
+        followers=1_025,
+    )
+    store.add_snapshot(
+        approval.id,
+        checkpoint_minutes=1440,
+        reply=later,
+        root=_result(900, views=100_000, username="source"),
+        owner_followers=1_025,
+        captured_at=now,
+    )
+
+    report = store.report(now=now + timedelta(minutes=1))
+
+    assert report["follower_window_lift"] == 25
+    assert report["by_experiment"]["concise_statement"]["count"] == 1
+    assert report["median_approval_latency_seconds"] == 45
+
+
+def test_experiment_variants_rotate_and_can_be_disabled(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+
+    first = store.choose_experiment_variant()
+    second = store.choose_experiment_variant()
+    assert first != second
+
+    store.set_experiment_enabled(False)
+    assert store.choose_experiment_variant() == "adaptive"
+
+
+def test_author_portfolios_expose_auto_watch_signals(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    now = datetime(2026, 8, 4, 12, tzinfo=UTC)
+    approval = _approval(
+        "portfolio-signals",
+        target_id=700,
+        approved_at=now - timedelta(hours=2),
+    )
+    approval.metadata.update(
+        {
+            "verified_audience_proxy": 65,
+            "monetization_risk_level": "green",
+        }
+    )
+    store.register_approval(approval)
+    posted = _result(
+        701,
+        target_id=700,
+        created_at=now - timedelta(hours=1),
+        views=25_000,
+    )
+    store.mark_discovered(approval.id, posted)
+    store.add_snapshot(
+        approval.id,
+        checkpoint_minutes=60,
+        reply=posted,
+        root=_result(700, views=100_000, username="source"),
+        author_replied=True,
+        captured_at=now,
+    )
+
+    rows = store.author_portfolios()
+
+    assert len(rows) == 1
+    assert rows[0]["username"] == "source"
+    assert rows[0]["median_views"] == 25_000
+    assert rows[0]["verified_audience_proxy"] == 65
+    assert rows[0]["green_rate"] == 1.0
+    assert rows[0]["last_interaction_at"] == posted.created_at

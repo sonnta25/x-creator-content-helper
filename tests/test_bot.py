@@ -106,6 +106,8 @@ def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
         "reply", "replyevery", "videoevery", "replybatch", "replylangs",
         "replylearn", "replyreport", "setupcheck", "cancel", "session",
         "inbox", "replygoal", "replycap",
+        "watchauthor", "money", "risk", "pace", "experiments",
+        "profileaudit", "wins",
     }.issubset(commands)
 
 
@@ -198,6 +200,51 @@ def test_earn_goal_rewards_verified_audience_proxy() -> None:
 
     assert ranked[0].username == "verified"
     assert ranked[0].premium_audience_score > ranked[1].premium_audience_score
+
+
+def test_earn_goal_excludes_red_monetization_target(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            creator_goal="earn",
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+        )
+    )
+    risky = XSearchResult(
+        id=1,
+        username="market",
+        display_name="Market",
+        text="New Polymarket betting odds",
+        created_at=datetime.now(UTC).isoformat(),
+        url="https://x.com/market/status/1",
+        viral_score=90,
+        reply_opportunity_score=90,
+        thread_availability_score=90,
+    )
+
+    assert bot._apply_reply_target_mode([risky], "balanced") == []
+
+
+def test_dynamic_session_mix_reserves_watched_relationship_slot() -> None:
+    def candidate(tweet_id: int, *, video: bool, score: float, watched: bool = False):
+        return XSearchResult(
+            id=tweet_id,
+            username=f"user{tweet_id}",
+            display_name="User",
+            text="Candidate",
+            created_at=datetime.now(UTC).isoformat(),
+            url=f"https://x.com/user{tweet_id}/status/{tweet_id}",
+            has_video=video,
+            goal_score=score,
+            watched_author=watched,
+        )
+
+    videos = [candidate(i, video=True, score=90 - i) for i in range(1, 5)]
+    targets = [candidate(10, video=False, score=80), candidate(11, video=False, score=20, watched=True)]
+
+    selected = _select_session_mix(targets, videos, max_items=5, video_share=0.75)
+
+    assert any(item.watched_author for item in selected)
 
 
 def test_session_queue_sends_one_unsent_card_at_a_time(tmp_path) -> None:
@@ -1411,7 +1458,7 @@ def test_scheduled_replytargets_reports_daily_cap_instead_of_confirmation(tmp_pa
 
     asyncio.run(bot._run_scheduled_replytargets("", 360, ["en"]))
 
-    assert "reached today's reply-card cap" in messages[-1]
+    assert "reached the daily/adaptive hourly card ceiling" in messages[-1]
     assert "Confirmed now: 1" in messages[-1]
     assert "none is confirmed enough" not in messages[-1]
 

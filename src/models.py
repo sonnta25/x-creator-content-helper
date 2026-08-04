@@ -77,7 +77,12 @@ class XSearchResult:
     relationship_score: float = 0.0
     rankability_score: float = 0.0
     premium_audience_score: float = 0.0
+    verified_audience_proxy: float = 0.0
     verified_replier_ratio: float = 0.0
+    monetization_safety_score: float = 100.0
+    monetization_risk_level: str = "green"
+    monetization_risk_reasons: tuple[str, ...] = ()
+    watched_author: bool = False
     goal_score: float = 0.0
 
 

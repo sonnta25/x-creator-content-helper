@@ -189,6 +189,12 @@ def test_auto_run_self_heals_alarms_and_heartbeats_claimed_jobs() -> None:
     assert "BRIDGE_FETCH_TIMEOUT_MS = 15000" in background_js
     assert "remote.extension_bridge_timeout_seconds" in background_js
     assert "timeoutSeconds: bridgeTimeoutSeconds" in background_js
+    assert "ACTIVE_PROVIDER_WATCHDOG_ALARM" in background_js
+    assert "activeProviderWatchdogTick()" in background_js
+    assert "ensureActiveProviderWatchdog()" in background_js
+    assert "delayInMinutes: 0.5" in background_js
+    assert "periodInMinutes: 1" in background_js
+    assert "MAX_PROVIDER_TIMEOUT_SECONDS = 360" in background_js
 
 
 def test_gemini_tab_wakes_the_extension_runtime_when_alarms_disappear() -> None:
@@ -252,8 +258,13 @@ def test_interrupted_provider_job_is_reclaimed_after_its_lease() -> None:
     )
 
     assert 'const PROVIDER_RECOVERY_ALARM = "x-content-bot-provider-recovery"' in background_js
+    assert 'const PROVIDER_RECOVERY_RETRY_ALARM = "x-content-bot-provider-recovery-retry"' in background_js
     assert 'const ACTIVE_PROVIDER_JOB_ID_KEY = "activeProviderJobId"' in background_js
     assert "await recoverInterruptedProviderJob();" in background_js
+    assert "delayInMinutes: 0.1" in background_js
     assert "delayInMinutes: 1.5" in background_js
     assert "runJobs({ force: true, maxJobs: 1 })" in background_js
-    assert "[ACTIVE_PROVIDER_JOB_ID_KEY]: job.id" in background_js
+    assert "await setActiveProviderJobId(job.id)" in background_js
+    assert "async function getActiveProviderJobId()" in background_js
+    assert "chromeStorageGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: \"\" })" in background_js
+    assert "chromeStorageSessionGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: \"\" })" in background_js

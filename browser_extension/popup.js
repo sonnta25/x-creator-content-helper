@@ -218,7 +218,10 @@ function readConfigFromForm() {
   return {
     bridgeUrl: els.bridgeUrl.value.trim().replace(/\/$/, "") || DEFAULTS.bridgeUrl,
     token: els.token.value.trim() || DEFAULTS.token,
-    timeoutSeconds: Math.max(30, Number(els.timeoutSeconds.value || DEFAULTS.timeoutSeconds)),
+    timeoutSeconds: Math.min(
+      360,
+      Math.max(120, Number(els.timeoutSeconds.value || DEFAULTS.timeoutSeconds))
+    ),
     pollSeconds: Math.max(
       currentConfig.lowResourceMode ? 60 : 30,
       Number(els.pollSeconds.value || DEFAULTS.pollSeconds)

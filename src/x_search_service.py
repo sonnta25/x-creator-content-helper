@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from contextlib import aclosing
 from datetime import datetime, timedelta, timezone
@@ -36,25 +37,31 @@ class XSearchService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._api: Any | None = None
+        # twscrape leases one account per request. Serializing access prevents
+        # discovery and tracking from exhausting a small one-cookie pool.
+        self._request_lock = asyncio.Lock()
 
     async def import_cookie_account(self, account_name: str, cookie: str) -> str:
         clean_name = normalize_account_name(account_name)
-        api = await self._get_api()
-        await api.pool.delete_accounts(clean_name)
-        await api.pool.add_account_cookies(clean_name, cookie)
-        await api.pool.reset_locks()
+        async with self._request_lock:
+            api = await self._get_api()
+            await api.pool.delete_accounts(clean_name)
+            await api.pool.add_account_cookies(clean_name, cookie)
+            await api.pool.reset_locks()
         return clean_name
 
     async def remove_cookie_account(self, account_name: str) -> str:
         clean_name = normalize_account_name(account_name)
-        api = await self._get_api()
-        await api.pool.delete_accounts(clean_name)
-        await api.pool.reset_locks()
+        async with self._request_lock:
+            api = await self._get_api()
+            await api.pool.delete_accounts(clean_name)
+            await api.pool.reset_locks()
         return clean_name
 
     async def accounts_info(self) -> list[dict[str, Any]]:
-        api = await self._get_api()
-        return await api.pool.accounts_info()
+        async with self._request_lock:
+            api = await self._get_api()
+            return await api.pool.accounts_info()
 
     async def search(
         self,
@@ -63,23 +70,24 @@ class XSearchService:
         product: str | None = None,
     ) -> list[XSearchResult]:
         clean_query = default_english_query(query)
-        api = await self._get_api()
         search_limit = limit or self.settings.x_search_limit
         results: list[XSearchResult] = []
         try:
-            async with aclosing(
-                api.search(
-                    clean_query,
-                    limit=search_limit,
-                    kv={"product": product or self.settings.x_search_product},
-                )
-            ) as stream:
-                async for tweet in stream:
-                    result = _to_search_result(tweet)
-                    if result.text or result.has_video:
-                        results.append(result)
-                    if len(results) >= search_limit:
-                        break
+            async with self._request_lock:
+                api = await self._get_api()
+                async with aclosing(
+                    api.search(
+                        clean_query,
+                        limit=search_limit,
+                        kv={"product": product or self.settings.x_search_product},
+                    )
+                ) as stream:
+                    async for tweet in stream:
+                        result = _to_search_result(tweet)
+                        if result.text or result.has_video:
+                            results.append(result)
+                        if len(results) >= search_limit:
+                            break
         except Exception as exc:
             raise RuntimeError(f"X search failed: {exc}") from exc
         return results
@@ -95,9 +103,10 @@ class XSearchService:
         return recent_query, await self.search(recent_query, limit=limit, product=product)
 
     async def tweet_by_id(self, tweet_id: int) -> XSearchResult | None:
-        api = await self._get_api()
         try:
-            tweet = await api.tweet_details(tweet_id)
+            async with self._request_lock:
+                api = await self._get_api()
+                tweet = await api.tweet_details(tweet_id)
         except Exception as exc:
             raise RuntimeError(f"X tweet lookup failed: {exc}") from exc
         if tweet is None:
@@ -110,11 +119,12 @@ class XSearchService:
         *,
         limit: int = 40,
     ) -> list[XSearchResult]:
-        api = await self._get_api()
         clean_username = username.strip().lstrip("@")
         if not clean_username:
             raise RuntimeError("X owner username is empty.")
+        await self._request_lock.acquire()
         try:
+            api = await self._get_api()
             user = await api.user_by_login(clean_username)
             if user is None:
                 raise RuntimeError(f"X user @{clean_username} was not found.")
@@ -131,16 +141,21 @@ class XSearchService:
             return results
         except Exception as exc:
             raise RuntimeError(f"X owner timeline lookup failed: {exc}") from exc
+        finally:
+            self._request_lock.release()
 
     async def user_profile(self, username: str) -> dict[str, Any]:
-        api = await self._get_api()
         clean_username = username.strip().lstrip("@")
         if not clean_username:
             raise RuntimeError("X username is empty.")
+        await self._request_lock.acquire()
         try:
+            api = await self._get_api()
             user = await api.user_by_login(clean_username)
         except Exception as exc:
             raise RuntimeError(f"X user profile lookup failed: {exc}") from exc
+        finally:
+            self._request_lock.release()
         if user is None:
             raise RuntimeError(f"X user @{clean_username} was not found.")
         pinned = getattr(user, "pinnedIds", None) or []
@@ -164,8 +179,9 @@ class XSearchService:
         *,
         limit: int = 20,
     ) -> list[XSearchResult]:
-        api = await self._get_api()
+        await self._request_lock.acquire()
         try:
+            api = await self._get_api()
             results: list[XSearchResult] = []
             async with aclosing(api.tweet_replies(tweet_id, limit=limit)) as stream:
                 async for tweet in stream:
@@ -177,6 +193,8 @@ class XSearchService:
             return results
         except Exception as exc:
             raise RuntimeError(f"X reply lookup failed: {exc}") from exc
+        finally:
+            self._request_lock.release()
 
     async def trends(self, category: str = "trending", limit: int = 10) -> list[XTrend]:
         clean_category = category.strip().lower() or "trending"
@@ -185,9 +203,10 @@ class XSearchService:
                 "Unknown trend category. Use trending, news, sport, or entertainment."
             )
 
-        api = await self._get_api()
         trends: list[XTrend] = []
+        await self._request_lock.acquire()
         try:
+            api = await self._get_api()
             async with aclosing(api.trends(clean_category, limit=limit)) as stream:
                 async for trend in stream:
                     parsed = _to_trend(trend)
@@ -197,6 +216,8 @@ class XSearchService:
                         break
         except Exception as exc:
             raise RuntimeError(f"X trends failed: {exc}") from exc
+        finally:
+            self._request_lock.release()
         return trends
 
     async def _get_api(self) -> Any:

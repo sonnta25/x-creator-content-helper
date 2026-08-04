@@ -17,6 +17,8 @@ from src.models import ImageAttachment
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
 JOB_LEASE_SECONDS = 75
+JOB_HEALTH_POLL_SECONDS = 15
+JOB_RECOVERY_WAIT_SECONDS = 120
 JOB_TIMEOUT_MIN_GRACE_SECONDS = 120
 JOB_TIMEOUT_GRACE_RATIO = 0.25
 
@@ -101,6 +103,7 @@ class ExtensionBridgeServer:
             JOB_TIMEOUT_MIN_GRACE_SECONDS,
             configured_timeout * JOB_TIMEOUT_GRACE_RATIO,
         )
+        stalled_since: float | None = None
         try:
             while True:
                 now = time.monotonic()
@@ -109,7 +112,7 @@ class ExtensionBridgeServer:
                     try:
                         return await asyncio.wait_for(
                             asyncio.shield(job.future),
-                            timeout=remaining,
+                            timeout=min(remaining, JOB_HEALTH_POLL_SECONDS),
                         )
                     except asyncio.TimeoutError:
                         pass
@@ -119,6 +122,52 @@ class ExtensionBridgeServer:
                     job.last_heartbeat_at > 0
                     and now - job.last_heartbeat_at <= JOB_LEASE_SECONDS
                 )
+                if job.claim_attempts > 0 and not heartbeat_is_recent:
+                    if stalled_since is None:
+                        stalled_since = now
+                    async with self._lock:
+                        if (
+                            job.phase == "final_running"
+                            and not job.future.done()
+                        ):
+                            # Make the interrupted job visible immediately. The
+                            # extension's active-job watchdog can reclaim it on
+                            # its next wake instead of waiting for the full
+                            # provider timeout to expire.
+                            job.phase = "final_pending"
+                            job.last_heartbeat_at = 0.0
+                    recovery_deadline = min(
+                        hard_deadline,
+                        stalled_since + JOB_RECOVERY_WAIT_SECONDS,
+                    )
+                    if now >= recovery_deadline:
+                        elapsed = max(0, int(now - started_at))
+                        raise RuntimeError(
+                            "Extension bridge timed out waiting for Chrome after "
+                            f"{elapsed}s. Chrome job heartbeat stopped. The bridge "
+                            "requeued the interrupted job, but the extension did not "
+                            "reclaim it before the recovery deadline."
+                        ) from asyncio.TimeoutError()
+                    if remaining <= 0:
+                        await asyncio.sleep(
+                            max(
+                                0.01,
+                                min(
+                                    JOB_HEALTH_POLL_SECONDS,
+                                    recovery_deadline - now,
+                                ),
+                            )
+                        )
+                    continue
+
+                # Health polling wakes this loop every few seconds. An
+                # unclaimed job must keep waiting until its configured soft
+                # deadline; the poll interval itself is not a job timeout.
+                if now < soft_deadline:
+                    continue
+
+                if heartbeat_is_recent:
+                    stalled_since = None
                 if heartbeat_is_recent and now < hard_deadline:
                     # Chrome has claimed the job and is still alive. Give the
                     # provider enough room to finish its own configured timeout
@@ -333,6 +382,15 @@ class ExtensionBridgeServer:
         job = await self._job(job_id)
         if job.future.done():
             return _json_response(200, {"ok": True, "phase": job.phase})
+        recovered_lease = False
+        if job.phase == "final_pending" and job.claim_attempts > 0:
+            # A temporary bridge/network interruption can outlive the server
+            # lease while the original Chrome worker is still processing the
+            # provider response. Let its next heartbeat resume the same job;
+            # otherwise every later heartbeat would receive 409 and the
+            # waiter would fail even though Chrome had recovered.
+            job.phase = "final_running"
+            recovered_lease = True
         if job.phase != "final_running":
             return _json_response(
                 409,
@@ -341,7 +399,12 @@ class ExtensionBridgeServer:
         job.last_heartbeat_at = time.monotonic()
         return _json_response(
             200,
-            {"ok": True, "phase": job.phase, "claim_attempts": job.claim_attempts},
+            {
+                "ok": True,
+                "phase": job.phase,
+                "claim_attempts": job.claim_attempts,
+                "recovered_lease": recovered_lease,
+            },
         )
 
     async def _job(self, job_id: str) -> ExtensionBridgeJob:

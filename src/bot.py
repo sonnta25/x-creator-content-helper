@@ -3185,7 +3185,11 @@ class ContentBot:
             f"Strict window: {strict_age} minutes; emergency fill window: {fill_age} minutes\n"
             "Target mix: two global videos plus one Vietnamese video when available."
         )
-        semaphore = asyncio.Semaphore(4)
+        # A typical cookie-only VPS has one usable twscrape account. Run video
+        # lanes serially so Top/Latest searches cannot lease the same small
+        # account pool concurrently and make every lane report unavailable.
+        semaphore = asyncio.Semaphore(1)
+        search_failures: list[str] = []
 
         async def search_one(
             label: str,
@@ -3204,7 +3208,11 @@ class ContentBot:
                         timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
                     )
                 return label, search_query, results
-            except Exception:
+            except Exception as exc:
+                search_failures.append(
+                    f"{label}/{product}: "
+                    f"{_truncate_text(_exception_detail(exc), 180)}"
+                )
                 return None
 
         responses = await asyncio.gather(
@@ -3216,8 +3224,11 @@ class ContentBot:
         )
         searched = [item for item in responses if item is not None]
         if not searched:
+            samples = " | ".join(search_failures[:3])
             raise RuntimeError(
-                "Every /replyvideo X search lane failed. Check the twscrape account/cookie."
+                "Every /replyvideo X search lane failed. This is an X/twscrape "
+                "account or transport problem; no Gemini job was started. "
+                f"First errors: {samples or 'no response detail'}"
             )
         combined, search_query_by_url = _combine_reply_target_results(searched)
         combined = self.reply_target_metrics.observe(combined)
@@ -4865,7 +4876,11 @@ def _friendly_error(exc: Exception) -> str:
             "`/importcookie account2 auth_token=...; ct0=...`, or wait if all "
             "accounts are temporarily rate-limited."
         )
-    if "X search failed" in text or "reply-target search lanes failed" in text:
+    if (
+        "X search failed" in text
+        or "reply-target search lanes failed" in text
+        or "/replyvideo X search lane failed" in text
+    ):
         return (
             "Could not search X. No Gemini or Chrome bridge job was started. Check the "
             "imported X cookies, account rate limits, and network access. "

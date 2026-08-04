@@ -7,7 +7,7 @@ from typing import Callable
 from src.models import ImageAttachment
 
 
-MAX_FRAME_BYTES = 600_000
+MAX_FRAME_BYTES = 350_000
 
 
 class VideoFrameError(RuntimeError):
@@ -60,9 +60,9 @@ class VideoFrameExtractor:
                 "-frames:v",
                 "1",
                 "-vf",
-                "scale='min(720,iw)':-2",
+                "scale='min(512,iw)':-2",
                 "-q:v",
-                "5",
+                "6",
                 "-y",
                 str(output),
             ]

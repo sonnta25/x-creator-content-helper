@@ -30,6 +30,8 @@ const AUTOMATION_ALARM = "x-content-bot-scheduled-approvals";
 const RUNTIME_WATCHDOG_ALARM = "x-content-bot-runtime-watchdog";
 const FOLLOW_UP_ALARM = "x-content-bot-follow-up";
 const PROVIDER_RECOVERY_ALARM = "x-content-bot-provider-recovery";
+const PROVIDER_RECOVERY_RETRY_ALARM = "x-content-bot-provider-recovery-retry";
+const ACTIVE_PROVIDER_WATCHDOG_ALARM = "x-content-bot-active-provider-watchdog";
 const BRIDGE_FETCH_TIMEOUT_MS = 15000;
 const TAB_SCRIPT_TIMEOUT_MS = 15000;
 const ATTACHMENT_SCRIPT_TIMEOUT_MS = 45000;
@@ -38,6 +40,8 @@ const PROVIDER_NO_PROGRESS_TIMEOUT_MS = 240000;
 const FINAL_PROVIDER_URL = "https://gemini.google.com/app";
 const FINAL_PROVIDER_NAME = "Gemini";
 const PROVIDER_RECYCLE_AFTER_JOBS = 10;
+const MIN_PROVIDER_TIMEOUT_SECONDS = 120;
+const MAX_PROVIDER_TIMEOUT_SECONDS = 360;
 const PROVIDER_JOB_COUNT_KEY = "providerSuccessfulJobs";
 const PROVIDER_TAB_ID_KEY = "managedProviderTabId";
 const ACTIVE_PROVIDER_JOB_ID_KEY = "activeProviderJobId";
@@ -106,9 +110,16 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     runJobs({ force: false, maxJobs: 1 })
       .catch((error) => setStatus(`Follow-up error: ${error.message || error}`));
   }
-  if (alarm.name === PROVIDER_RECOVERY_ALARM) {
+  if (
+    alarm.name === PROVIDER_RECOVERY_ALARM ||
+    alarm.name === PROVIDER_RECOVERY_RETRY_ALARM
+  ) {
     runJobs({ force: true, maxJobs: 1 })
       .catch((error) => setStatus(`Provider recovery error: ${error.message || error}`));
+  }
+  if (alarm.name === ACTIVE_PROVIDER_WATCHDOG_ALARM) {
+    activeProviderWatchdogTick()
+      .catch((error) => setStatus(`Active job watchdog error: ${error.message || error}`));
   }
 });
 
@@ -179,17 +190,73 @@ async function initializeRuntime() {
   await recoverInterruptedProviderJob();
 }
 
+async function getActiveProviderJobId() {
+  const [local, session] = await Promise.all([
+    chromeStorageGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" }),
+    chromeStorageSessionGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" })
+  ]);
+  return String(
+    session[ACTIVE_PROVIDER_JOB_ID_KEY] ||
+    local[ACTIVE_PROVIDER_JOB_ID_KEY] ||
+    ""
+  );
+}
+
+async function setActiveProviderJobId(jobId) {
+  const value = String(jobId || "");
+  await Promise.all([
+    chromeStorageSet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: value }),
+    chromeStorageSessionSet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: value })
+  ]);
+}
+
 async function recoverInterruptedProviderJob() {
   if (running) return false;
-  const session = await chromeStorageSessionGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" });
-  const interruptedJobId = String(session[ACTIVE_PROVIDER_JOB_ID_KEY] || "");
+  const interruptedJobId = await getActiveProviderJobId();
   if (!interruptedJobId) return false;
-  await chromeStorageSessionSet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" });
-  chrome.alarms.create(PROVIDER_RECOVERY_ALARM, { delayInMinutes: 1.5 });
+  await setActiveProviderJobId("");
+  await chromeAlarmsClear(ACTIVE_PROVIDER_WATCHDOG_ALARM);
+  // Try immediately in case the browser restarted after the 75-second server
+  // lease had already expired, then retry after the lease is certainly stale.
+  chrome.alarms.create(PROVIDER_RECOVERY_ALARM, { delayInMinutes: 0.1 });
+  chrome.alarms.create(PROVIDER_RECOVERY_RETRY_ALARM, { delayInMinutes: 1.5 });
   await setStatus(
     `Detected interrupted Gemini job ${interruptedJobId}. ` +
     "It will be reclaimed after the bridge lease expires."
   );
+  return true;
+}
+
+async function ensureActiveProviderWatchdog() {
+  const existing = await chromeAlarmsGet(ACTIVE_PROVIDER_WATCHDOG_ALARM);
+  if (!existing) {
+    chrome.alarms.create(ACTIVE_PROVIDER_WATCHDOG_ALARM, {
+      delayInMinutes: 0.5,
+      periodInMinutes: 1
+    });
+  }
+}
+
+async function activeProviderWatchdogTick() {
+  const jobId = await getActiveProviderJobId();
+  if (!jobId) {
+    await chromeAlarmsClear(ACTIVE_PROVIDER_WATCHDOG_ALARM);
+    return false;
+  }
+  if (!running) {
+    return recoverInterruptedProviderJob();
+  }
+  const config = await loadConfig();
+  try {
+    await bridgeFetch(config, `/jobs/${jobId}/heartbeat`, {
+      method: "POST",
+      body: {},
+      timeoutMs: 5000
+    });
+  } catch (_error) {
+    // The regular 20-second heartbeat remains primary. A stale server lease is
+    // reclaimed by recoverInterruptedProviderJob if this worker is restarted.
+  }
   return true;
 }
 
@@ -352,11 +419,11 @@ async function syncTelegramAutomationConfig(config) {
   const updatedAt = Number(remote.reply_targets_updated_at || 0);
   const videoMinutes = Number(remote.reply_video_minutes || 0);
   const videoUpdatedAt = Number(remote.reply_video_updated_at || 0);
-  const bridgeTimeoutSeconds = Number(remote.extension_bridge_timeout_seconds || 0);
+  const bridgeTimeoutSeconds = boundedProviderTimeout(
+    remote.extension_bridge_timeout_seconds
+  );
   const automationRunning = Boolean(remote.automation_running);
   if (
-    Number.isFinite(bridgeTimeoutSeconds) &&
-    bridgeTimeoutSeconds >= 30 &&
     bridgeTimeoutSeconds !== config.timeoutSeconds
   ) {
     await chromeStorageSet({ timeoutSeconds: bridgeTimeoutSeconds });
@@ -550,7 +617,8 @@ async function runOneJob(config) {
 async function runGeminiTextJob(config, job, { reportError = true } = {}) {
   let providerStarted = false;
   let providerCompleted = false;
-  await chromeStorageSessionSet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: job.id });
+  await setActiveProviderJobId(job.id);
+  await ensureActiveProviderWatchdog();
   const stopHeartbeat = startJobHeartbeat(config, job.id);
   try {
     const finalPrompt = job.final_prompt;
@@ -589,9 +657,9 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
     throw error;
   } finally {
     stopHeartbeat();
-    const session = await chromeStorageSessionGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" });
-    if (String(session[ACTIVE_PROVIDER_JOB_ID_KEY] || "") === String(job.id)) {
-      await chromeStorageSessionSet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: "" });
+    if (await getActiveProviderJobId() === String(job.id)) {
+      await setActiveProviderJobId("");
+      await chromeAlarmsClear(ACTIVE_PROVIDER_WATCHDOG_ALARM);
     }
   }
 }
@@ -2102,6 +2170,15 @@ function injectedDiagnoseDom() {
   return reportLines.join("\n");
 }
 
+function boundedProviderTimeout(value) {
+  const parsed = Number(value || DEFAULTS.timeoutSeconds);
+  const finite = Number.isFinite(parsed) ? parsed : DEFAULTS.timeoutSeconds;
+  return Math.min(
+    MAX_PROVIDER_TIMEOUT_SECONDS,
+    Math.max(MIN_PROVIDER_TIMEOUT_SECONDS, finite)
+  );
+}
+
 async function loadConfig() {
   const [saved, session] = await Promise.all([
     chromeStorageGet(DEFAULTS),
@@ -2110,7 +2187,7 @@ async function loadConfig() {
   return {
     bridgeUrl: String(saved.bridgeUrl || DEFAULTS.bridgeUrl).replace(/\/$/, ""),
     token: String(saved.token || DEFAULTS.token),
-    timeoutSeconds: Math.max(30, Number(saved.timeoutSeconds || DEFAULTS.timeoutSeconds)),
+    timeoutSeconds: boundedProviderTimeout(saved.timeoutSeconds),
     autoRun: Boolean(saved.autoRun),
     pollSeconds: Math.max(
       saved.lowResourceMode === false ? 30 : 60,
@@ -2147,7 +2224,7 @@ async function saveConfig(config) {
   await chromeStorageSet({
     bridgeUrl: String(config.bridgeUrl || DEFAULTS.bridgeUrl).replace(/\/$/, ""),
     token: String(config.token || DEFAULTS.token),
-    timeoutSeconds: Math.max(30, Number(config.timeoutSeconds || DEFAULTS.timeoutSeconds)),
+    timeoutSeconds: boundedProviderTimeout(config.timeoutSeconds),
     autoRun: Boolean(config.autoRun),
     pollSeconds: Math.max(
       config.lowResourceMode === false ? 30 : 60,

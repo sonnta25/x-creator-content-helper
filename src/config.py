@@ -181,7 +181,10 @@ class Settings:
                 "local-bridge-change-me",
             ).strip()
             or "local-bridge-change-me",
-            extension_bridge_timeout_seconds=_int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 360),
+            extension_bridge_timeout_seconds=min(
+                360,
+                max(120, _int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 360)),
+            ),
             telegram_approval_chat_id=_optional_int_env("TELEGRAM_APPROVAL_CHAT_ID"),
             telegram_reply_targets_minutes=_optional_int_env(
                 "TELEGRAM_REPLY_TARGETS_MINUTES"

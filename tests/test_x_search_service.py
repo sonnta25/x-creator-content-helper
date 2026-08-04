@@ -1,6 +1,8 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+import src.x_search_service as x_search_service_module
 from src.models import XSearchResult, XTrend
 from src.config import Settings
 import pytest
@@ -18,6 +20,53 @@ from src.x_search_service import (
     recent_search_query,
 )
 from src.x_search_service import XSearchService
+
+
+def test_x_search_service_serializes_overlapping_searches(monkeypatch) -> None:
+    class FakeApi:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        def search(self, query, **_kwargs):
+            async def stream():
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    await asyncio.sleep(0.01)
+                    yield SimpleNamespace(query=query)
+                finally:
+                    self.active -= 1
+
+            return stream()
+
+    async def exercise() -> None:
+        service = XSearchService(Settings(telegram_bot_token="123:ABC"))
+        api = FakeApi()
+        service._api = api
+        monkeypatch.setattr(
+            x_search_service_module,
+            "_to_search_result",
+            lambda tweet: XSearchResult(
+                id=1,
+                username="source",
+                display_name="Source",
+                text=tweet.query,
+                created_at="",
+                url=f"https://x.com/source/status/{tweet.query}",
+            ),
+        )
+
+        first, second = await asyncio.gather(
+            service.search("one", limit=1),
+            service.search("two", limit=1),
+        )
+
+        assert first[0].text.endswith("lang:en")
+        assert second[0].text.endswith("lang:en")
+        assert api.max_active == 1
+
+    asyncio.run(exercise())
 
 
 def test_trend_categories_match_supported_twscrape_ids() -> None:

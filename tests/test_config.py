@@ -72,6 +72,7 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
         "REPLY_VIDEO_MAX_AGE_MINUTES=40\n"
         "REPLY_VIDEO_FRAME_ANALYSIS=false\n"
         "REPLY_VIDEO_FRAME_COUNT=3\n"
+        "EXTENSION_BRIDGE_TIMEOUT_SECONDS=600\n"
         "REPLY_TARGET_MAX_AGE_MINUTES=480\n"
         "REPLY_TARGET_LANGUAGES=en,ja,ko\n"
         "REPLY_TARGET_METRICS_PATH=data/test-reply-metrics.json\n"
@@ -107,6 +108,7 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
     assert settings.reply_video_max_age_minutes == 40
     assert settings.reply_video_frame_analysis is False
     assert settings.reply_video_frame_count == 3
+    assert settings.extension_bridge_timeout_seconds == 360
     assert settings.reply_target_max_age_minutes == 480
     assert settings.reply_target_languages == "en,ja,ko"
     assert settings.reply_target_metrics_path == "data/test-reply-metrics.json"

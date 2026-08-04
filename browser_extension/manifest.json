@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Content Bot Bridge",
-  "version": "0.8.4",
+  "version": "0.8.6",
   "description": "Runs scheduled Gemini reply jobs for the Telegram approval workflow.",
   "permissions": ["storage", "tabs", "scripting", "alarms", "activeTab"],
   "host_permissions": [

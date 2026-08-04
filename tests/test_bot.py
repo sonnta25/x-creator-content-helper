@@ -577,6 +577,38 @@ def test_replyvideo_queries_cover_global_english_japanese_and_vietnamese() -> No
     assert "min_faves:80 lang:vi" in lanes["Vietnamese"]
 
 
+def test_replyvideo_search_lanes_are_serialized_for_one_cookie_pool() -> None:
+    class FakeSearch:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.calls = 0
+
+        async def search_recent(self, query, **_kwargs):
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.002)
+            self.active -= 1
+            return query, []
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+    search = FakeSearch()
+    bot.x_search = search
+
+    _label, results, _tier = asyncio.run(
+        bot._get_reply_video_context("", Status())
+    )
+
+    assert results == []
+    assert search.calls == 8
+    assert search.max_active == 1
+
+
 def test_replyvideo_mix_prefers_two_global_and_one_vietnamese() -> None:
     results = [
         XSearchResult(id=1, username="a", display_name="", text="a", created_at="", url="1", language="en"),

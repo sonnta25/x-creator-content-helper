@@ -176,6 +176,10 @@ is not reliable and `REPLY_VIDEO_FRAME_ANALYSIS=true`, the bot downloads the vid
 extracts a small number of representative frames, sends them to Gemini, and removes
 temporary media after processing.
 
+Global, English, Japanese, and Vietnamese `Top`/`Latest` searches are serialized with
+tracking and account checks. This deliberately trades a little scan speed for reliable
+operation when the twscrape pool contains only one usable cookie account.
+
 Frames are evidence samples, not full audio or motion analysis. The prompt forbids
 inventing speech, timing, identity, location, intent, or outcomes that are not visible
 or stated.
@@ -327,15 +331,18 @@ Logs are written to `logs/bot.out.log` and `logs/bot.err.log`.
 6. Enable **Auto Run** for queued Gemini work and **Automation** for schedules.
 7. Keep low-resource mode enabled on a small VPS.
 
-The required extension version is `0.8.4`. After replacing project files, press
+The required extension version is `0.8.6`. After replacing project files, press
 **Reload** on the extension card whenever `browser_extension/` changed.
 
-Version `0.8.4` allows up to 60 seconds for Gemini's editor to accept and submit a
+Version `0.8.6` allows up to 60 seconds for Gemini's editor to accept and submit a
 large reply-target prompt on a low-spec VPS, while still bounding frame upload and
-DOM-read operations. It also
-reduces expensive shadow-DOM scans; fails a no-progress Gemini response after four
-minutes; and reclaims an interrupted job after the bridge lease expires. It cannot
-restart the entire Chrome process if Chrome itself is closed or crashes.
+DOM-read operations. It also reduces expensive shadow-DOM scans; fails a no-progress
+Gemini response after four minutes; uses a lightweight watchdog only while a provider
+job is active; and requeues an interrupted job as soon as its heartbeat lease expires.
+The active job ID is persisted across Chrome/extension restarts, with an immediate
+reclaim attempt and a second attempt after the lease expires. Video evidence frames
+are capped at 512 pixels and 350 KB to reduce Chrome memory use. The extension cannot
+restart the entire Chrome process if Chrome itself is closed or remains frozen.
 
 ## Important `.env` settings
 
@@ -376,8 +383,9 @@ Prefer `/importcookie`, `/replylangs`, `/replygoal`, `/replycap`, `/replybatch`,
 `/replyevery`, and `/videoevery` for settings supported from Telegram. Those commands
 update the running bot immediately and persist supported values to `.env`.
 
-Do not increase the bridge timeout simply to hide a stuck provider tab. Extension
-`0.8.4` should fail and recycle a stalled tab earlier.
+Do not increase the bridge timeout simply to hide a stuck provider tab. Values are
+clamped to 120-360 seconds, and extension `0.8.6` should recover or recycle a stalled
+tab earlier.
 
 ## Media downloads
 
@@ -431,10 +439,11 @@ node --check browser_extension\background.js
 
 - **No reply-ready posts:** run `/setupcheck` and `/xaccounts`; refresh X cookies if
   the pool reports authentication, challenge, or rate-limit errors.
-- **Chrome never claimed the job:** reload extension `0.8.4`, verify the bridge URL
+- **Chrome never claimed the job:** reload extension `0.8.6`, verify the bridge URL
   and token, and enable Auto Run or click **Run next job**.
-- **Heartbeat stopped:** keep Chrome open. Version `0.8.4` can recover an interrupted
-  MV3 worker or tab operation, but not a terminated Chrome process.
+- **Heartbeat stopped:** keep Chrome open. Version `0.8.6` adds a per-job watchdog and
+  lease-based requeue for an interrupted MV3 worker, but cannot recover a terminated or
+  completely frozen Chrome process.
 - **Gemini made no readable progress:** inspect the managed Gemini tab for login,
   verification, quota, or usage-limit messages.
 - **Video frame upload failed:** confirm Gemini is logged in and reload the extension;

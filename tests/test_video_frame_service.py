@@ -14,6 +14,8 @@ def test_frame_extractor_returns_named_jpeg_attachments(tmp_path: Path) -> None:
 
     def runner(command, **kwargs):
         assert kwargs["timeout"] == 45
+        assert "scale='min(512,iw)':-2" in command
+        assert command[command.index("-q:v") + 1] == "6"
         Path(command[-1]).write_bytes(b"j" * 400)
         return SimpleNamespace(returncode=0, stderr="")
 

@@ -271,6 +271,16 @@ adaptive pace, and 30-60 seconds in high pace. Strict risk mode always keeps at 
 the 120-240 second window. Open risk mode removes its language/category caps but no
 longer disables card-delivery spacing.
 
+The queue is bounded by `REPLY_PENDING_QUEUE_CAP` (default 5). Discovery pauses before
+Gemini when fewer than two slots remain, preventing scheduled runs from creating drafts
+faster than the operator can review them. A queued card older than two minutes is
+re-fetched from X immediately before delivery; stale or newly crowded targets are
+expired, while temporary X lookup failures retry without sending an unverified card.
+Creation and Telegram delivery both use process-wide asynchronous locks, so overlapping
+commands cannot create duplicate approvals or send the same card twice.
+Target and video discovery also share one scan slot; their per-lane X timeouts therefore
+start without competing against another full scan for the same twscrape cookie pool.
+
 A queued card is marked as delivered only after Telegram returns a message receipt.
 Transient Telegram delivery failures keep the card unsent and retry after 15, 30, 60,
 then at most 120 seconds while its approval remains fresh. On the first restart after
@@ -288,6 +298,11 @@ not need to send the reply URL back. It samples public metrics around 15 minutes
 1 hour, 6 hours, and 24 hours. Original-author responses are checked more frequently
 and immediately create a Telegram follow-up card with **Continue conversation** and
 **Stop here**.
+
+Tracking is work-budgeted with `REPLY_TRACKING_CHECKS_PER_CYCLE` (default 8). Recent
+author responses are checked first, then due metric checkpoints, then older response
+checks. This keeps a single twscrape cookie pool responsive even when the account has
+hundreds of tracked replies.
 
 One verified direct response to the user's reply may also enter `/inbox`. This broadens
 the conversation workflow without drafting for every low-value notification. Follower
@@ -325,7 +340,7 @@ eligibility, profile visits, or exact revenue attributable to one reply.
 `/pace adaptive` converts the daily cap into a rolling hourly ceiling. `/risk` adds an
 anti-reply-farming layer based on approved cards:
 
-- `strict`: at most 12 approved replies/hour; Japanese 20/day and 4/hour; unrelated
+- `strict`: at most 12 approved replies/hour; Japanese 20/day and 2/hour; unrelated
   approvals are spaced by a stable 120-240 second safety window;
 - `balanced` (recommended): at most 20/hour; Japanese 30/day and 6/hour; unrelated
   approvals are spaced by 60-120 seconds;
@@ -390,7 +405,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 `setup.ps1` creates `.venv`, installs dependencies, asks for the Telegram token, and
 creates or updates `.env` while preserving supported operator settings. It then starts
 one hidden bot process, so a separate `start.ps1` call is not needed after setup.
-`start.ps1` is used for later routine starts and checks dependency changes first.
+Dependencies are constrained by `requirements.lock`, the exact versions validated by
+the test suite. `start.ps1` refuses to modify the venv while a current or older bot copy
+is running.
 
 Operational commands:
 
@@ -398,7 +415,12 @@ Operational commands:
 .\scripts\windows\status.ps1
 .\scripts\windows\stop.ps1
 .\scripts\windows\start.ps1
+.\scripts\windows\restart.ps1
 ```
+
+After extracting an update, use `restart.ps1`. It stops bot processes from both the
+current folder and recognized older `x-content-bot` folders, verifies they exited,
+synchronizes locked dependencies, and starts exactly one updated instance.
 
 Logs are written to `logs/bot.out.log` and `logs/bot.err.log`.
 
@@ -460,11 +482,13 @@ CREATOR_DAILY_REPLY_CAP=500
 REPLY_AUTHOR_DAILY_CAP=5
 REPLY_TARGET_BATCH_SIZE=3
 REPLY_VIDEO_BATCH_SIZE=3
+REPLY_PENDING_QUEUE_CAP=5
 
 REPLY_VIDEO_FRAME_ANALYSIS=true
 REPLY_VIDEO_FRAME_COUNT=2
 REPLY_LEARNING_ENABLED=true
 REPLY_TRACKING_POLL_MINUTES=5
+REPLY_TRACKING_CHECKS_PER_CYCLE=8
 REPLY_DAILY_DIGEST_HOUR=22
 ```
 
@@ -475,6 +499,10 @@ update the running bot immediately and persist supported values to `.env`.
 Do not increase the bridge timeout simply to hide a stuck provider tab. Values are
 clamped to 120-360 seconds, and extension `0.8.8` should recover or recycle a stalled
 tab earlier.
+
+The bridge serializes scheduled, manual, revision, and tracking Gemini requests. A
+request waiting behind another job does not start its provider timeout until it reaches
+the front of the queue, preventing false timeouts caused only by local job contention.
 
 ## Media downloads
 
@@ -539,9 +567,9 @@ node --check browser_extension\background.js
 - **Video frame upload failed:** confirm Gemini is logged in and reload the extension;
   set `REPLY_VIDEO_FRAME_ANALYSIS=false` if the VPS cannot handle frame analysis.
 - **Dependency import traceback:** run `setup.ps1` again if `.venv` is missing or
-  damaged. Normal updates only require `start.ps1`.
-- **Telegram `Conflict: terminated by other getUpdates request`:** stop duplicate bot
-  processes and keep exactly one polling instance.
+  damaged. After normal code updates, use `restart.ps1`.
+- **Telegram `Conflict: terminated by other getUpdates request`:** run `restart.ps1`
+  from the updated folder; it removes recognized older bot copies before starting.
 - **Old menu remains visible:** restart the updated bot, send `/menu` once, then select
   a command; the one-time keyboard will collapse.
 

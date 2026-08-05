@@ -27,11 +27,13 @@ class Settings:
     reply_learning_path: str = "data/reply_learning.json"
     revenue_ops_path: str = "data/revenue_ops.json"
     reply_tracking_poll_minutes: int = 5
+    reply_tracking_checks_per_cycle: int = 8
     reply_watch_path: str = "data/reply_watchlist.json"
     reply_target_mode: str = "balanced"
     creator_goal: str = "qualify"
     reply_target_batch_size: int = 3
     reply_video_batch_size: int = 3
+    reply_pending_queue_cap: int = 5
     reply_session_minutes: int = 20
     reply_author_daily_cap: int = 5
     stale_mobile_approval_hours: int = 6
@@ -110,6 +112,10 @@ class Settings:
             reply_tracking_poll_minutes=max(
                 1, _int_env("REPLY_TRACKING_POLL_MINUTES", 5)
             ),
+            reply_tracking_checks_per_cycle=min(
+                50,
+                max(2, _int_env("REPLY_TRACKING_CHECKS_PER_CYCLE", 8)),
+            ),
             reply_watch_path=os.getenv(
                 "REPLY_WATCH_PATH", "data/reply_watchlist.json"
             ).strip()
@@ -131,6 +137,10 @@ class Settings:
             reply_video_batch_size=min(
                 5,
                 max(2, _int_env("REPLY_VIDEO_BATCH_SIZE", 3)),
+            ),
+            reply_pending_queue_cap=min(
+                20,
+                max(2, _int_env("REPLY_PENDING_QUEUE_CAP", 5)),
             ),
             creator_daily_reply_cap=max(
                 1, _int_env("CREATOR_DAILY_REPLY_CAP", 500)

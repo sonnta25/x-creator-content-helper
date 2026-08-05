@@ -58,6 +58,10 @@ class ExtensionBridgeServer:
         self._jobs: OrderedDict[str, ExtensionBridgeJob] = OrderedDict()
         self._server: asyncio.AbstractServer | None = None
         self._lock = asyncio.Lock()
+        # One Chrome/Gemini tab can reliably complete only one provider job at
+        # a time. Queue callers before their timeout starts so a manual command
+        # cannot expire while a scheduled or tracking job is still running.
+        self._submission_lock = asyncio.Lock()
         self._automation_handler: AutomationBridgeHandler | None = None
 
     def set_automation_handler(self, handler: AutomationBridgeHandler) -> None:
@@ -85,15 +89,16 @@ class ExtensionBridgeServer:
         *,
         attachments: list[ImageAttachment] | None = None,
     ) -> str:
-        await self.start()
-        job = ExtensionBridgeJob(
-            id=secrets.token_urlsafe(12),
-            final_prompt=gemini_single_pass_prompt(prompt),
-            attachments=_attachment_payloads(attachments or []),
-        )
-        async with self._lock:
-            self._jobs[job.id] = job
-        return await self._wait_for_job(job)
+        async with self._submission_lock:
+            await self.start()
+            job = ExtensionBridgeJob(
+                id=secrets.token_urlsafe(12),
+                final_prompt=gemini_single_pass_prompt(prompt),
+                attachments=_attachment_payloads(attachments or []),
+            )
+            async with self._lock:
+                self._jobs[job.id] = job
+            return await self._wait_for_job(job)
 
     async def _wait_for_job(self, job: ExtensionBridgeJob) -> str:
         configured_timeout = float(self.settings.extension_bridge_timeout_seconds)

@@ -34,6 +34,7 @@ def test_reply_farming_guardrails_follow_risk_mode() -> None:
 
     assert strict.global_hourly_cap == 12
     assert strict.japanese_daily_cap == 20
+    assert strict.japanese_hourly_cap == 2
     assert balanced.global_hourly_cap == 20
     assert balanced.japanese_daily_cap == 30
     assert balanced.japanese_hourly_cap == 6

@@ -42,6 +42,7 @@ from src.bot import (
     MENU_SETTINGS,
     MENU_VIDEO_SCHEDULE,
     _command_payload,
+    _counts_toward_health_circuit_breaker,
     _dedupe_queries,
     _exception_detail,
     _extract_media_url,
@@ -91,6 +92,15 @@ def test_parse_importcookie_args_default_account() -> None:
 
     assert account == "telegram_bot"
     assert cookie == "auth_token=abc; ct0=def"
+
+
+def test_content_rejection_does_not_pause_infrastructure_health_circuit() -> None:
+    assert not _counts_toward_health_circuit_breaker(
+        RuntimeError("AI returned no usable reply targets after one repair")
+    )
+    assert _counts_toward_health_circuit_breaker(
+        RuntimeError("Extension bridge timed out waiting for Chrome")
+    )
 
 
 def test_parse_importcookie_args_named_account() -> None:
@@ -424,6 +434,36 @@ def test_japanese_guardrail_counts_only_approved_cards(tmp_path) -> None:
     )
 
     assert bot._japanese_reply_slots_remaining() == 0
+
+
+def test_strict_risk_spreads_japanese_approvals_to_two_per_hour(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    bot.revenue_ops.set_risk_mode("strict")
+
+    for index in range(2):
+        approval = bot.approvals.create(
+            kind="reply",
+            text=f"Strict Japanese reply {index}",
+            chat_id=1,
+            approver_user_id=1,
+            metadata={"language": "ja", "root_author": f"strict-author{index}"},
+        )
+        bot.approvals.decide(
+            approval.id,
+            approve=True,
+            chat_id=1,
+            user_id=1,
+            destination="mobile",
+        )
+        assert bot._japanese_reply_slots_remaining() == 1 - index
 
 
 def test_natural_spacing_delays_delivery_without_blocking_approval(tmp_path) -> None:
@@ -811,6 +851,270 @@ def test_reply_delivery_is_global_across_overlapping_batches(tmp_path) -> None:
         bot._send_next_reply_delivery("video-batch", respect_pacing=False)
     ) is True
     assert sent == [queued.id]
+
+
+def test_concurrent_reply_delivery_calls_send_one_card_only(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Only one Telegram card",
+        chat_id=1,
+        approver_user_id=1,
+        target_url="https://x.com/source/status/12",
+        metadata={
+            "reply_delivery_queue_id": "race-batch",
+            "reply_delivery_queue_index": 0,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    bot._reply_approval_delay_seconds = lambda _approval: 0
+    sent = []
+
+    async def send(item):
+        sent.append(item.id)
+        await asyncio.sleep(0.02)
+        return SimpleNamespace(message_id=99)
+
+    bot._send_approval = send
+
+    async def deliver_twice():
+        await asyncio.gather(
+            bot._send_next_reply_delivery("race-batch", respect_pacing=True),
+            bot._send_next_reply_delivery("race-batch", respect_pacing=True),
+        )
+
+    asyncio.run(deliver_twice())
+
+    assert sent == [approval.id]
+
+
+def test_reply_target_and_video_discovery_share_one_scan_slot(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    active = 0
+    maximum_active = 0
+
+    async def run_scan(label):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return label, [], ""
+
+    async def target_scan(*_args, **_kwargs):
+        return await run_scan("targets")
+
+    async def video_scan(*_args, **_kwargs):
+        return await run_scan("videos")
+
+    bot._get_reply_target_context_locked = target_scan
+    bot._get_reply_video_context_locked = video_scan
+
+    async def discover_both():
+        return await asyncio.gather(
+            bot._get_reply_target_context("", SimpleNamespace()),
+            bot._get_reply_video_context("", SimpleNamespace()),
+        )
+
+    results = asyncio.run(discover_both())
+
+    assert maximum_active == 1
+    assert [item[0] for item in results] == ["targets", "videos"]
+
+
+def test_stale_queued_card_is_expired_before_telegram_delivery(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Stale queued card",
+        chat_id=1,
+        approver_user_id=1,
+        target_url="https://x.com/source/status/13",
+        metadata={
+            "reply_delivery_queue_id": "stale-batch",
+            "reply_delivery_queue_index": 0,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    approval.created_at = datetime.now(UTC) - timedelta(minutes=3)
+    sent = []
+
+    async def closed(_approval):
+        return False, "The discussion became too crowded."
+
+    async def send(item):
+        sent.append(item.id)
+
+    bot._queued_reply_delivery_status = closed
+    bot._send_approval = send
+
+    asyncio.run(
+        bot._send_next_reply_delivery("stale-batch", respect_pacing=False)
+    )
+
+    assert sent == []
+    assert bot.approvals.get(approval.id).status == "expired"
+
+
+def test_unverified_stale_card_is_retried_without_telegram_delivery(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Temporarily unverifiable card",
+        chat_id=1,
+        approver_user_id=1,
+        target_url="https://x.com/source/status/14",
+        metadata={
+            "reply_delivery_queue_id": "retry-batch",
+            "reply_delivery_queue_index": 0,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    approval.created_at = datetime.now(UTC) - timedelta(minutes=3)
+    sent = []
+    retries = []
+
+    async def unknown(_approval):
+        return None, "X lookup timed out"
+
+    async def send(item):
+        sent.append(item.id)
+
+    def schedule(*args, **kwargs):
+        retries.append((args, kwargs))
+
+    bot._queued_reply_delivery_status = unknown
+    bot._send_approval = send
+    bot._schedule_delayed_approval_queue = schedule
+
+    asyncio.run(
+        bot._send_next_reply_delivery("retry-batch", respect_pacing=False)
+    )
+
+    stored = bot.approvals.get(approval.id)
+    assert sent == []
+    assert stored.status == "pending"
+    assert stored.metadata["reply_delivery_last_error"] == "X lookup timed out"
+    assert len(retries) == 1
+
+
+def test_full_pending_queue_skips_gemini_generation(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+            reply_pending_queue_cap=2,
+        )
+    )
+    for index in range(2):
+        bot.approvals.create(
+            kind="reply",
+            text=f"Pending {index}",
+            chat_id=1,
+            approver_user_id=1,
+            target_url=f"https://x.com/pending/status/{20 + index}",
+            metadata={
+                "reply_delivery_queue_id": "existing-batch",
+                "reply_delivery_queue_index": index,
+                "reply_delivery_card_sent": index == 0,
+            },
+        )
+
+    class FailAI:
+        async def generate_reply_targets(self, *_args, **_kwargs):
+            raise AssertionError("Gemini must not run while the queue is full")
+
+    bot.ai = FailAI()
+    candidates = [
+        XSearchResult(
+            id=30 + index,
+            username=f"candidate{index}",
+            display_name="Candidate",
+            text="Fresh candidate",
+            created_at="",
+            url=f"https://x.com/candidate/status/{30 + index}",
+        )
+        for index in range(2)
+    ]
+
+    result = asyncio.run(
+        bot._create_reply_approvals(
+            candidates,
+            query="test",
+            chat_id=1,
+            approver_user_id=1,
+        )
+    )
+
+    assert result.created == 0
+    assert "global reply-card queue" in result.diagnostic()
+
+
+def test_tracking_cycle_budget_prioritizes_recent_responses_and_checkpoints() -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            reply_tracking_checks_per_cycle=2,
+        )
+    )
+    now = datetime.now(UTC)
+    records = [
+        {
+            "approval_id": "old-author",
+            "posted_at": (now - timedelta(hours=8)).isoformat(),
+            "author_due": True,
+            "checkpoint_due": False,
+        },
+        {
+            "approval_id": "checkpoint",
+            "posted_at": (now - timedelta(hours=2)).isoformat(),
+            "author_due": False,
+            "checkpoint_due": True,
+        },
+        {
+            "approval_id": "recent-author",
+            "posted_at": (now - timedelta(minutes=20)).isoformat(),
+            "author_due": True,
+            "checkpoint_due": False,
+        },
+    ]
+    bot.reply_learning.due_checkpoint = (
+        lambda record, *, now: 60 if record["checkpoint_due"] else None
+    )
+    bot.reply_learning.author_response_check_due = (
+        lambda record, *, now: bool(record["author_due"])
+    )
+
+    selected = bot._tracking_records_for_cycle(records, now=now)
+
+    assert [record["approval_id"] for record in selected] == [
+        "recent-author",
+        "checkpoint",
+    ]
 
 
 def test_failed_telegram_delivery_stays_unsent_and_retries(tmp_path) -> None:
@@ -1879,6 +2183,107 @@ def test_stop_here_marks_the_parent_conversation_stopped(tmp_path) -> None:
     assert bot.approvals.get(followup.id).status == "rejected"
     assert bot.reply_learning.data["records"][parent.id]["conversation_stopped"] is True
     assert "Conversation stopped" in edits[0][0][0]
+
+
+def test_saved_approval_releases_queue_even_when_telegram_edit_fails(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Approved despite edit failure",
+        chat_id=123,
+        approver_user_id=456,
+        target_url="https://x.com/source/status/42",
+        metadata={
+            "reply_strategy": "specific_observation",
+            "root_author": "source",
+            "reply_delivery_queue_id": "batch-edit-failure",
+            "reply_delivery_queue_index": 0,
+            "reply_delivery_card_sent": True,
+        },
+    )
+    released = []
+    error_messages = []
+
+    async def release(queue_id, *, respect_pacing):
+        released.append((queue_id, respect_pacing))
+        return True
+
+    class Message:
+        chat = SimpleNamespace(id=123)
+        text = "Approval card"
+
+        async def reply_text(self, text, **_kwargs):
+            error_messages.append(text)
+
+    class FakeQuery:
+        data = f"automation:mobile:{approval.id}"
+        from_user = SimpleNamespace(id=456)
+        message = Message()
+
+        async def answer(self, *_args, **_kwargs):
+            return None
+
+        async def edit_message_text(self, *_args, **_kwargs):
+            raise RuntimeError("Telegram edit failed")
+
+    bot._send_next_reply_delivery = release
+
+    asyncio.run(
+        bot.automation_approval(
+            SimpleNamespace(callback_query=FakeQuery()),
+            SimpleNamespace(),
+        )
+    )
+
+    assert bot.approvals.get(approval.id).status == "mobile_approved"
+    assert released == [("batch-edit-failure", True)]
+    assert "queue" in error_messages[0].lower()
+
+
+def test_daily_digest_marker_is_written_only_after_telegram_delivery(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            reply_learning_path=str(tmp_path / "learning.json"),
+            creator_timezone="UTC",
+            reply_daily_digest_hour=0,
+        )
+    )
+    bot.approval_chat_id = 123
+    bot.reply_learning.report = lambda *_args, **_kwargs: {
+        "posted": 1,
+        "measured": 1,
+        "median_views": 10_000,
+        "over_5k": 1,
+        "over_20k": 0,
+        "over_50k": 0,
+        "author_response_rate": 0.25,
+        "by_language": {},
+        "by_source": {},
+        "by_strategy": {},
+    }
+
+    class FailingTelegramBot:
+        async def send_message(self, **_kwargs):
+            raise RuntimeError("Telegram temporarily unavailable")
+
+    bot._application = SimpleNamespace(bot=FailingTelegramBot())
+    now = datetime(2026, 8, 5, 22, 0, tzinfo=UTC)
+
+    try:
+        asyncio.run(bot._maybe_send_daily_digest(now))
+    except RuntimeError as exc:
+        assert "Telegram temporarily unavailable" in str(exc)
+    else:
+        raise AssertionError("The Telegram failure should be visible to the scheduler")
+
+    assert bot.reply_learning.last_digest_date == ""
 
 
 def test_mobile_post_falls_back_to_a_short_composer_url_when_draft_is_long() -> None:

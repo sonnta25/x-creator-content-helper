@@ -21,12 +21,14 @@ def test_settings_defaults() -> None:
     assert settings.reply_learning_enabled is True
     assert settings.reply_learning_path == "data/reply_learning.json"
     assert settings.reply_tracking_poll_minutes == 5
+    assert settings.reply_tracking_checks_per_cycle == 8
     assert settings.reply_watch_path == "data/reply_watchlist.json"
     assert settings.reply_target_mode == "balanced"
     assert settings.creator_goal == "qualify"
     assert settings.creator_daily_reply_cap == 500
     assert settings.reply_target_batch_size == 3
     assert settings.reply_video_batch_size == 3
+    assert settings.reply_pending_queue_cap == 5
     assert settings.reply_session_minutes == 20
     assert settings.revenue_ops_path == "data/revenue_ops.json"
     assert settings.reply_author_daily_cap == 5
@@ -81,11 +83,13 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
         "REPLY_LEARNING_PATH=data/test-reply-learning.json\n"
         "REVENUE_OPS_PATH=data/test-revenue-ops.json\n"
         "REPLY_TRACKING_POLL_MINUTES=3\n"
+        "REPLY_TRACKING_CHECKS_PER_CYCLE=11\n"
         "REPLY_WATCH_PATH=data/test-reply-watch.json\n"
         "REPLY_TARGET_MODE=relationship\n"
         "CREATOR_DAILY_REPLY_CAP=6\n"
         "REPLY_TARGET_BATCH_SIZE=5\n"
         "REPLY_VIDEO_BATCH_SIZE=2\n"
+        "REPLY_PENDING_QUEUE_CAP=7\n"
         "CREATOR_TIMEZONE=Asia/Tokyo\n"
         "DOWNLOAD_MAX_FILE_MB=40\nDOWNLOAD_TIMEOUT_SECONDS=120\n"
         "DOWNLOAD_COOKIES_FILE=data/cookies.txt\n"
@@ -117,11 +121,13 @@ def test_settings_from_env_loads_project_env_when_cwd_changes(monkeypatch, tmp_p
     assert settings.reply_learning_path == "data/test-reply-learning.json"
     assert settings.revenue_ops_path == "data/test-revenue-ops.json"
     assert settings.reply_tracking_poll_minutes == 3
+    assert settings.reply_tracking_checks_per_cycle == 11
     assert settings.reply_watch_path == "data/test-reply-watch.json"
     assert settings.reply_target_mode == "relationship"
     assert settings.creator_daily_reply_cap == 6
     assert settings.reply_target_batch_size == 5
     assert settings.reply_video_batch_size == 2
+    assert settings.reply_pending_queue_cap == 7
     assert settings.creator_timezone == "Asia/Tokyo"
     assert settings.download_max_file_mb == 40
     assert settings.download_timeout_seconds == 120

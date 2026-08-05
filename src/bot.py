@@ -107,12 +107,15 @@ REPLY_VIDEO_RESULT_LIMIT = 16
 REPLY_VIDEO_CONTEXT_ITEMS = 3
 REPLY_VIDEO_MIN_BATCH_ITEMS = 2
 REPLY_VIDEO_GLOBAL_LANGUAGES = ("en", "ja", "ko", "es", "pt", "zh-cn")
-BOT_RUNTIME_REVISION = "revenue-ops-v2"
+BOT_RUNTIME_REVISION = "stability-queue-v3"
 REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
+REPLY_TARGET_POOL_TIMEOUT_SECONDS = 70
 REPLY_TARGET_REFRESH_TIMEOUT_SECONDS = 12
 REPLY_TARGET_REFRESH_LIMIT = 6
 GLOBAL_REPLY_DELIVERY_QUEUE_ID = "global-reply-delivery"
+REPLY_DELIVERY_REVALIDATE_AFTER_SECONDS = 120
+REPLY_DELIVERY_RETRY_SECONDS = 30
 COMMAND_INPUT_TIMEOUT_SECONDS = 5 * 60
 COMMAND_INPUT_PROMPTS = {
     "download": (
@@ -373,6 +376,7 @@ class _ReplyApprovalCreationResult:
     filtered_active: int = 0
     filtered_missing_source: int = 0
     filtered_closed: int = 0
+    filtered_unverified: int = 0
     filtered_duplicate: int = 0
     blocked_reason: str = ""
 
@@ -388,6 +392,7 @@ class _ReplyApprovalCreationResult:
             ("already active", self.filtered_active),
             ("URL not in the selected pool", self.filtered_missing_source),
             ("stale after refresh", self.filtered_closed),
+            ("could not be revalidated", self.filtered_unverified),
             ("similar to a recent reply", self.filtered_duplicate),
             ("per-author limit", self.filtered_author_limit),
             ("Japanese safety limit", self.filtered_language_limit),
@@ -439,6 +444,9 @@ class ContentBot:
         self.media_downloader = MediaDownloadService(settings)
         self.video_frame_extractor = VideoFrameExtractor()
         self._download_semaphore = asyncio.Semaphore(1)
+        self._reply_discovery_lock = asyncio.Lock()
+        self._reply_creation_lock = asyncio.Lock()
+        self._reply_delivery_lock = asyncio.Lock()
         self._x_account_error_notices: dict[str, str] = {}
         self.approvals = AutomationApprovalStore(settings.automation_approvals_path)
         self._approval_migration = self.approvals.migrate_reply_only(
@@ -1302,6 +1310,13 @@ class ContentBot:
                 "Use /pace resume after checking /setupcheck."
             )
             return
+        if self._reply_delivery_slots_remaining() < MIN_REPLY_TARGET_BATCH_ITEMS:
+            await message.reply_text(
+                "The global reply-card queue is full. Process the current card(s) before "
+                f"starting a new session ({self._pending_reply_delivery_count()}/"
+                f"{self.settings.reply_pending_queue_cap} pending)."
+            )
+            return
 
         remaining_cap = max(
             0,
@@ -1958,6 +1973,10 @@ class ContentBot:
             f"Video-reply schedule: {self.settings.telegram_reply_video_minutes or 'extension default (5)'} minutes\n"
             f"Reply cards per run: targets {self.settings.reply_target_batch_size}; "
             f"video {self.settings.reply_video_batch_size}\n"
+            f"Global pending queue: {self._pending_reply_delivery_count()}/"
+            f"{self.settings.reply_pending_queue_cap}\n"
+            f"Tracking checks per cycle: "
+            f"{self.settings.reply_tracking_checks_per_cycle}\n"
             f"Timezone: {self.settings.creator_timezone}\n"
             f"Stale mobile approvals: {stale_mobile}\n"
             f"Startup cleanup: {self._approval_migration.get('archived_posts', 0)} "
@@ -1982,8 +2001,52 @@ class ContentBot:
         session_id: str = "",
         sequential: bool = False,
     ) -> _ReplyApprovalCreationResult:
+        async with self._reply_creation_lock:
+            return await self._create_reply_approvals_locked(
+                results,
+                query=query,
+                chat_id=chat_id,
+                approver_user_id=approver_user_id,
+                video_mode=video_mode,
+                visual_attachments=visual_attachments,
+                max_items=max_items,
+                session_id=session_id,
+                sequential=sequential,
+            )
+
+    async def _create_reply_approvals_locked(
+        self,
+        results: list[XSearchResult],
+        *,
+        query: str,
+        chat_id: int,
+        approver_user_id: int,
+        video_mode: bool = False,
+        visual_attachments: list[ImageAttachment] | None = None,
+        max_items: int | None = None,
+        session_id: str = "",
+        sequential: bool = False,
+    ) -> _ReplyApprovalCreationResult:
         if not results:
             return _ReplyApprovalCreationResult(blocked_reason="No candidates were supplied.")
+        active_before_generation = sum(
+            self.approvals.has_active_target(result.url)
+            for result in results
+            if result.url
+        )
+        results = [
+            result
+            for result in results
+            if not self.approvals.has_active_target(result.url)
+        ]
+        if len(results) < MIN_REPLY_TARGET_BATCH_ITEMS:
+            return _ReplyApprovalCreationResult(
+                filtered_active=active_before_generation,
+                blocked_reason=(
+                    "Fewer than two unused candidates remained when the serialized "
+                    "creation slot became available."
+                ),
+            )
         if self.revenue_ops.pace_paused:
             return _ReplyApprovalCreationResult(blocked_reason="Reply generation is paused.")
         hourly_remaining = self._hourly_reply_capacity()
@@ -1991,9 +2054,19 @@ class ContentBot:
             return _ReplyApprovalCreationResult(
                 blocked_reason="The adaptive hourly card ceiling is full."
             )
+        queue_slots = self._reply_delivery_slots_remaining()
+        if queue_slots < MIN_REPLY_TARGET_BATCH_ITEMS:
+            return _ReplyApprovalCreationResult(
+                blocked_reason=(
+                    "The global reply-card queue is full enough to avoid stale drafts. "
+                    f"Pending: {self._pending_reply_delivery_count()}/"
+                    f"{self.settings.reply_pending_queue_cap}."
+                )
+            )
         requested_batch_size = min(
             5,
             hourly_remaining,
+            queue_slots,
             max(
                 1,
                 max_items
@@ -2064,9 +2137,10 @@ class ContentBot:
         )
         generation_latency_seconds = round(time.monotonic() - generation_started, 1)
         created: list[AutomationApproval] = []
-        filtered_active = 0
+        filtered_active = active_before_generation
         filtered_missing_source = 0
         filtered_closed = 0
+        filtered_unverified = 0
         filtered_duplicate = 0
         delivery_queue_id = session_id or f"batch-{chat_id}-{time.time_ns()}"
         recent_texts = _recent_reply_texts(self.approvals.items(), limit=120)
@@ -2081,7 +2155,14 @@ class ContentBot:
             if result is None:
                 filtered_missing_source += 1
                 continue
-            if not await self._opportunity_still_open(result, video_mode=result.has_video):
+            opportunity_status, _opportunity_detail = await self._opportunity_status(
+                result,
+                video_mode=result.has_video,
+            )
+            if opportunity_status is None:
+                filtered_unverified += 1
+                continue
+            if not opportunity_status:
                 self.reply_watch.mark_expired(target_url, reason="opportunity changed")
                 filtered_closed += 1
                 continue
@@ -2147,7 +2228,18 @@ class ContentBot:
             filtered_active=filtered_active,
             filtered_missing_source=filtered_missing_source,
             filtered_closed=filtered_closed,
+            filtered_unverified=filtered_unverified,
             filtered_duplicate=filtered_duplicate,
+        )
+
+    def _pending_reply_delivery_count(self) -> int:
+        return _pending_reply_delivery_count(self.approvals.items())
+
+    def _reply_delivery_slots_remaining(self) -> int:
+        return max(
+            0,
+            self.settings.reply_pending_queue_cap
+            - self._pending_reply_delivery_count(),
         )
 
     def _japanese_reply_slots_remaining(self) -> int | None:
@@ -2380,23 +2472,29 @@ class ContentBot:
             ceiling - used,
         )
 
-    async def _opportunity_still_open(
+    async def _opportunity_status(
         self,
         original: XSearchResult,
         *,
         video_mode: bool,
-    ) -> bool:
+    ) -> tuple[bool | None, str]:
         try:
             current = await asyncio.wait_for(
                 self.x_search.tweet_by_id(original.id),
                 timeout=REPLY_TARGET_REFRESH_TIMEOUT_SECONDS,
             )
-        except Exception:
-            return True
+        except Exception as exc:
+            detail = _truncate_text(_exception_detail(exc), 300)
+            LOGGER.warning(
+                "Could not revalidate reply opportunity %s: %s",
+                original.url,
+                detail,
+            )
+            return None, detail
         if not isinstance(current, XSearchResult):
-            return current is not None
+            return False, "The X post is no longer available."
         if current.is_reply or current.is_retweet:
-            return False
+            return False, "The target is no longer an eligible root post."
         age_limit = (
             min(90, max(45, self.settings.reply_video_max_age_minutes * 2))
             if video_mode
@@ -2408,16 +2506,60 @@ class ContentBot:
             else 0.0
         )
         if age_minutes > age_limit:
-            return False
+            return False, "The opportunity became too old."
         reply_limit = max(
             80 if video_mode else 120,
             original.reply_count + 50,
             original.reply_count * 2 + 10,
         )
         if current.reply_count >= reply_limit:
-            return False
+            return False, "The discussion became too crowded."
         views_per_reply = (current.view_count or 0) / max(1, current.reply_count + 1)
-        return current.view_count is None or views_per_reply >= (150 if video_mode else 80)
+        if current.view_count is not None and views_per_reply < (
+            150 if video_mode else 80
+        ):
+            return False, "Views per competing reply fell below the delivery floor."
+        return True, ""
+
+    async def _opportunity_still_open(
+        self,
+        original: XSearchResult,
+        *,
+        video_mode: bool,
+    ) -> bool:
+        status, _detail = await self._opportunity_status(
+            original,
+            video_mode=video_mode,
+        )
+        return status is True
+
+    async def _queued_reply_delivery_status(
+        self,
+        approval: AutomationApproval,
+    ) -> tuple[bool | None, str]:
+        tweet_id = extract_tweet_id(approval.target_url)
+        if tweet_id is None:
+            return False, "The queued card no longer has a valid X target URL."
+        metadata = approval.metadata or {}
+        original = XSearchResult(
+            id=tweet_id,
+            username=str(metadata.get("root_author") or ""),
+            display_name="",
+            text=str(metadata.get("root_text") or ""),
+            created_at="",
+            url=approval.target_url,
+            reply_count=int(metadata.get("root_replies") or 0),
+            view_count=(
+                int(metadata["root_views"])
+                if str(metadata.get("root_views") or "").isdigit()
+                else None
+            ),
+            has_video=bool(metadata.get("has_video")),
+        )
+        return await self._opportunity_status(
+            original,
+            video_mode=original.has_video,
+        )
 
     async def _send_next_session_approval(self, session_id: str) -> bool:
         return await self._send_next_approval_queue(
@@ -2438,14 +2580,15 @@ class ContentBot:
         # replytargets, replyvideo, sessions, and overlapping scheduled runs
         # must never expose two undecided cards at the same time.
         del queue_id
-        return await self._send_next_approval_queue(
-            GLOBAL_REPLY_DELIVERY_QUEUE_ID,
-            queue_key="reply_delivery_queue_id",
-            index_key="reply_delivery_queue_index",
-            sent_key="reply_delivery_card_sent",
-            respect_pacing=respect_pacing,
-            global_reply_delivery=True,
-        )
+        async with self._reply_delivery_lock:
+            return await self._send_next_approval_queue(
+                GLOBAL_REPLY_DELIVERY_QUEUE_ID,
+                queue_key="reply_delivery_queue_id",
+                index_key="reply_delivery_queue_index",
+                sent_key="reply_delivery_card_sent",
+                respect_pacing=respect_pacing,
+                global_reply_delivery=True,
+            )
 
     async def _send_next_approval_queue(
         self,
@@ -2495,6 +2638,49 @@ class ContentBot:
         )
         if next_card is None:
             return False
+        if (
+            global_reply_delivery
+            and datetime.now(UTC) - next_card.created_at
+            >= timedelta(seconds=REPLY_DELIVERY_REVALIDATE_AFTER_SECONDS)
+        ):
+            opportunity_status, opportunity_detail = (
+                await self._queued_reply_delivery_status(next_card)
+            )
+            if opportunity_status is None:
+                self.approvals.update_metadata(
+                    next_card.id,
+                    reply_delivery_last_error=opportunity_detail,
+                    reply_delivery_not_before=(
+                        datetime.now(UTC)
+                        + timedelta(seconds=REPLY_DELIVERY_RETRY_SECONDS)
+                    ).isoformat(),
+                )
+                self._schedule_delayed_approval_queue(
+                    queue_id,
+                    queue_key=queue_key,
+                    index_key=index_key,
+                    sent_key=sent_key,
+                    delay_seconds=REPLY_DELIVERY_RETRY_SECONDS,
+                    global_reply_delivery=True,
+                )
+                return True
+            if not opportunity_status:
+                self.approvals.expire(
+                    next_card.id,
+                    error=opportunity_detail or "Opportunity changed before delivery.",
+                )
+                self.reply_watch.mark_expired(
+                    next_card.target_url,
+                    reason="opportunity changed before delivery",
+                )
+                return await self._send_next_approval_queue(
+                    queue_id,
+                    queue_key=queue_key,
+                    index_key=index_key,
+                    sent_key=sent_key,
+                    respect_pacing=respect_pacing,
+                    global_reply_delivery=True,
+                )
         delay_seconds = (
             self._reply_approval_delay_seconds(next_card)
             if respect_pacing
@@ -2587,14 +2773,20 @@ class ContentBot:
             current_task = asyncio.current_task()
             if self._delayed_approval_tasks.get(task_key) is current_task:
                 self._delayed_approval_tasks.pop(task_key, None)
-            await self._send_next_approval_queue(
-                queue_id,
-                queue_key=queue_key,
-                index_key=index_key,
-                sent_key=sent_key,
-                respect_pacing=True,
-                global_reply_delivery=global_reply_delivery,
-            )
+            if global_reply_delivery:
+                await self._send_next_reply_delivery(
+                    queue_id,
+                    respect_pacing=True,
+                )
+            else:
+                await self._send_next_approval_queue(
+                    queue_id,
+                    queue_key=queue_key,
+                    index_key=index_key,
+                    sent_key=sent_key,
+                    respect_pacing=True,
+                    global_reply_delivery=False,
+                )
 
         task = asyncio.create_task(
             deliver(),
@@ -2668,6 +2860,47 @@ class ContentBot:
             poll_minutes = min(5, self.settings.reply_tracking_poll_minutes)
             await asyncio.sleep(max(60, poll_minutes * 60))
 
+    def _tracking_records_for_cycle(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        prioritized: list[tuple[int, str, dict[str, Any]]] = []
+        for record in records:
+            checkpoint_due = self.reply_learning.due_checkpoint(record, now=now)
+            author_due = self.reply_learning.author_response_check_due(
+                record,
+                now=now,
+            )
+            if checkpoint_due is None and not author_due:
+                continue
+            try:
+                posted_at = datetime.fromisoformat(str(record.get("posted_at") or ""))
+                if posted_at.tzinfo is None:
+                    posted_at = posted_at.replace(tzinfo=UTC)
+                age_minutes = max(0.0, (now - posted_at).total_seconds() / 60)
+            except ValueError:
+                age_minutes = 10_000.0
+            priority = (
+                0
+                if author_due and age_minutes <= 60
+                else 1
+                if checkpoint_due is not None
+                else 2
+            )
+            last_checked = str(
+                record.get("last_author_response_check_at")
+                or record.get("posted_at")
+                or ""
+            )
+            prioritized.append((priority, last_checked, record))
+        prioritized.sort(key=lambda item: (item[0], item[1]))
+        return [
+            item[2]
+            for item in prioritized[: self.settings.reply_tracking_checks_per_cycle]
+        ]
+
     async def _process_reply_tracking_once(
         self,
         *,
@@ -2704,7 +2937,11 @@ class ContentBot:
                         published=False,
                     )
 
-        for record in self.reply_learning.records("tracking"):
+        tracking_records = self._tracking_records_for_cycle(
+            self.reply_learning.records("tracking"),
+            now=current,
+        )
+        for record in tracking_records:
             checkpoint = self.reply_learning.due_checkpoint(record, now=current)
             author_response: XSearchResult | None = None
             should_watch_author = (
@@ -2843,8 +3080,8 @@ class ContentBot:
         ):
             return
         report = self.reply_learning.report(1, now=current)
-        self.reply_learning.mark_digest_sent(digest_date)
         if not report["posted"]:
+            self.reply_learning.mark_digest_sent(digest_date)
             return
         await self._application.bot.send_message(
             chat_id=self.approval_chat_id,
@@ -2858,6 +3095,9 @@ class ContentBot:
                 f"Next allocation: {_performance_recommendation(report)}"
             ),
         )
+        # Persist only after Telegram confirms delivery; transient failures are
+        # retried on the next tracking cycle instead of losing the daily digest.
+        self.reply_learning.mark_digest_sent(digest_date)
 
     async def _create_author_followup(
         self,
@@ -3044,53 +3284,66 @@ class ContentBot:
             )
             if approval.status == "mobile_approved" and approval.kind == "reply":
                 self.reply_learning.register_approval(approval)
-            await query.answer()
-            answered = True
-            original = str(query.message.text or "").strip()
-            mobile_note = _mobile_approval_note(approval)
-            await query.edit_message_text(
-                (
-                    f"{original}\n\n{mobile_note}".strip()
-                    if approval.status == "mobile_approved"
-                    else (
-                        f"{original}\n\nConversation stopped. No further follow-up "
-                        "will be suggested for this exchange."
-                        if decision == "stop"
-                        else f"{original}\n\nRejected."
-                    )
-                ),
-                reply_markup=(
-                    _approval_keyboard(approval, include_decisions=False)
-                    if approval.status == "mobile_approved"
-                    else None
-                ),
-            )
-            if reply_delivery_queue_id:
-                await self._send_next_reply_delivery(
-                    reply_delivery_queue_id,
-                    respect_pacing=(
-                        approval.status == "mobile_approved"
-                        and not bool(
-                            (approval.metadata or {}).get("relationship_followup")
+            try:
+                await query.answer()
+                answered = True
+                original = str(query.message.text or "").strip()
+                mobile_note = _mobile_approval_note(approval)
+                await query.edit_message_text(
+                    (
+                        f"{original}\n\n{mobile_note}".strip()
+                        if approval.status == "mobile_approved"
+                        else (
+                            f"{original}\n\nConversation stopped. No further follow-up "
+                            "will be suggested for this exchange."
+                            if decision == "stop"
+                            else f"{original}\n\nRejected."
                         )
                     ),
+                    reply_markup=(
+                        _approval_keyboard(approval, include_decisions=False)
+                        if approval.status == "mobile_approved"
+                        else None
+                    ),
                 )
-            elif (
-                reply_session_id
-                and bool((existing.metadata or {}).get("reply_session_sequential"))
-            ):
-                # Backward compatibility for guided-session cards created by
-                # versions before the delivery queue was introduced.
-                await self._send_next_session_approval(reply_session_id)
+            finally:
+                # The decision is already durable. Telegram message-edit
+                # failures must not strand every later card in the queue.
+                if reply_delivery_queue_id:
+                    await self._send_next_reply_delivery(
+                        reply_delivery_queue_id,
+                        respect_pacing=(
+                            approval.status == "mobile_approved"
+                            and not bool(
+                                (approval.metadata or {}).get("relationship_followup")
+                            )
+                        ),
+                    )
+                elif (
+                    reply_session_id
+                    and bool((existing.metadata or {}).get("reply_session_sequential"))
+                ):
+                    # Backward compatibility for guided-session cards created
+                    # before the global delivery queue was introduced.
+                    await self._send_next_session_approval(reply_session_id)
         except Exception as exc:
             error = _friendly_error(exc)
             if not answered:
-                await query.answer(error, show_alert=True)
+                try:
+                    await query.answer(error, show_alert=True)
+                except Exception:
+                    LOGGER.warning("Could not answer failed approval callback", exc_info=True)
             else:
-                await query.message.reply_text(
-                    f"Approval was saved, but Telegram could not refresh this card: {error}\n"
-                    "Tap the approval button again to retry opening the mobile action."
-                )
+                try:
+                    await query.message.reply_text(
+                        f"Approval was saved, but Telegram could not refresh this card: "
+                        f"{error}\nThe next queued card will still continue automatically."
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "Could not report Telegram approval presentation failure",
+                        exc_info=True,
+                    )
 
     async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]:
         query = str(payload.get("query", "")).strip()
@@ -3167,8 +3420,10 @@ class ContentBot:
                 raise
             except Exception as exc:
                 LOGGER.exception("Scheduled %s failed", kind)
-                paused_now = self.revenue_ops.record_health_error(
-                    _exception_detail(exc)
+                paused_now = (
+                    self.revenue_ops.record_health_error(_exception_detail(exc))
+                    if _counts_toward_health_circuit_breaker(exc)
+                    else False
                 )
                 if self._application is not None and self.approval_chat_id is not None:
                     await self._application.bot.send_message(
@@ -3201,6 +3456,8 @@ class ContentBot:
         if self._application is None or self.approval_chat_id is None:
             raise RuntimeError("Automation chat is not ready.")
         if self.revenue_ops.pace_paused:
+            return
+        if self._reply_delivery_slots_remaining() < MIN_REPLY_TARGET_BATCH_ITEMS:
             return
         status = await self._application.bot.send_message(
             chat_id=self.approval_chat_id,
@@ -3299,6 +3556,8 @@ class ContentBot:
             raise RuntimeError("Automation chat is not ready.")
         if self.revenue_ops.pace_paused:
             return
+        if self._reply_delivery_slots_remaining() < REPLY_VIDEO_MIN_BATCH_ITEMS:
+            return
         status = await self._application.bot.send_message(
             chat_id=self.approval_chat_id,
             text=(
@@ -3393,6 +3652,13 @@ class ContentBot:
         languages = parse_reply_target_languages(
             self.settings.reply_target_languages
         )
+        if self._reply_delivery_slots_remaining() < MIN_REPLY_TARGET_BATCH_ITEMS:
+            await message.reply_text(
+                "The global reply-card queue is full. Process the current card(s) first "
+                f"({self._pending_reply_delivery_count()}/"
+                f"{self.settings.reply_pending_queue_cap} pending)."
+            )
+            return
         status = await message.reply_text(
             f"Finding fast-moving reply targets from the last {max_age_minutes} minutes "
             f"in {', '.join(languages)}..."
@@ -3503,6 +3769,13 @@ class ContentBot:
         query = " ".join(context.args).strip()
         if query.lower() == "auto":
             query = ""
+        if self._reply_delivery_slots_remaining() < REPLY_VIDEO_MIN_BATCH_ITEMS:
+            await message.reply_text(
+                "The global reply-card queue is full. Process the current card(s) first "
+                f"({self._pending_reply_delivery_count()}/"
+                f"{self.settings.reply_pending_queue_cap} pending)."
+            )
+            return
         await message.chat.send_action(ChatAction.TYPING)
         status = await message.reply_text(
             "Hunting fresh Japanese videos first, then filling from other global "
@@ -3719,6 +3992,27 @@ class ContentBot:
         languages: list[str] | tuple[str, ...] | str | None = None,
         mode: str | None = None,
     ) -> tuple[str, list[XSearchResult], str]:
+        # /replytargets and /replyvideo share one cookie-backed twscrape pool.
+        # Serialize whole discovery scans so per-lane timeouts do not expire
+        # merely because another scan already owns the X request lock.
+        async with self._reply_discovery_lock:
+            return await self._get_reply_target_context_locked(
+                query,
+                status,
+                max_age_minutes=max_age_minutes,
+                languages=languages,
+                mode=mode,
+            )
+
+    async def _get_reply_target_context_locked(
+        self,
+        query: str,
+        status,
+        *,
+        max_age_minutes: int = 360,
+        languages: list[str] | tuple[str, ...] | str | None = None,
+        mode: str | None = None,
+    ) -> tuple[str, list[XSearchResult], str]:
         selected_mode = mode or self.settings.reply_target_mode
         selected_languages = parse_reply_target_languages(
             languages,
@@ -3766,7 +4060,10 @@ class ContentBot:
                             candidate,
                             max_age_minutes=max_age_minutes,
                         ),
-                        timeout=REPLY_TARGET_SEARCH_TIMEOUT_SECONDS,
+                        # One logical target lane performs serialized Top and
+                        # Latest calls. Its deadline must cover both calls plus
+                        # brief waiting behind priority tracking requests.
+                        timeout=REPLY_TARGET_POOL_TIMEOUT_SECONDS,
                     )
             except Exception as exc:
                 search_failures.append(
@@ -3908,6 +4205,14 @@ class ContentBot:
         return last_search_query, [], diagnostic
 
     async def _get_reply_video_context(
+        self,
+        query: str,
+        status,
+    ) -> tuple[str, list[XSearchResult], str]:
+        async with self._reply_discovery_lock:
+            return await self._get_reply_video_context_locked(query, status)
+
+    async def _get_reply_video_context_locked(
         self,
         query: str,
         status,
@@ -5826,6 +6131,19 @@ def _exception_detail(exc: Exception) -> str:
         current = current.__cause__ or current.__context__
 
     return " <- ".join(details) or type(exc).__name__
+
+
+def _counts_toward_health_circuit_breaker(exc: Exception) -> bool:
+    """Pause only for infrastructure failures, not deterministic draft rejection."""
+    detail = _exception_detail(exc).casefold()
+    content_rejection_markers = (
+        "no usable reply targets",
+        "did not contain usable reply targets",
+        "question-only reply",
+        "invalid target urls",
+        "similar to a recent reply",
+    )
+    return not any(marker in detail for marker in content_rejection_markers)
 
 
 def _strip_exception_prefix(text: str) -> str:

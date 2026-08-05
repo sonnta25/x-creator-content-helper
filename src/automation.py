@@ -214,6 +214,16 @@ class AutomationApprovalStore:
             self._save()
         return cancelled
 
+    def expire(self, approval_id: str, *, error: str = "") -> AutomationApproval:
+        approval = self.get(approval_id)
+        if approval is None:
+            raise RuntimeError("Unknown approval request.")
+        if approval.status == "pending":
+            approval.status = "expired"
+            approval.error = str(error or "").strip()
+            self._save()
+        return approval
+
     def update_text(self, approval_id: str, text: str) -> AutomationApproval:
         approval = self.get(approval_id)
         if approval is None:

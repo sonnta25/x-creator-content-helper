@@ -3,11 +3,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
 $pythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+
 $bots = Get-CimInstance Win32_Process -Filter "name = 'python.exe'" |
     Where-Object {
-        $_.CommandLine -like "*$pythonExe*" -and $_.CommandLine -like "*-m src.main*"
+        $_.CommandLine -like "*-m src.main*" -and
+        (
+            $_.CommandLine -like "*$pythonExe*" -or
+            $_.CommandLine -like "*x-content-bot*" -or
+            $_.CommandLine -like "*x-creator-content-helper*"
+        )
     }
 
 if (-not $bots) {

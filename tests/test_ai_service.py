@@ -26,6 +26,37 @@ def test_extension_bridge_provider_is_selected() -> None:
     assert isinstance(create_ai_service(settings), ExtensionBridgeService)
 
 
+def test_extension_bridge_serializes_provider_jobs_before_timeout_starts() -> None:
+    server = ExtensionBridgeServer(Settings(telegram_bot_token="123:ABC"))
+    active = 0
+    max_active = 0
+
+    async def no_start():
+        return None
+
+    async def wait_for_job(job):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return job.final_prompt
+
+    server.start = no_start
+    server._wait_for_job = wait_for_job
+
+    async def submit_both():
+        return await asyncio.gather(
+            server.submit_text_job("first"),
+            server.submit_text_job("second"),
+        )
+
+    results = asyncio.run(submit_both())
+
+    assert len(results) == 2
+    assert max_active == 1
+
+
 def test_extension_bridge_service_covers_text_generation_methods() -> None:
     service = create_ai_service(
         Settings(

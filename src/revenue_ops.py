@@ -150,7 +150,9 @@ def reply_farming_guardrails(risk_mode: str) -> ReplyFarmingGuardrails:
         return ReplyFarmingGuardrails(
             global_hourly_cap=12,
             japanese_daily_cap=20,
-            japanese_hourly_cap=4,
+            # Spread the 20/day Japanese allowance across the creator day
+            # instead of exhausting it during the first few scan windows.
+            japanese_hourly_cap=2,
             minimum_approval_gap_seconds=120,
         )
     if mode == "open":

@@ -193,7 +193,7 @@ def test_auto_run_self_heals_alarms_and_heartbeats_claimed_jobs() -> None:
     assert "activeProviderWatchdogTick()" in background_js
     assert "ensureActiveProviderWatchdog()" in background_js
     assert "delayInMinutes: 0.5" in background_js
-    assert "periodInMinutes: 1" in background_js
+    assert "periodInMinutes: 0.5" in background_js
     assert "MAX_PROVIDER_TIMEOUT_SECONDS = 360" in background_js
 
 
@@ -259,12 +259,32 @@ def test_interrupted_provider_job_is_reclaimed_after_its_lease() -> None:
 
     assert 'const PROVIDER_RECOVERY_ALARM = "x-content-bot-provider-recovery"' in background_js
     assert 'const PROVIDER_RECOVERY_RETRY_ALARM = "x-content-bot-provider-recovery-retry"' in background_js
+    assert 'const PROVIDER_RECOVERY_WATCHDOG_ALARM = "x-content-bot-provider-recovery-watchdog"' in background_js
     assert 'const ACTIVE_PROVIDER_JOB_ID_KEY = "activeProviderJobId"' in background_js
     assert "await recoverInterruptedProviderJob();" in background_js
     assert "delayInMinutes: 0.1" in background_js
     assert "delayInMinutes: 1.5" in background_js
+    assert "periodInMinutes: 0.5" in background_js
     assert "runJobs({ force: true, maxJobs: 1 })" in background_js
     assert "await setActiveProviderJobId(job.id)" in background_js
     assert "async function getActiveProviderJobId()" in background_js
     assert "chromeStorageGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: \"\" })" in background_js
     assert "chromeStorageSessionGet({ [ACTIVE_PROVIDER_JOB_ID_KEY]: \"\" })" in background_js
+    recovery = background_js.split(
+        "async function recoverInterruptedProviderJob()", 1
+    )[1].split("async function clearProviderRecoveryState", 1)[0]
+    assert 'setActiveProviderJobId("")' not in recovery
+    assert "await ensureGeminiHeartbeatInjected(true)" in recovery
+
+
+def test_gemini_navigation_reattaches_the_page_heartbeat() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+    prepare = background_js.split("async function prepareProviderTab", 1)[1].split(
+        "async function recordProviderJobSuccess", 1
+    )[0]
+
+    assert "chrome.tabs.onUpdated.addListener" in background_js
+    assert prepare.count("await injectGeminiHeartbeat(tab.id)") >= 4
+    assert "await waitForProviderReady(tab.id);\n    await injectGeminiHeartbeat(tab.id);" in prepare

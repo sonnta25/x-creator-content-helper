@@ -31,6 +31,7 @@ const RUNTIME_WATCHDOG_ALARM = "x-content-bot-runtime-watchdog";
 const FOLLOW_UP_ALARM = "x-content-bot-follow-up";
 const PROVIDER_RECOVERY_ALARM = "x-content-bot-provider-recovery";
 const PROVIDER_RECOVERY_RETRY_ALARM = "x-content-bot-provider-recovery-retry";
+const PROVIDER_RECOVERY_WATCHDOG_ALARM = "x-content-bot-provider-recovery-watchdog";
 const ACTIVE_PROVIDER_WATCHDOG_ALARM = "x-content-bot-active-provider-watchdog";
 const BRIDGE_FETCH_TIMEOUT_MS = 15000;
 const TAB_SCRIPT_TIMEOUT_MS = 15000;
@@ -90,6 +91,23 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
 });
 
+// Gemini can replace its document while opening a fresh conversation. Any
+// page-injected heartbeat disappears with that document, so reattach it after
+// every completed navigation of the one tab managed by this extension.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (
+    changeInfo.status !== "complete" ||
+    !String(tab && tab.url || "").startsWith("https://gemini.google.com/")
+  ) {
+    return;
+  }
+  getManagedProviderTab(FINAL_PROVIDER_URL)
+    .then((managed) => managed && managed.id === tabId
+      ? injectGeminiHeartbeat(tabId)
+      : null)
+    .catch(() => null);
+});
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === AUTO_ALARM) {
     runJobs({ force: false, maxJobs: 1 })
@@ -112,7 +130,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
   if (
     alarm.name === PROVIDER_RECOVERY_ALARM ||
-    alarm.name === PROVIDER_RECOVERY_RETRY_ALARM
+    alarm.name === PROVIDER_RECOVERY_RETRY_ALARM ||
+    alarm.name === PROVIDER_RECOVERY_WATCHDOG_ALARM
   ) {
     runJobs({ force: true, maxJobs: 1 })
       .catch((error) => setStatus(`Provider recovery error: ${error.message || error}`));
@@ -214,17 +233,40 @@ async function recoverInterruptedProviderJob() {
   if (running) return false;
   const interruptedJobId = await getActiveProviderJobId();
   if (!interruptedJobId) return false;
-  await setActiveProviderJobId("");
-  await chromeAlarmsClear(ACTIVE_PROVIDER_WATCHDOG_ALARM);
-  // Try immediately in case the browser restarted after the 75-second server
-  // lease had already expired, then retry after the lease is certainly stale.
-  chrome.alarms.create(PROVIDER_RECOVERY_ALARM, { delayInMinutes: 0.1 });
-  chrome.alarms.create(PROVIDER_RECOVERY_RETRY_ALARM, { delayInMinutes: 1.5 });
+  await ensureGeminiHeartbeatInjected(true);
+  await ensureActiveProviderWatchdog();
+  // Keep the durable job ID until completion or an explicit expired response.
+  // Quick one-shot attempts reduce latency; the repeating watchdog survives a
+  // delayed/lost MV3 alarm and keeps trying across the server lease boundary.
+  if (!await chromeAlarmsGet(PROVIDER_RECOVERY_ALARM)) {
+    chrome.alarms.create(PROVIDER_RECOVERY_ALARM, { delayInMinutes: 0.1 });
+  }
+  if (!await chromeAlarmsGet(PROVIDER_RECOVERY_RETRY_ALARM)) {
+    chrome.alarms.create(PROVIDER_RECOVERY_RETRY_ALARM, { delayInMinutes: 1.5 });
+  }
+  if (!await chromeAlarmsGet(PROVIDER_RECOVERY_WATCHDOG_ALARM)) {
+    chrome.alarms.create(PROVIDER_RECOVERY_WATCHDOG_ALARM, {
+      delayInMinutes: 0.5,
+      periodInMinutes: 0.5
+    });
+  }
   await setStatus(
     `Detected interrupted Gemini job ${interruptedJobId}. ` +
-    "It will be reclaimed after the bridge lease expires."
+    "Recovery will retry until the bridge lease is reclaimed or expires."
   );
   return true;
+}
+
+async function clearProviderRecoveryState({ clearJobId = false } = {}) {
+  await Promise.all([
+    chromeAlarmsClear(ACTIVE_PROVIDER_WATCHDOG_ALARM),
+    chromeAlarmsClear(PROVIDER_RECOVERY_ALARM),
+    chromeAlarmsClear(PROVIDER_RECOVERY_RETRY_ALARM),
+    chromeAlarmsClear(PROVIDER_RECOVERY_WATCHDOG_ALARM)
+  ]);
+  if (clearJobId) {
+    await setActiveProviderJobId("");
+  }
 }
 
 async function ensureActiveProviderWatchdog() {
@@ -232,7 +274,7 @@ async function ensureActiveProviderWatchdog() {
   if (!existing) {
     chrome.alarms.create(ACTIVE_PROVIDER_WATCHDOG_ALARM, {
       delayInMinutes: 0.5,
-      periodInMinutes: 1
+      periodInMinutes: 0.5
     });
   }
 }
@@ -253,17 +295,27 @@ async function activeProviderWatchdogTick() {
       body: {},
       timeoutMs: 5000
     });
-  } catch (_error) {
+  } catch (error) {
+    if (String(error && (error.message || error)).includes("Unknown or expired job")) {
+      await clearProviderRecoveryState({ clearJobId: true });
+      await setStatus(`Interrupted Gemini job ${jobId} has expired on the bridge.`);
+      return false;
+    }
     // The regular 20-second heartbeat remains primary. A stale server lease is
     // reclaimed by recoverInterruptedProviderJob if this worker is restarted.
   }
   return true;
 }
 
-async function ensureGeminiHeartbeatInjected() {
+async function ensureGeminiHeartbeatInjected(force = false) {
   const now = Date.now();
   const session = await chromeStorageSessionGet({ lastHeartbeatInjectionAt: 0 });
-  if (now - Number(session.lastHeartbeatInjectionAt || 0) < HEARTBEAT_INJECTION_MIN_INTERVAL_MS) {
+  const activeJobId = await getActiveProviderJobId();
+  if (
+    !force &&
+    !activeJobId &&
+    now - Number(session.lastHeartbeatInjectionAt || 0) < HEARTBEAT_INJECTION_MIN_INTERVAL_MS
+  ) {
     return;
   }
   let tab = await getManagedProviderTab(FINAL_PROVIDER_URL);
@@ -658,8 +710,7 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
   } finally {
     stopHeartbeat();
     if (await getActiveProviderJobId() === String(job.id)) {
-      await setActiveProviderJobId("");
-      await chromeAlarmsClear(ACTIVE_PROVIDER_WATCHDOG_ALARM);
+      await clearProviderRecoveryState({ clearJobId: true });
     }
   }
 }
@@ -908,6 +959,7 @@ async function prepareProviderTab(url) {
     await chromeTabsUpdate(tab.id, { url, active: true });
     await waitForTabComplete(tab.id);
     await waitForProviderReady(tab.id);
+    await injectGeminiHeartbeat(tab.id);
   }
 
   const [resetResult] = await executeTabScript(
@@ -921,12 +973,14 @@ async function prepareProviderTab(url) {
     await delay(1000);
     await waitForTabComplete(tab.id);
     await waitForProviderReady(tab.id);
+    await injectGeminiHeartbeat(tab.id);
     return await chromeTabsGet(tab.id);
   }
 
   await chromeTabsUpdate(tab.id, { url, active: true });
   await waitForTabComplete(tab.id);
   await waitForProviderReady(tab.id);
+  await injectGeminiHeartbeat(tab.id);
   return await chromeTabsGet(tab.id);
 }
 

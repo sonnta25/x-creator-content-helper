@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from telegram import ForceReply, ReplyKeyboardMarkup
 
+from src.automation import AutomationApproval
 from src.bot import (
     BOT_COMMANDS,
     ContentBot,
@@ -36,6 +37,9 @@ from src.bot import (
     _parse_importcookie_args,
     _parse_persona_args,
     _reply_target_max_age_minutes,
+    _reply_approvals_created_since,
+    _reply_approvals_created_today,
+    _author_approvals_created_today,
     _reply_video_search_queries,
     _video_context_quality,
     _is_reliable_video_context_text,
@@ -121,6 +125,140 @@ def test_grouped_menu_keeps_replyvideo_and_automation_controls() -> None:
     assert MENU_REPLY_BATCH in MENU_LAYOUTS["automation"][1]
     assert MENU_ACTIONS[MENU_REPLY_VIDEO] == ("command", "replyvideo")
     assert MENU_ACTIONS[MENU_VIDEO_SCHEDULE] == ("command", "videoevery")
+
+
+def test_reply_caps_count_only_cards_that_were_approved() -> None:
+    now = datetime.now(UTC)
+    cards = [
+        AutomationApproval(
+            id="pending",
+            kind="reply",
+            text="Pending",
+            chat_id=1,
+            approver_user_id=1,
+            status="pending",
+            created_at=now - timedelta(minutes=10),
+            metadata={"root_author": "author"},
+        ),
+        AutomationApproval(
+            id="approved",
+            kind="reply",
+            text="Approved",
+            chat_id=1,
+            approver_user_id=1,
+            status="mobile_approved",
+            created_at=now - timedelta(minutes=20),
+            decided_at=now - timedelta(minutes=5),
+            metadata={"root_author": "author"},
+        ),
+        AutomationApproval(
+            id="approved-not-found",
+            kind="reply",
+            text="Approved but not confirmed",
+            chat_id=1,
+            approver_user_id=1,
+            status="not_found",
+            created_at=now - timedelta(minutes=25),
+            decided_at=now - timedelta(minutes=4),
+            metadata={"root_author": "author"},
+        ),
+        AutomationApproval(
+            id="rejected",
+            kind="reply",
+            text="Rejected",
+            chat_id=1,
+            approver_user_id=1,
+            status="rejected",
+            created_at=now - timedelta(minutes=15),
+            decided_at=now - timedelta(minutes=3),
+            metadata={"root_author": "author"},
+        ),
+    ]
+
+    assert _reply_approvals_created_today(cards) == 2
+    assert _reply_approvals_created_since(
+        cards,
+        since=now - timedelta(hours=1),
+    ) == 2
+    assert _author_approvals_created_today(
+        cards,
+        username="@author",
+        timezone_name="Asia/Ho_Chi_Minh",
+    ) == 2
+
+
+def test_reply_cap_uses_approval_time_instead_of_draft_creation_time() -> None:
+    now = datetime.now(UTC)
+    old_draft_approved_now = AutomationApproval(
+        id="old-draft",
+        kind="reply",
+        text="Approved today",
+        chat_id=1,
+        approver_user_id=1,
+        status="mobile_approved",
+        created_at=now - timedelta(days=2),
+        decided_at=now - timedelta(minutes=2),
+    )
+
+    assert _reply_approvals_created_today([old_draft_approved_now]) == 1
+    assert _reply_approvals_created_since(
+        [old_draft_approved_now],
+        since=now - timedelta(hours=1),
+    ) == 1
+
+
+def test_replycap_show_reports_approved_usage_and_pending_drafts(tmp_path) -> None:
+    class Message:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        async def reply_text(self, text: str):
+            self.texts.append(text)
+            return self
+
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            telegram_approval_chat_id=123,
+            creator_daily_reply_cap=10,
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    approved = bot.approvals.create(
+        kind="reply",
+        text="Approved",
+        chat_id=123,
+        approver_user_id=123,
+    )
+    bot.approvals.decide(
+        approved.id,
+        approve=True,
+        chat_id=123,
+        user_id=123,
+        destination="mobile",
+    )
+    bot.approvals.create(
+        kind="reply",
+        text="Pending",
+        chat_id=123,
+        approver_user_id=123,
+    )
+    message = Message()
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_message=message,
+    )
+
+    asyncio.run(bot.replycap(update, SimpleNamespace(args=["show"])))
+
+    assert "Approved today: 1/10" in message.texts[-1]
+    assert "Remaining today: 9" in message.texts[-1]
+    assert "Approved in the last 60 minutes: 1/8" in message.texts[-1]
+    assert "Available now: 7" in message.texts[-1]
+    assert "Pending drafts not counted: 1" in message.texts[-1]
 
 
 def test_menu_keyboard_hides_after_a_selection() -> None:
@@ -1450,7 +1588,7 @@ def test_scheduled_replytargets_reports_daily_cap_instead_of_confirmation(tmp_pa
     bot = ContentBot(
         Settings(
             telegram_bot_token="123:ABC",
-                        creator_daily_reply_cap=1,
+            creator_daily_reply_cap=1,
             automation_approvals_path=str(tmp_path / "approvals.json"),
             reply_watch_path=str(tmp_path / "watch.json"),
         )
@@ -1464,12 +1602,19 @@ def test_scheduled_replytargets_reports_daily_cap_instead_of_confirmation(tmp_pa
         created_at=datetime.now(UTC).isoformat(),
         url="https://x.com/ready/status/402",
     )
-    bot.approvals.create(
+    existing = bot.approvals.create(
         kind="reply",
         text="Existing reply card",
         chat_id=123,
         approver_user_id=123,
         target_url="https://x.com/already/status/1",
+    )
+    bot.approvals.decide(
+        existing.id,
+        approve=True,
+        chat_id=123,
+        user_id=123,
+        destination="mobile",
     )
     messages = []
 

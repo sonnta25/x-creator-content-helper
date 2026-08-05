@@ -1435,11 +1435,58 @@ class ContentBot:
             await self._request_command_input(update, "replycap")
             return
         if raw in {"show", "current", "status"}:
+            approvals = self.approvals.items()
+            daily_used = _reply_approvals_created_today(
+                approvals,
+                timezone_name=self.settings.creator_timezone,
+            )
+            daily_remaining = max(
+                0,
+                self.settings.creator_daily_reply_cap - daily_used,
+            )
+            hourly_used = _reply_approvals_created_since(
+                approvals,
+                since=datetime.now(UTC) - timedelta(hours=1),
+            )
+            hourly_ceiling = self._adaptive_hourly_ceiling()
+            hourly_remaining = (
+                0
+                if self.revenue_ops.pace_paused
+                else max(0, hourly_ceiling - hourly_used)
+            )
+            available_now = min(daily_remaining, hourly_remaining)
+            pending = sum(
+                approval.kind == "reply" and approval.status == "pending"
+                for approval in approvals
+            )
+            try:
+                creator_timezone = ZoneInfo(self.settings.creator_timezone)
+            except ZoneInfoNotFoundError:
+                creator_timezone = UTC
+            next_creator_day = (
+                datetime.now(creator_timezone).replace(
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                )
+                + timedelta(days=1)
+            )
             await message.reply_text(
-                "Reply-card ceilings\n"
-                f"- Daily: {self.settings.creator_daily_reply_cap}\n"
-                f"- Per author/day: {self.settings.reply_author_daily_cap}\n\n"
-                "These are safety ceilings, not posting quotas."
+                "Reply-card usage (approved cards only)\n"
+                f"- Approved today: {daily_used}/{self.settings.creator_daily_reply_cap}\n"
+                f"- Remaining today: {daily_remaining}\n"
+                f"- Approved in the last 60 minutes: {hourly_used}/{hourly_ceiling}\n"
+                f"- Available now: {available_now}\n"
+                f"- Pending drafts not counted: {pending}\n"
+                f"- Per author/day: {self.settings.reply_author_daily_cap}\n"
+                f"- Daily reset: {next_creator_day:%Y-%m-%d %H:%M} "
+                f"{self.settings.creator_timezone}\n\n"
+                + (
+                    "Adaptive pace is PAUSED. Use /pace resume after checking /setupcheck."
+                    if self.revenue_ops.pace_paused
+                    else "Pending and rejected cards do not consume these ceilings."
+                )
             )
             return
         scope, separator, raw_value = raw.partition(" ")
@@ -1878,9 +1925,7 @@ class ContentBot:
                 await self._send_approval(approval)
         return len(created)
 
-    def _hourly_reply_capacity(self) -> int:
-        if self.revenue_ops.pace_paused:
-            return 0
+    def _adaptive_hourly_ceiling(self) -> int:
         ceiling = self.revenue_ops.hourly_ceiling(self.settings.creator_daily_reply_cap)
         recent_decisions = sorted(
             [
@@ -1909,6 +1954,12 @@ class ContentBot:
             performance.get("average_score") or 0.0
         ) < 25.0:
             ceiling = max(2, round(ceiling * 0.75))
+        return ceiling
+
+    def _hourly_reply_capacity(self) -> int:
+        if self.revenue_ops.pace_paused:
+            return 0
+        ceiling = self._adaptive_hourly_ceiling()
         used = _reply_approvals_created_since(
             self.approvals.items(),
             since=datetime.now(UTC) - timedelta(hours=1),
@@ -4525,13 +4576,12 @@ def _reply_approvals_created_today(
     except ZoneInfoNotFoundError:
         timezone = UTC
     today = datetime.now(timezone).date()
-    ignored_statuses = {"rejected", "expired", "failed", "not_found"}
     return sum(
         1
         for approval in approvals
-        if approval.kind == "reply"
-        and approval.created_at.astimezone(timezone).date() == today
-        and approval.status not in ignored_statuses
+        if _is_approved_reply_card(approval)
+        and approval.decided_at is not None
+        and approval.decided_at.astimezone(timezone).date() == today
     )
 
 
@@ -4549,13 +4599,12 @@ def _author_approvals_created_today(
     except ZoneInfoNotFoundError:
         timezone = UTC
     today = datetime.now(timezone).date()
-    ignored = {"rejected", "expired", "failed", "not_found", "archived"}
     return sum(
         1
         for approval in approvals
-        if approval.kind == "reply"
-        and approval.status not in ignored
-        and approval.created_at.astimezone(timezone).date() == today
+        if _is_approved_reply_card(approval)
+        and approval.decided_at is not None
+        and approval.decided_at.astimezone(timezone).date() == today
         and str((approval.metadata or {}).get("root_author") or "")
         .lstrip("@")
         .casefold()
@@ -4609,12 +4658,20 @@ def _reply_approvals_created_since(
     *,
     since: datetime,
 ) -> int:
-    ignored = {"rejected", "expired", "failed", "not_found", "archived"}
     return sum(
-        approval.kind == "reply"
-        and approval.status not in ignored
-        and approval.created_at >= since
+        _is_approved_reply_card(approval)
+        and approval.decided_at is not None
+        and approval.decided_at >= since
         for approval in approvals
+    )
+
+
+def _is_approved_reply_card(approval: AutomationApproval) -> bool:
+    """Return whether a reply card has passed an explicit approval decision."""
+    return (
+        approval.kind == "reply"
+        and approval.decided_at is not None
+        and approval.status != "rejected"
     )
 
 

@@ -168,6 +168,55 @@ def test_bridge_allows_original_worker_to_resume_a_requeued_lease() -> None:
     asyncio.run(exercise())
 
 
+def test_bridge_gives_a_recovered_worker_a_fresh_stall_window(monkeypatch) -> None:
+    async def exercise() -> None:
+        monkeypatch.setattr(extension_bridge_module, "JOB_LEASE_SECONDS", 0.03)
+        monkeypatch.setattr(extension_bridge_module, "JOB_HEALTH_POLL_SECONDS", 0.005)
+        monkeypatch.setattr(extension_bridge_module, "JOB_RECOVERY_WAIT_SECONDS", 0.2)
+        server = ExtensionBridgeServer(
+            Settings(
+                telegram_bot_token="123:ABC",
+                extension_bridge_timeout_seconds=1,
+            )
+        )
+        job = ExtensionBridgeJob(
+            id="job-recovered-twice",
+            phase="final_running",
+            final_prompt="Write one reply.",
+            last_heartbeat_at=time.monotonic() - 0.04,
+            claim_attempts=1,
+        )
+        server._jobs[job.id] = job
+        waiter = asyncio.create_task(server._wait_for_job(job))
+
+        for _ in range(40):
+            if job.phase == "final_pending":
+                break
+            await asyncio.sleep(0.005)
+        assert job.phase == "final_pending"
+
+        # Keep the recovered lease healthy beyond most of the first recovery
+        # window. A later interruption must start a new window, not reuse the
+        # almost-expired timestamp from the first stall.
+        for _ in range(8):
+            await server._accept_heartbeat(job.id)
+            await asyncio.sleep(0.02)
+
+        for _ in range(40):
+            if job.phase == "final_pending":
+                break
+            await asyncio.sleep(0.005)
+        assert job.phase == "final_pending"
+        await asyncio.sleep(0.05)
+
+        reclaimed = json.loads((await server._next_job()).split(b"\r\n\r\n", 1)[1])
+        assert reclaimed["job"]["id"] == job.id
+        job.future.set_result("Recovered after a second interruption")
+        assert await waiter == "Recovered after a second interruption"
+
+    asyncio.run(exercise())
+
+
 def test_bridge_stopped_heartbeat_fails_at_recovery_deadline(monkeypatch) -> None:
     async def exercise() -> None:
         monkeypatch.setattr(extension_bridge_module, "JOB_LEASE_SECONDS", 0.005)

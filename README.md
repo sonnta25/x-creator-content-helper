@@ -85,7 +85,8 @@ such as `/replytargets AI agents`, continue to work.
 - `/replyevery <5-1440>` — set the scheduled post-reply interval in minutes.
 - `/videoevery <3-1440>` — set the scheduled video-reply interval.
 - `/replybatch show|targets <2-5>|video <2-5>` — set cards requested per run.
-- `/replycap show|daily <1-2000>|author <1-25>` — set daily and per-author ceilings.
+- `/replycap show|daily <1-2000>|author <1-25>` — inspect approved-card usage and
+  set daily or per-author ceilings. Pending and rejected drafts do not consume caps.
 - `/pace show|conservative|adaptive|high|pause|resume` — control adaptive hourly
   card ceilings and health backoff.
 - `/replylangs show|add|remove|set` — manage up to six X language codes.
@@ -331,18 +332,20 @@ Logs are written to `logs/bot.out.log` and `logs/bot.err.log`.
 6. Enable **Auto Run** for queued Gemini work and **Automation** for schedules.
 7. Keep low-resource mode enabled on a small VPS.
 
-The required extension version is `0.8.6`. After replacing project files, press
+The required extension version is `0.8.7`. After replacing project files, press
 **Reload** on the extension card whenever `browser_extension/` changed.
 
-Version `0.8.6` allows up to 60 seconds for Gemini's editor to accept and submit a
+Version `0.8.7` allows up to 60 seconds for Gemini's editor to accept and submit a
 large reply-target prompt on a low-spec VPS, while still bounding frame upload and
 DOM-read operations. It also reduces expensive shadow-DOM scans; fails a no-progress
 Gemini response after four minutes; uses a lightweight watchdog only while a provider
 job is active; and requeues an interrupted job as soon as its heartbeat lease expires.
-The active job ID is persisted across Chrome/extension restarts, with an immediate
-reclaim attempt and a second attempt after the lease expires. Video evidence frames
-are capped at 512 pixels and 350 KB to reduce Chrome memory use. The extension cannot
-restart the entire Chrome process if Chrome itself is closed or remains frozen.
+The active job ID remains persisted until completion or confirmed expiry. Heartbeat
+injection is restored after every managed Gemini navigation, while a 30-second reclaim
+watchdog keeps retrying across delayed MV3 alarms instead of relying on two one-shot
+attempts. Video evidence frames are capped at 512 pixels and 350 KB to reduce Chrome
+memory use. The extension cannot restart the entire Chrome process if Chrome itself is
+closed or remains frozen.
 
 ## Important `.env` settings
 
@@ -384,7 +387,7 @@ Prefer `/importcookie`, `/replylangs`, `/replygoal`, `/replycap`, `/replybatch`,
 update the running bot immediately and persist supported values to `.env`.
 
 Do not increase the bridge timeout simply to hide a stuck provider tab. Values are
-clamped to 120-360 seconds, and extension `0.8.6` should recover or recycle a stalled
+clamped to 120-360 seconds, and extension `0.8.7` should recover or recycle a stalled
 tab earlier.
 
 ## Media downloads
@@ -439,11 +442,12 @@ node --check browser_extension\background.js
 
 - **No reply-ready posts:** run `/setupcheck` and `/xaccounts`; refresh X cookies if
   the pool reports authentication, challenge, or rate-limit errors.
-- **Chrome never claimed the job:** reload extension `0.8.6`, verify the bridge URL
+- **Chrome never claimed the job:** reload extension `0.8.7`, verify the bridge URL
   and token, and enable Auto Run or click **Run next job**.
-- **Heartbeat stopped:** keep Chrome open. Version `0.8.6` adds a per-job watchdog and
-  lease-based requeue for an interrupted MV3 worker, but cannot recover a terminated or
-  completely frozen Chrome process.
+- **Heartbeat stopped:** keep Chrome open. Version `0.8.7` reattaches the page heartbeat
+  after Gemini navigation, preserves interrupted job state, and retries lease reclaim
+  every 30 seconds. It still cannot recover a terminated or completely frozen Chrome
+  process.
 - **Gemini made no readable progress:** inspect the managed Gemini tab for login,
   verification, quota, or usage-limit messages.
 - **Video frame upload failed:** confirm Gemini is logged in and reload the extension;

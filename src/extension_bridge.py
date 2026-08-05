@@ -122,6 +122,11 @@ class ExtensionBridgeServer:
                     job.last_heartbeat_at > 0
                     and now - job.last_heartbeat_at <= JOB_LEASE_SECONDS
                 )
+                if heartbeat_is_recent:
+                    # A reclaimed worker gets a fresh recovery window if it is
+                    # interrupted again later. Keeping the first stall timestamp
+                    # would make a successful reclaim fail at the old deadline.
+                    stalled_since = None
                 if job.claim_attempts > 0 and not heartbeat_is_recent:
                     if stalled_since is None:
                         stalled_since = now
@@ -166,8 +171,6 @@ class ExtensionBridgeServer:
                 if now < soft_deadline:
                     continue
 
-                if heartbeat_is_recent:
-                    stalled_since = None
                 if heartbeat_is_recent and now < hard_deadline:
                     # Chrome has claimed the job and is still alive. Give the
                     # provider enough room to finish its own configured timeout

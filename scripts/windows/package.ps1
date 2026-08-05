@@ -87,7 +87,23 @@ try {
         Copy-Item -LiteralPath $file.FullName -Destination $target -Force
     }
 
-    Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $OutputPath -Force
+    $archiveCreated = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $OutputPath -Force
+            $archiveCreated = $true
+            break
+        } catch {
+            if ($attempt -ge 3) {
+                throw
+            }
+            Write-Warning "Archive attempt $attempt failed because a staging file was temporarily locked. Retrying..."
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
+    if (-not $archiveCreated) {
+        throw "Deployment archive was not created."
+    }
     Write-Host "Package created: $OutputPath"
 } finally {
     if (Test-Path $stagingRoot) {

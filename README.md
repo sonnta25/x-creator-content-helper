@@ -146,6 +146,16 @@ signal, but it still keeps the freshness, root-post, active-card, deduplication,
 monetization-safety checks. If fewer than two real candidates remain, no tweet or URL
 is invented and no Gemini batch is spent.
 
+Posts that already have an active card are removed before each top-N ranking pass, so
+previous winners cannot hide slightly lower-ranked unused candidates. If Gemini still
+produces no card, the Telegram status reports exact final-check counts for active URLs,
+stale opportunities, unknown URLs, similar drafts, and safety limits.
+
+Per-author and Japanese anti-farming limits are also applied before the final top-five
+cut. When a leading candidate has reached one of those limits, the bot continues down
+the ranked pool and fills the batch from another eligible author or language instead of
+submitting a batch that is guaranteed to create zero cards.
+
 Priority authors are searched before generic trend lanes. Their posts still pass the
 same freshness, public-momentum, reply-competition, deduplication, and safety gates;
 watching an author is a ranking advantage, not an automatic approval.
@@ -183,6 +193,10 @@ the strongest non-Japanese global candidate. If Japanese supply is scarce or blo
 by safety limits, the remaining slots fall back to other languages without failing the
 run. Freshness, momentum, reply competition, monetization safety, and learned outcome
 quality still apply; language preference never bypasses those gates.
+
+Previously carded videos are likewise removed before strict, warm, and fill ranking;
+the bot therefore continues down the fresh candidate pool instead of repeatedly asking
+Gemini to process the same top videos.
 
 When caption or X media text is reliable, the reply is grounded only in that text.
 When it is not reliable and `REPLY_VIDEO_FRAME_ANALYSIS=true`, the bot downloads the
@@ -242,13 +256,26 @@ is required because one Telegram button cannot both record a callback and open X
 Long replies that do not fit safely in a Web Intent remain available through
 **Copy draft** or normal copy/paste.
 
-Reply batches are delivered one card at a time. After an unrelated reply is approved,
-the bot keeps the next card queued until the current reply-safety spacing has elapsed,
-then sends it automatically; the operator no longer receives a "wait and tap again"
-alert. Rejecting a card releases the next one immediately because no reply was posted.
-Author and verified-audience conversation follow-ups remain immediate. The timer starts
-from Telegram approval because the bot deliberately cannot observe the final manual X
-Reply click.
+Reply batches use one global delivery queue across `/replytargets`, `/replyvideo`,
+guided sessions, and overlapping scheduled runs. Only one undecided reply card is
+visible at a time. After an unrelated reply is approved, the bot keeps every later card
+queued until the current reply-safety spacing has elapsed, then sends the oldest one
+automatically; the operator no longer receives a "wait and tap again" alert. Rejecting
+a card releases the next one immediately because no reply was posted. Author and
+verified-audience conversation follow-ups remain immediate. The timer starts from
+Telegram approval because the bot deliberately cannot observe the final manual X Reply
+click.
+
+The delivery window is 120-240 seconds in conservative pace, 60-120 seconds in
+adaptive pace, and 30-60 seconds in high pace. Strict risk mode always keeps at least
+the 120-240 second window. Open risk mode removes its language/category caps but no
+longer disables card-delivery spacing.
+
+A queued card is marked as delivered only after Telegram returns a message receipt.
+Transient Telegram delivery failures keep the card unsent and retry after 15, 30, 60,
+then at most 120 seconds while its approval remains fresh. On the first restart after
+upgrading, the bot also releases uncertain delayed cards created by the earlier
+pre-receipt queue implementation.
 
 Set the real posting username with:
 

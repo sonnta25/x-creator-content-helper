@@ -10,6 +10,7 @@ from src.automation import AutomationApproval
 from src.bot import (
     BOT_COMMANDS,
     ContentBot,
+    GLOBAL_REPLY_DELIVERY_QUEUE_ID,
     MENU_ACTIONS,
     MENU_LAYOUTS,
     MENU_INBOX,
@@ -475,6 +476,20 @@ def test_natural_spacing_delays_delivery_without_blocking_approval(tmp_path) -> 
     assert bot._reply_approval_delay_seconds(followup, now=now) == 0
 
 
+def test_open_risk_mode_still_keeps_a_high_pace_delivery_gap(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+        )
+    )
+    bot.revenue_ops.set_risk_mode("open")
+    bot.revenue_ops.set_pace_mode("high")
+
+    assert bot._reply_delivery_base_gap_seconds() == 30
+
+
 def test_balanced_mode_skips_japanese_tragedy_targets(tmp_path) -> None:
     bot = ContentBot(
         Settings(
@@ -699,7 +714,7 @@ def test_reply_delivery_queue_schedules_next_card_instead_of_showing_wait_alert(
     refreshed = bot.approvals.get(approval.id)
 
     assert sent == []
-    assert scheduled["queue_id"] == "batch-1"
+    assert scheduled["queue_id"] == GLOBAL_REPLY_DELIVERY_QUEUE_ID
     assert scheduled["delay_seconds"] == 131
     assert refreshed is not None
     assert refreshed.metadata["reply_delivery_card_sent"] is False
@@ -739,6 +754,141 @@ def test_rejected_card_releases_next_delivery_immediately(tmp_path) -> None:
     assert sent == [approval.id]
     assert refreshed is not None
     assert refreshed.metadata["reply_delivery_card_sent"] is True
+
+
+def test_reply_delivery_is_global_across_overlapping_batches(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    visible = bot.approvals.create(
+        kind="reply",
+        text="Visible replyvideo card",
+        chat_id=1,
+        approver_user_id=1,
+        target_url="https://x.com/video/status/10",
+        metadata={
+            "reply_delivery_queue_id": "video-batch",
+            "reply_delivery_queue_index": 0,
+            "reply_delivery_card_sent": True,
+            "reply_delivery_message_id": 10,
+        },
+    )
+    queued = bot.approvals.create(
+        kind="reply",
+        text="Queued replytargets card",
+        chat_id=1,
+        approver_user_id=1,
+        target_url="https://x.com/post/status/11",
+        metadata={
+            "reply_delivery_queue_id": "target-batch",
+            "reply_delivery_queue_index": 0,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    sent = []
+
+    async def send(item):
+        sent.append(item.id)
+
+    bot._send_approval = send
+
+    assert asyncio.run(
+        bot._send_next_reply_delivery("target-batch", respect_pacing=False)
+    ) is True
+    assert sent == []
+
+    bot.approvals.decide(
+        visible.id,
+        approve=False,
+        chat_id=1,
+        user_id=1,
+        destination="mobile",
+    )
+    assert asyncio.run(
+        bot._send_next_reply_delivery("video-batch", respect_pacing=False)
+    ) is True
+    assert sent == [queued.id]
+
+
+def test_failed_telegram_delivery_stays_unsent_and_retries(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Retry this card",
+        chat_id=1,
+        target_url="https://x.com/source/status/4",
+        metadata={
+            "reply_delivery_queue_id": "batch-retry",
+            "reply_delivery_queue_index": 1,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    scheduled = {}
+    bot._reply_approval_delay_seconds = lambda _approval: 0
+    bot._schedule_delayed_approval_queue = lambda queue_id, **kwargs: scheduled.update(
+        {"queue_id": queue_id, **kwargs}
+    )
+
+    async def fail_send(_approval):
+        raise RuntimeError("temporary Telegram timeout")
+
+    bot._send_approval = fail_send
+
+    assert asyncio.run(
+        bot._send_next_reply_delivery("batch-retry", respect_pacing=True)
+    ) is True
+    refreshed = bot.approvals.get(approval.id)
+
+    assert refreshed is not None
+    assert refreshed.metadata["reply_delivery_card_sent"] is False
+    assert refreshed.metadata["reply_delivery_attempts"] == 1
+    assert "Telegram timeout" in refreshed.metadata["reply_delivery_last_error"]
+    assert scheduled["queue_id"] == GLOBAL_REPLY_DELIVERY_QUEUE_ID
+    assert scheduled["delay_seconds"] == 15
+
+
+def test_restore_recovers_uncertain_delayed_card_from_previous_build(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Previously stuck card",
+        chat_id=1,
+        target_url="https://x.com/source/status/5",
+        metadata={
+            "reply_delivery_queue_id": "batch-old",
+            "reply_delivery_queue_index": 1,
+            "reply_delivery_card_sent": True,
+        },
+    )
+    sent = []
+
+    async def send(item):
+        sent.append(item.id)
+        return SimpleNamespace(message_id=99)
+
+    bot._send_approval = send
+
+    asyncio.run(bot._restore_reply_delivery_queues())
+    refreshed = bot.approvals.get(approval.id)
+
+    assert sent == [approval.id]
+    assert refreshed is not None
+    assert refreshed.metadata["reply_delivery_card_sent"] is True
+    assert refreshed.metadata["reply_delivery_message_id"] == 99
+    assert refreshed.metadata["reply_delivery_receipt_recovered"] is True
 
 
 def test_final_opportunity_check_rejects_a_suddenly_saturated_thread() -> None:
@@ -1068,6 +1218,86 @@ def test_replyvideo_search_lanes_are_serialized_for_one_cookie_pool() -> None:
     assert results == []
     assert search.calls == 8
     assert search.max_active == 1
+
+
+def test_replyvideo_removes_active_cards_before_each_ranking_pass(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    now = int(datetime.now(UTC).timestamp())
+    active = XSearchResult(
+        id=1201,
+        username="activevideo",
+        display_name="Active Video",
+        text="Already has a card",
+        created_at="",
+        url="https://x.com/activevideo/status/1201",
+        language="ja",
+        created_at_timestamp=now - 120,
+        like_count=1_000,
+        view_count=200_000,
+        has_video=True,
+    )
+    unused = XSearchResult(
+        id=1202,
+        username="unusedvideo",
+        display_name="Unused Video",
+        text="Fresh unused video",
+        created_at="",
+        url="https://x.com/unusedvideo/status/1202",
+        language="en",
+        created_at_timestamp=now - 120,
+        like_count=500,
+        view_count=100_000,
+        has_video=True,
+    )
+
+    class FakeSearch:
+        async def search_recent(self, query, **_kwargs):
+            return query, [active, unused]
+
+    class Status:
+        async def edit_text(self, _text):
+            return None
+
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+            reply_target_metrics_path=str(tmp_path / "metrics.json"),
+        )
+    )
+    bot.x_search = FakeSearch()
+    bot.approvals.create(
+        kind="reply",
+        text="Existing active video draft",
+        chat_id=123,
+        approver_user_id=123,
+        target_url=active.url,
+    )
+    ranked_inputs: list[list[int]] = []
+
+    def fake_rank(results, **_kwargs):
+        ranked_inputs.append([result.id for result in results])
+        return list(results)
+
+    async def enrich(results):
+        return results
+
+    monkeypatch.setattr("src.bot.rank_viral_video_posts", fake_rank)
+    bot._enrich_reply_thread_context = enrich
+    bot._apply_reply_target_mode = lambda results, _mode: results
+
+    _label, results, note = asyncio.run(
+        bot._get_reply_video_context("", Status())
+    )
+
+    assert ranked_inputs == [[1202], [1202], [1202]]
+    assert [result.id for result in results] == [1202]
+    assert "Skipped 1 already-used" in note
 
 
 def test_replyvideo_mix_prefers_two_japanese_then_best_global_alternative() -> None:
@@ -2057,6 +2287,126 @@ def test_replytargets_relaxed_ranking_keeps_view_count_as_a_hard_floor() -> None
     )
 
     assert [result.id for result in ranked] == [10]
+
+
+def test_replytargets_remove_active_cards_before_top_five_ranking(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+            reply_target_metrics_path=str(tmp_path / "metrics.json"),
+        )
+    )
+    now = int(datetime.now(UTC).timestamp())
+    candidates: list[XSearchResult] = []
+    for index in range(6):
+        candidate = XSearchResult(
+            id=900 + index,
+            username=f"candidate{index}",
+            display_name=f"Candidate {index}",
+            text=f"Fresh distinct discussion {index}",
+            created_at="",
+            url=f"https://x.com/candidate{index}/status/{900 + index}",
+            created_at_timestamp=now - 120,
+            like_count=500 - index * 50,
+            reply_count=5,
+            view_count=100_000 - index * 10_000,
+            author_followers_count=100_000,
+        )
+        candidates.append(candidate)
+        if index < 5:
+            bot.approvals.create(
+                kind="reply",
+                text=f"Existing draft {index}",
+                chat_id=123,
+                approver_user_id=123,
+                target_url=candidate.url,
+            )
+
+    ranked = bot._rank_reply_target_pool(
+        candidates,
+        relaxed=True,
+        max_age_minutes=360,
+    )
+
+    assert [result.id for result in ranked] == [905]
+
+
+def test_replytargets_fill_from_other_languages_when_japanese_hourly_limit_is_full(
+    tmp_path,
+) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+            reply_target_metrics_path=str(tmp_path / "metrics.json"),
+        )
+    )
+    for index in range(6):
+        approval = bot.approvals.create(
+            kind="reply",
+            text=f"Approved Japanese reply {index}",
+            chat_id=123,
+            approver_user_id=123,
+            target_url=f"https://x.com/history{index}/status/{1300 + index}",
+            metadata={"language": "ja", "root_author": f"history{index}"},
+        )
+        bot.approvals.decide(
+            approval.id,
+            approve=True,
+            chat_id=123,
+            user_id=123,
+            destination="mobile",
+        )
+
+    now = int(datetime.now(UTC).timestamp())
+    candidates = [
+        XSearchResult(
+            id=1400 + index,
+            username=f"japanese{index}",
+            display_name=f"Japanese {index}",
+            text=f"Fast Japanese post {index}",
+            created_at="",
+            url=f"https://x.com/japanese{index}/status/{1400 + index}",
+            language="ja",
+            created_at_timestamp=now - 120,
+            like_count=1_000 - index * 50,
+            reply_count=5,
+            view_count=200_000 - index * 10_000,
+            author_followers_count=100_000,
+        )
+        for index in range(5)
+    ]
+    candidates.append(
+        XSearchResult(
+            id=1500,
+            username="englishbackup",
+            display_name="English Backup",
+            text="A slightly lower-ranked but eligible English post",
+            created_at="",
+            url="https://x.com/englishbackup/status/1500",
+            language="en",
+            created_at_timestamp=now - 120,
+            like_count=300,
+            reply_count=5,
+            view_count=50_000,
+            author_followers_count=100_000,
+        )
+    )
+
+    ranked = bot._rank_reply_target_pool(
+        candidates,
+        relaxed=True,
+        max_age_minutes=360,
+    )
+
+    assert [result.id for result in ranked] == [1500]
 
 
 def test_replytargets_volume_fallback_lowers_view_floor_to_fill_batch(tmp_path) -> None:

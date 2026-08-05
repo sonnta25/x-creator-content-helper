@@ -112,6 +112,7 @@ REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
 REPLY_TARGET_REFRESH_TIMEOUT_SECONDS = 12
 REPLY_TARGET_REFRESH_LIMIT = 6
+GLOBAL_REPLY_DELIVERY_QUEUE_ID = "global-reply-delivery"
 COMMAND_INPUT_TIMEOUT_SECONDS = 5 * 60
 COMMAND_INPUT_PROMPTS = {
     "download": (
@@ -361,6 +362,39 @@ class _PendingCommandInput:
     command: str
     expires_at: float
     prompt_message_id: int | None = None
+
+
+@dataclass(frozen=True)
+class _ReplyApprovalCreationResult:
+    created: int = 0
+    ai_drafts: int = 0
+    filtered_author_limit: int = 0
+    filtered_language_limit: int = 0
+    filtered_active: int = 0
+    filtered_missing_source: int = 0
+    filtered_closed: int = 0
+    filtered_duplicate: int = 0
+    blocked_reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.created > 0
+
+    def diagnostic(self) -> str:
+        parts = []
+        if self.blocked_reason:
+            parts.append(self.blocked_reason)
+        parts.append(f"AI drafts: {self.ai_drafts}")
+        filters = (
+            ("already active", self.filtered_active),
+            ("URL not in the selected pool", self.filtered_missing_source),
+            ("stale after refresh", self.filtered_closed),
+            ("similar to a recent reply", self.filtered_duplicate),
+            ("per-author limit", self.filtered_author_limit),
+            ("Japanese safety limit", self.filtered_language_limit),
+        )
+        parts.extend(f"{label}: {count}" for label, count in filters if count)
+        parts.append(f"cards created: {self.created}")
+        return "; ".join(parts)
 
 
 BOT_COMMANDS = [
@@ -950,15 +984,18 @@ class ContentBot:
             return
         if raw in {"show", "status"}:
             guardrails = reply_farming_guardrails(self.revenue_ops.risk_mode)
+            delivery_gap = self._reply_delivery_base_gap_seconds()
             farming_limits = (
-                "No extra volume guardrails"
+                (
+                    "No extra language/category caps; card delivery spacing "
+                    f"{delivery_gap}-{delivery_gap * 2}s"
+                )
                 if guardrails.global_hourly_cap is None
                 else (
                     f"Global {guardrails.global_hourly_cap}/hour; Japanese "
                     f"{guardrails.japanese_daily_cap}/day and "
                     f"{guardrails.japanese_hourly_cap}/hour; approval spacing "
-                    f"{guardrails.minimum_approval_gap_seconds}-"
-                    f"{guardrails.minimum_approval_gap_seconds * 2}s"
+                    f"{delivery_gap}-{delivery_gap * 2}s"
                 )
             )
             await message.reply_text(
@@ -1360,12 +1397,12 @@ class ContentBot:
             )
             if not created:
                 await status.edit_text(
-                    "Targets were found, but they expired, exceeded the author limit, or "
-                    "produced duplicate drafts during the final check. No card was sent."
+                    "Targets were found, but the final check created no card. "
+                    f"{created.diagnostic()}"
                 )
                 return
             await status.edit_text(
-                f"Session ready: {created} card(s), goal {self.settings.creator_goal}. "
+                f"Session ready: {created.created} card(s), goal {self.settings.creator_goal}. "
                 "Only one card is shown at a time; approving or rejecting it opens the next."
             )
         except Exception as exc:
@@ -1944,14 +1981,16 @@ class ContentBot:
         max_items: int | None = None,
         session_id: str = "",
         sequential: bool = False,
-    ) -> int:
+    ) -> _ReplyApprovalCreationResult:
         if not results:
-            return 0
+            return _ReplyApprovalCreationResult(blocked_reason="No candidates were supplied.")
         if self.revenue_ops.pace_paused:
-            return 0
+            return _ReplyApprovalCreationResult(blocked_reason="Reply generation is paused.")
         hourly_remaining = self._hourly_reply_capacity()
         if hourly_remaining <= 0:
-            return 0
+            return _ReplyApprovalCreationResult(
+                blocked_reason="The adaptive hourly card ceiling is full."
+            )
         requested_batch_size = min(
             5,
             hourly_remaining,
@@ -1967,34 +2006,20 @@ class ContentBot:
             ),
         )
         generation_size = min(5, requested_batch_size + (0 if sequential else 2))
-        eligible = [
-            result
-            for result in results
-            if _author_approvals_created_today(
-                self.approvals.items(),
-                username=result.username,
-                timezone_name=self.settings.creator_timezone,
+        selected, filtered_author_limit, filtered_language_limit = (
+            self._filter_reply_generation_candidates(
+                _select_diverse_candidates(results, len(results)),
+                max_items=generation_size,
             )
-            < self.settings.reply_author_daily_cap
-        ]
-        japanese_slots = self._japanese_reply_slots_remaining()
-        selected: list[XSearchResult] = []
-        selected_japanese = 0
-        for result in _select_diverse_candidates(eligible, len(eligible)):
-            is_japanese = str(result.language or "").casefold().startswith("ja")
-            if (
-                is_japanese
-                and japanese_slots is not None
-                and selected_japanese >= japanese_slots
-            ):
-                continue
-            selected.append(result)
-            if is_japanese:
-                selected_japanese += 1
-            if len(selected) >= generation_size:
-                break
+        )
         if not selected:
-            return 0
+            return _ReplyApprovalCreationResult(
+                filtered_author_limit=filtered_author_limit,
+                filtered_language_limit=filtered_language_limit,
+                blocked_reason=(
+                    "All candidates were removed by per-author or Japanese safety limits."
+                ),
+            )
         strategy_by_url = {
             result.url: self.reply_learning.choose_strategy()
             for result in selected
@@ -2039,6 +2064,10 @@ class ContentBot:
         )
         generation_latency_seconds = round(time.monotonic() - generation_started, 1)
         created: list[AutomationApproval] = []
+        filtered_active = 0
+        filtered_missing_source = 0
+        filtered_closed = 0
+        filtered_duplicate = 0
         delivery_queue_id = session_id or f"batch-{chat_id}-{time.time_ns()}"
         recent_texts = _recent_reply_texts(self.approvals.items(), limit=120)
         for draft in drafts:
@@ -2046,15 +2075,19 @@ class ContentBot:
                 break
             target_url = _format_reply_target_link(draft)
             if self.approvals.has_active_target(target_url):
+                filtered_active += 1
                 continue
             result = _result_for_url(selected, target_url)
             if result is None:
+                filtered_missing_source += 1
                 continue
             if not await self._opportunity_still_open(result, video_mode=result.has_video):
                 self.reply_watch.mark_expired(target_url, reason="opportunity changed")
+                filtered_closed += 1
                 continue
             draft_text = _format_reply_target_reply(draft)
             if _is_semantic_duplicate(draft_text, recent_texts):
+                filtered_duplicate += 1
                 continue
             strategy = strategy_by_url.get(target_url, "specific_observation")
             approval = self.approvals.create(
@@ -2106,7 +2139,16 @@ class ContentBot:
                 delivery_queue_id,
                 respect_pacing=True,
             )
-        return len(created)
+        return _ReplyApprovalCreationResult(
+            created=len(created),
+            ai_drafts=len(drafts),
+            filtered_author_limit=filtered_author_limit,
+            filtered_language_limit=filtered_language_limit,
+            filtered_active=filtered_active,
+            filtered_missing_source=filtered_missing_source,
+            filtered_closed=filtered_closed,
+            filtered_duplicate=filtered_duplicate,
+        )
 
     def _japanese_reply_slots_remaining(self) -> int | None:
         guardrails = reply_farming_guardrails(self.revenue_ops.risk_mode)
@@ -2130,6 +2172,56 @@ class ContentBot:
                 (guardrails.japanese_hourly_cap or 0) - used_hour,
             ),
         )
+
+    def _filter_reply_generation_candidates(
+        self,
+        results: list[XSearchResult],
+        *,
+        max_items: int | None = None,
+    ) -> tuple[list[XSearchResult], int, int]:
+        """Apply approval-time author/language limits while retaining backups."""
+        approvals = self.approvals.items()
+        japanese_slots = self._japanese_reply_slots_remaining()
+        selected: list[XSearchResult] = []
+        selected_by_author: dict[str, int] = {}
+        selected_japanese = 0
+        filtered_author_limit = 0
+        filtered_language_limit = 0
+        limit = len(results) if max_items is None else max(0, max_items)
+        if limit == 0:
+            return [], 0, 0
+
+        for result in results:
+            author = str(result.username or "").strip().lstrip("@").casefold()
+            author_used = _author_approvals_created_today(
+                approvals,
+                username=author,
+                timezone_name=self.settings.creator_timezone,
+            )
+            if author_used + selected_by_author.get(author, 0) >= (
+                self.settings.reply_author_daily_cap
+            ):
+                filtered_author_limit += 1
+                continue
+
+            is_japanese = str(result.language or "").casefold().startswith("ja")
+            if (
+                is_japanese
+                and japanese_slots is not None
+                and selected_japanese >= japanese_slots
+            ):
+                filtered_language_limit += 1
+                continue
+
+            selected.append(result)
+            if author:
+                selected_by_author[author] = selected_by_author.get(author, 0) + 1
+            if is_japanese:
+                selected_japanese += 1
+            if len(selected) >= limit:
+                break
+
+        return selected, filtered_author_limit, filtered_language_limit
 
     def _reply_approval_safety_block(
         self,
@@ -2202,10 +2294,7 @@ class ContentBot:
         if bool((approval.metadata or {}).get("relationship_followup")):
             return 0
         current = now or datetime.now(UTC)
-        guardrails = reply_farming_guardrails(self.revenue_ops.risk_mode)
-        base_gap = guardrails.minimum_approval_gap_seconds
-        if base_gap <= 0:
-            return 0
+        base_gap = self._reply_delivery_base_gap_seconds()
         approved = [
             item
             for item in self.approvals.items()
@@ -2229,6 +2318,18 @@ class ContentBot:
         if remaining > 0:
             return remaining
         return 0
+
+    def _reply_delivery_base_gap_seconds(self) -> int:
+        """Keep card delivery paced even when risk filtering is fully open."""
+        pace_floor = {
+            "conservative": 120,
+            "adaptive": 60,
+            "high": 30,
+        }.get(self.revenue_ops.pace_mode, 60)
+        safety_floor = reply_farming_guardrails(
+            self.revenue_ops.risk_mode
+        ).minimum_approval_gap_seconds
+        return max(pace_floor, safety_floor)
 
     def _adaptive_hourly_ceiling(self) -> int:
         ceiling = self.revenue_ops.hourly_ceiling(self.settings.creator_daily_reply_cap)
@@ -2333,12 +2434,17 @@ class ContentBot:
         *,
         respect_pacing: bool,
     ) -> bool:
+        # Batch IDs remain in metadata for diagnostics, but delivery is global:
+        # replytargets, replyvideo, sessions, and overlapping scheduled runs
+        # must never expose two undecided cards at the same time.
+        del queue_id
         return await self._send_next_approval_queue(
-            queue_id,
+            GLOBAL_REPLY_DELIVERY_QUEUE_ID,
             queue_key="reply_delivery_queue_id",
             index_key="reply_delivery_queue_index",
             sent_key="reply_delivery_card_sent",
             respect_pacing=respect_pacing,
+            global_reply_delivery=True,
         )
 
     async def _send_next_approval_queue(
@@ -2349,13 +2455,36 @@ class ContentBot:
         index_key: str,
         sent_key: str,
         respect_pacing: bool,
+        global_reply_delivery: bool = False,
     ) -> bool:
-        pending = sorted(
-            self.approvals.pending_by_metadata(queue_key, queue_id),
-            key=lambda approval: int(
-                (approval.metadata or {}).get(index_key) or 0
-            ),
-        )
+        if global_reply_delivery:
+            pending = sorted(
+                (
+                    approval
+                    for approval in self.approvals.items()
+                    if approval.kind == "reply"
+                    and approval.status == "pending"
+                    and bool((approval.metadata or {}).get(queue_key))
+                ),
+                key=lambda approval: (
+                    approval.created_at,
+                    int((approval.metadata or {}).get(index_key) or 0),
+                ),
+            )
+            # A sent-but-undecided card is already visible in Telegram. Wait
+            # for its Approve/Reject callback before exposing any other batch.
+            if any(
+                bool((approval.metadata or {}).get(sent_key))
+                for approval in pending
+            ):
+                return True
+        else:
+            pending = sorted(
+                self.approvals.pending_by_metadata(queue_key, queue_id),
+                key=lambda approval: int(
+                    (approval.metadata or {}).get(index_key) or 0
+                ),
+            )
         next_card = next(
             (
                 approval
@@ -2384,13 +2513,58 @@ class ContentBot:
                 index_key=index_key,
                 sent_key=sent_key,
                 delay_seconds=delay_seconds,
+                global_reply_delivery=global_reply_delivery,
+            )
+            return True
+        try:
+            telegram_message = await self._send_approval(next_card)
+        except Exception as exc:
+            attempts = int(
+                (next_card.metadata or {}).get("reply_delivery_attempts") or 0
+            ) + 1
+            retry_seconds = min(120, 15 * (2 ** min(attempts - 1, 3)))
+            self.approvals.update_metadata(
+                next_card.id,
+                **{
+                    sent_key: False,
+                    "reply_delivery_attempts": attempts,
+                    "reply_delivery_last_error": _truncate_text(
+                        _exception_detail(exc),
+                        500,
+                    ),
+                    "reply_delivery_not_before": (
+                        datetime.now(UTC) + timedelta(seconds=retry_seconds)
+                    ).isoformat(),
+                },
+            )
+            self._schedule_delayed_approval_queue(
+                queue_id,
+                queue_key=queue_key,
+                index_key=index_key,
+                sent_key=sent_key,
+                delay_seconds=retry_seconds,
+                global_reply_delivery=global_reply_delivery,
+            )
+            LOGGER.warning(
+                "Telegram reply-card delivery failed; retrying in %ss (attempt %s): %s",
+                retry_seconds,
+                attempts,
+                _exception_detail(exc),
             )
             return True
         self.approvals.update_metadata(
             next_card.id,
-            **{sent_key: True, "reply_delivery_not_before": ""},
+            **{
+                sent_key: True,
+                "reply_delivery_not_before": "",
+                "reply_delivery_attempts": 0,
+                "reply_delivery_last_error": "",
+                "reply_delivery_message_id": int(
+                    getattr(telegram_message, "message_id", 0) or 0
+                ),
+                "reply_delivery_sent_at": datetime.now(UTC).isoformat(),
+            },
         )
-        await self._send_approval(next_card)
         return True
 
     def _schedule_delayed_approval_queue(
@@ -2401,6 +2575,7 @@ class ContentBot:
         index_key: str,
         sent_key: str,
         delay_seconds: int,
+        global_reply_delivery: bool = False,
     ) -> None:
         task_key = f"{queue_key}:{queue_id}"
         active = self._delayed_approval_tasks.get(task_key)
@@ -2418,6 +2593,7 @@ class ContentBot:
                 index_key=index_key,
                 sent_key=sent_key,
                 respect_pacing=True,
+                global_reply_delivery=global_reply_delivery,
             )
 
         task = asyncio.create_task(
@@ -2447,6 +2623,27 @@ class ContentBot:
             if approval.kind == "reply" and approval.status == "pending"
         }
         for queue_id in sorted(queue_id for queue_id in queue_ids if queue_id):
+            pending = self.approvals.pending_by_metadata(
+                "reply_delivery_queue_id",
+                queue_id,
+            )
+            # Version 0.8.8 initially marked a delayed card as sent before
+            # Telegram confirmed send_message. A pending non-first card with no
+            # Telegram receipt is therefore uncertain. Release it once during
+            # upgrade; later deliveries always persist the real message ID.
+            for approval in pending:
+                metadata = approval.metadata or {}
+                if (
+                    bool(metadata.get("reply_delivery_card_sent"))
+                    and not int(metadata.get("reply_delivery_message_id") or 0)
+                    and int(metadata.get("reply_delivery_queue_index") or 0) > 0
+                    and not bool(metadata.get("reply_delivery_receipt_recovered"))
+                ):
+                    self.approvals.update_metadata(
+                        approval.id,
+                        reply_delivery_card_sent=False,
+                        reply_delivery_receipt_recovered=True,
+                    )
             pending = self.approvals.pending_by_metadata(
                 "reply_delivery_queue_id",
                 queue_id,
@@ -3090,8 +3287,8 @@ class ContentBot:
                 await _delete_message_safely(status)
             else:
                 await status.edit_text(
-                    "Scheduled /replytargets finished, but every returned target already "
-                    "has an active approval card."
+                    "Scheduled /replytargets created no new cards. Final check: "
+                    f"{sent.diagnostic()}."
                 )
         except Exception:
             await _delete_message_safely(status)
@@ -3157,9 +3354,16 @@ class ContentBot:
             if sent:
                 await _delete_message_safely(status)
             else:
+                queued = _pending_reply_delivery_count(
+                    self.approvals.items(),
+                    source_type="replyvideo",
+                )
                 await status.edit_text(
-                    "Scheduled /replyvideo finished, but all returned videos already have "
-                    "active approval cards."
+                    "Scheduled /replyvideo created no new cards. Candidates were already "
+                    "filtered during the final check. "
+                    f"{sent.diagnostic()}. Pending video delivery queue: {queued}. "
+                    "Queued cards retry "
+                    "Telegram delivery automatically."
                 )
         except Exception:
             await _delete_message_safely(status)
@@ -3168,11 +3372,11 @@ class ContentBot:
     async def _send_approval(
         self,
         approval: AutomationApproval,
-    ) -> None:
+    ) -> Any:
         if self._application is None:
             raise RuntimeError("Telegram bot is not ready.")
         body = _approval_message_text(approval)
-        await self._application.bot.send_message(
+        return await self._application.bot.send_message(
             chat_id=approval.chat_id,
             text=body[:4096],
             reply_markup=_approval_keyboard(approval),
@@ -3279,10 +3483,16 @@ class ContentBot:
                 chat_id=message.chat.id,
                 approver_user_id=approver_user_id,
             )
-            await status.edit_text(
-                f"Queued {sent} reply card(s). Cards are delivered one at a time "
-                f"with automatic pacing. Watching total: {watching_total}."
-            )
+            if sent:
+                await status.edit_text(
+                    f"Queued {sent.created} reply card(s). Cards are delivered one at a time "
+                    f"with automatic pacing. Watching total: {watching_total}."
+                )
+            else:
+                await status.edit_text(
+                    "No reply card passed the final check. "
+                    f"{sent.diagnostic()}. Watching total: {watching_total}."
+                )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -3353,10 +3563,16 @@ class ContentBot:
                 video_mode=True,
                 visual_attachments=visual_attachments,
             )
-            await status.edit_text(
-                f"Queued {sent} viral-video reply card(s). Cards are delivered "
-                "one at a time with automatic pacing."
-            )
+            if sent:
+                await status.edit_text(
+                    f"Queued {sent.created} viral-video reply card(s). Cards are delivered "
+                    "one at a time with automatic pacing."
+                )
+            else:
+                await status.edit_text(
+                    "No viral-video card passed the final check. "
+                    f"{sent.diagnostic()}."
+                )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -3588,6 +3804,11 @@ class ContentBot:
             for result in refreshed:
                 search_query_by_url.setdefault(result.url, "persisted watchlist refresh")
         combined_results = self.reply_target_metrics.observe(combined_results)
+        active_count = sum(
+            self.approvals.has_active_target(result.url)
+            for result in combined_results
+            if result.url
+        )
         strict_results = self._rank_reply_target_pool(
             combined_results,
             max_age_minutes=max_age_minutes,
@@ -3662,19 +3883,26 @@ class ContentBot:
                 return (
                     selected_query,
                     results,
-                    f"Selected with {fallback_level} to fill a two-reply batch.\n",
+                    f"Selected with {fallback_level} to fill a two-reply batch. "
+                    f"Skipped {active_count} already-used post(s) before ranking.\n",
                 )
             note = (
                 "Selected by momentum across the requested topic and languages.\n"
                 if query
                 else "Selected by momentum across current topics and languages.\n"
             )
-            return selected_query, results, note
+            return (
+                selected_query,
+                results,
+                note.rstrip()
+                + f" Skipped {active_count} already-used post(s) before ranking.\n",
+            )
 
         diagnostic = (
             f"Fetched {len(combined_results)} unique root posts from "
             f"{len(searched)} successful search responses; {len(search_failures)} "
-            "search lane(s) failed. Fewer than two posts remained after the age, "
+            f"search lane(s) failed. Skipped {active_count} already-used post(s) before "
+            "ranking. Fewer than two posts remained after the age, "
             "root-post, active-approval, deduplication, and visible-signal gates."
         )
         return last_search_query, [], diagnostic
@@ -3741,10 +3969,23 @@ class ContentBot:
             )
         combined, search_query_by_url = _combine_reply_target_results(searched)
         combined = self.reply_target_metrics.observe(combined)
+        active_count = sum(
+            self.approvals.has_active_target(result.url)
+            for result in combined
+            if result.url
+        )
+        # Remove previously-carded posts before each top-N ranking pass. If the
+        # filter happens afterwards, the same hot posts occupy all 24 slots and
+        # hide slightly lower-ranked unused videos forever.
+        combined = [
+            result
+            for result in combined
+            if not self.approvals.has_active_target(result.url)
+        ]
         configured_floor = max(0, self.settings.reply_video_min_views)
         strict = rank_viral_video_posts(
             combined,
-            max_items=24,
+            max_items=max(24, len(combined)),
             max_age_minutes=strict_age,
             min_view_count=configured_floor,
             min_like_count_when_views_missing=150,
@@ -3753,7 +3994,7 @@ class ContentBot:
         warm_floor = min(configured_floor, max(2_000, configured_floor // 5))
         warm = rank_viral_video_posts(
             combined,
-            max_items=24,
+            max_items=max(24, len(combined)),
             max_age_minutes=strict_age,
             min_view_count=warm_floor,
             min_like_count_when_views_missing=60,
@@ -3762,18 +4003,23 @@ class ContentBot:
         fill_floor = min(warm_floor, max(500, configured_floor // 30))
         fill = rank_viral_video_posts(
             combined,
-            max_items=24,
+            max_items=max(24, len(combined)),
             max_age_minutes=fill_age,
             min_view_count=fill_floor,
             min_like_count_when_views_missing=20,
             min_view_velocity=0.0,
         )
         candidates = _merge_reply_target_search_products([strict, warm, fill])
+        # Keep the second check for the small race where a card is created by
+        # another run while ranking is in progress.
         candidates = [
             result
             for result in candidates
             if not self.approvals.has_active_target(result.url)
         ]
+        candidates, author_limit_skips, language_limit_skips = (
+            self._filter_reply_generation_candidates(candidates)
+        )
         selected = _select_reply_video_mix(
             candidates,
             max_items=8,
@@ -3802,7 +4048,13 @@ class ContentBot:
             if selected
             else "viral video lanes"
         )
-        return search_label, selected, tier
+        return (
+            search_label,
+            selected,
+            f"{tier} Skipped {active_count} already-used, "
+            f"{author_limit_skips} author-limited, and "
+            f"{language_limit_skips} Japanese-limit video(s) before drafting.",
+        )
 
     async def _prepare_reply_video_evidence(
         self,
@@ -4173,9 +4425,19 @@ class ContentBot:
             max_age_minutes,
             default=self.settings.reply_target_max_age_minutes,
         )
+        # Exclude active targets before max_items truncation. Otherwise the
+        # hottest five already-used posts can starve all fresh candidates.
+        available_results = [
+            result
+            for result in recent_results
+            if not self.approvals.has_active_target(result.url)
+        ]
         ranked = rank_fast_growing_posts(
-            recent_results,
-            max_items=5,
+            available_results,
+            # Rank the complete fetched pool, then apply approval-time safety
+            # limits and finally take five. This lets lower-ranked languages
+            # and authors replace otherwise blocked top results.
+            max_items=max(5, len(available_results)),
             max_age_minutes=freshness_minutes,
             min_engagement_score=0 if relaxed else MIN_REPLY_TARGET_ENGAGEMENT_SCORE,
             min_velocity_score=0 if relaxed else MIN_REPLY_TARGET_VELOCITY_SCORE,
@@ -4200,7 +4462,10 @@ class ContentBot:
             for result in ranked
             if not self.approvals.has_active_target(result.url)
         ]
-        return unseen
+        eligible, _author_skips, _language_skips = (
+            self._filter_reply_generation_candidates(unseen, max_items=5)
+        )
+        return eligible
 
     async def _auto_reply_target_queries(
         self,
@@ -5144,6 +5409,27 @@ def _recent_reply_texts(
         for approval in rows
         if approval.kind == "reply" and approval.text.strip()
     ][: max(0, limit)]
+
+
+def _pending_reply_delivery_count(
+    approvals: list[AutomationApproval],
+    *,
+    source_type: str = "",
+) -> int:
+    clean_source = str(source_type or "").strip().casefold()
+    return sum(
+        1
+        for approval in approvals
+        if approval.kind == "reply"
+        and approval.status == "pending"
+        and bool((approval.metadata or {}).get("reply_delivery_queue_id"))
+        and (
+            not clean_source
+            or str((approval.metadata or {}).get("source_type") or "")
+            .casefold()
+            == clean_source
+        )
+    )
 
 
 def _select_diverse_candidates(

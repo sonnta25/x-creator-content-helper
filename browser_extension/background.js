@@ -37,7 +37,12 @@ const BRIDGE_FETCH_TIMEOUT_MS = 15000;
 const TAB_SCRIPT_TIMEOUT_MS = 15000;
 const ATTACHMENT_SCRIPT_TIMEOUT_MS = 45000;
 const PROMPT_SUBMISSION_TIMEOUT_MS = 60000;
-const PROVIDER_NO_PROGRESS_TIMEOUT_MS = 240000;
+const PROVIDER_NO_PROGRESS_TIMEOUT_MS = 120000;
+const PROVIDER_MAX_ATTEMPTS = 2;
+const PROVIDER_RETRY_MIN_JOB_TIMEOUT_SECONDS = 240;
+const PROVIDER_RETRY_RESERVE_SECONDS = 60;
+const PROVIDER_ATTEMPT_MIN_TIMEOUT_SECONDS = 60;
+const PROVIDER_ATTEMPT_WATCHDOG_GRACE_SECONDS = 30;
 const FINAL_PROVIDER_URL = "https://gemini.google.com/app";
 const FINAL_PROVIDER_NAME = "Gemini";
 const PROVIDER_RECYCLE_AFTER_JOBS = 10;
@@ -681,12 +686,47 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
       `Job ${job.id}\nUsing existing ${FINAL_PROVIDER_NAME} tab...`
     );
     providerStarted = true;
-    const finalOutput = await runProviderPrompt(
-      FINAL_PROVIDER_URL,
-      finalPrompt,
-      config.timeoutSeconds,
-      Array.isArray(job.attachments) ? job.attachments : []
-    );
+    const attachments = Array.isArray(job.attachments) ? job.attachments : [];
+    const maxAttempts = config.timeoutSeconds >= PROVIDER_RETRY_MIN_JOB_TIMEOUT_SECONDS
+      ? PROVIDER_MAX_ATTEMPTS
+      : 1;
+    const attemptTimeoutSeconds = maxAttempts > 1
+      ? Math.max(
+        PROVIDER_ATTEMPT_MIN_TIMEOUT_SECONDS,
+        Math.floor((config.timeoutSeconds - PROVIDER_RETRY_RESERVE_SECONDS) / maxAttempts)
+      )
+      : config.timeoutSeconds;
+    let finalOutput = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      await setStatus(
+        `Job ${job.id}\n${FINAL_PROVIDER_NAME} attempt ${attempt}/${maxAttempts}...`
+      );
+      try {
+        finalOutput = await withDeadline(
+          runProviderPrompt(
+            FINAL_PROVIDER_URL,
+            finalPrompt,
+            attemptTimeoutSeconds,
+            attachments
+          ),
+          (attemptTimeoutSeconds + PROVIDER_ATTEMPT_WATCHDOG_GRACE_SECONDS) * 1000,
+          `${FINAL_PROVIDER_NAME} attempt ${attempt}/${maxAttempts}`
+        );
+        break;
+      } catch (error) {
+        if (attempt >= maxAttempts || !isRetryableProviderError(error)) {
+          throw error;
+        }
+        await setStatus(
+          `Gemini attempt ${attempt}/${maxAttempts} stalled. ` +
+          "Opening one fresh managed tab and retrying once..."
+        );
+        await recycleProviderAfterFailure();
+      }
+    }
+    if (!finalOutput) {
+      throw new Error("Gemini retry finished without a readable response.");
+    }
     providerCompleted = true;
 
     await setStatus(`Job ${job.id}\nReturning final output...`);
@@ -713,6 +753,38 @@ async function runGeminiTextJob(config, job, { reportError = true } = {}) {
       await clearProviderRecoveryState({ clearJobId: true });
     }
   }
+}
+
+async function withDeadline(promise, timeoutMs, label) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} exceeded its bounded ${Math.round(timeoutMs / 1000)}-second watchdog.`));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+function isRetryableProviderError(error) {
+  const message = String(error && (error.message || error) || "").toLowerCase();
+  const nonRetryableMarkers = [
+    "usage limit",
+    "quota",
+    "rate limit",
+    "reached your limit",
+    "login",
+    "sign in",
+    "image file input was not found",
+    "missing gemini prompt",
+    "invalid image data"
+  ];
+  return !nonRetryableMarkers.some((marker) => message.includes(marker));
 }
 
 function startJobHeartbeat(config, jobId) {
@@ -809,6 +881,10 @@ async function runProviderPrompt(url, prompt, timeoutSeconds, attachments = []) 
 
   const started = Date.now();
   const timeoutMs = timeoutSeconds * 1000;
+  const noProgressTimeoutMs = Math.min(
+    PROVIDER_NO_PROGRESS_TIMEOUT_MS,
+    Math.max(60000, timeoutMs - 15000)
+  );
   let best = "";
   let last = "";
   let stableSince = Date.now();
@@ -853,9 +929,9 @@ async function runProviderPrompt(url, prompt, timeoutSeconds, attachments = []) 
       );
       lastStatusAt = Date.now();
     }
-    if (!best && Date.now() - started >= PROVIDER_NO_PROGRESS_TIMEOUT_MS) {
+    if (!best && Date.now() - started >= noProgressTimeoutMs) {
       throw new Error(
-        `Gemini produced no readable progress for ${Math.round(PROVIDER_NO_PROGRESS_TIMEOUT_MS / 1000)} seconds. ` +
+        `Gemini produced no readable progress for ${Math.round(noProgressTimeoutMs / 1000)} seconds. ` +
         `${lastDebug || "The provider tab may be stuck or rate limited."}`
       );
     }

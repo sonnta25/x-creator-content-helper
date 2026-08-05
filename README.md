@@ -66,6 +66,11 @@ When a menu action requires a value, the bot opens a private reply prompt. The p
 expires after five minutes and can be closed with `/cancel`. Direct command forms,
 such as `/replytargets AI agents`, continue to work.
 
+Finite mode controls do not require typing: **Creator goal**, **Reply safety**,
+**Adaptive pace**, and **Experiments** open dedicated button menus containing every
+available mode plus status and back navigation. Numeric ranges and free-form values
+still use the private reply prompt.
+
 ## Commands
 
 ### Daily workflow
@@ -96,7 +101,8 @@ such as `/replytargets AI agents`, continue to work.
 - `/persona` — show or update niche, voice, and audience.
 - `/watchauthor list|add @name|pin @name|remove @name|block @name|unblock @name|auto on|off|status`
   — inspect and control pinned, automatically learned, and blocked priority authors.
-- `/risk show|strict|balanced|open` — control monetization-safety filtering.
+- `/risk show|strict|balanced|open` — control monetization filtering and anti-farming
+  pace guardrails.
 - `/money status|report [90d]|payout YYYY-MM-DD amount [USD]|set ...` — maintain
   monetization readiness and the payout feedback loop without CSV imports.
 - `/profileaudit` — check whether the public profile converts reply viewers.
@@ -171,11 +177,17 @@ Authentication, rate-limit, bridge, or provider failures are still reported.
 
 ### `/replyvideo`
 
-The video lane prioritizes fresh global viral video and low reply competition. When
-caption or X media text is reliable, the reply is grounded only in that text. When it
-is not reliable and `REPLY_VIDEO_FRAME_ANALYSIS=true`, the bot downloads the video,
-extracts a small number of representative frames, sends them to Gemini, and removes
-temporary media after processing.
+The video lane gives Japanese candidates a stronger preference than `/replytargets`:
+when available, each ranked batch starts with up to two Japanese videos, followed by
+the strongest non-Japanese global candidate. If Japanese supply is scarce or blocked
+by safety limits, the remaining slots fall back to other languages without failing the
+run. Freshness, momentum, reply competition, monetization safety, and learned outcome
+quality still apply; language preference never bypasses those gates.
+
+When caption or X media text is reliable, the reply is grounded only in that text.
+When it is not reliable and `REPLY_VIDEO_FRAME_ANALYSIS=true`, the bot downloads the
+video, extracts a small number of representative frames, sends them to Gemini, and
+removes temporary media after processing.
 
 Global, English, Japanese, and Vietnamese `Top`/`Latest` searches are serialized with
 tracking and account checks. This deliberately trades a little scan speed for reliable
@@ -189,7 +201,21 @@ or stated.
 
 Replies follow the source language and must add a concrete observation, implication,
 comparison, caveat, or reason. Generic agreement and question-only replies are
-rejected.
+rejected. Deterministic checks also reject emoji-only drafts, canned Japanese/English
+openings, URLs, hashtags, unrelated mentions, and self-promotion before a card reaches
+Telegram. Near-copy detection covers recent pending and approved drafts, including
+Japanese text without spaces.
+
+Japanese replies default to natural `です/ます` social distance with strangers unless
+the source is clearly casual. Balanced mode skips Japanese disaster, death, mourning,
+war, and graphic-violence targets; strict mode excludes all yellow-risk topics. Prompts
+for serious contexts forbid humor and engagement questions.
+
+These controls support X's [Authenticity policy](https://help.x.com/en/rules-and-policies/authenticity)
+and [Automation rules](https://help.x.com/en/rules-and-policies/x-automation?lang=browser):
+the bot proposes a contextual draft, but the operator must read it and perform the
+final Reply action on X. It does not auto-submit replies or treat viral keywords as
+permission to contact people automatically.
 
 Gemini is asked for 2-5 drafts. If one draft is malformed, the bot preserves good
 drafts and repairs only unresolved URLs. A blank URL is recovered only when its
@@ -215,6 +241,14 @@ After **Approve on mobile**, Telegram shows **Open X on phone**. This two-step d
 is required because one Telegram button cannot both record a callback and open X.
 Long replies that do not fit safely in a Web Intent remain available through
 **Copy draft** or normal copy/paste.
+
+Reply batches are delivered one card at a time. After an unrelated reply is approved,
+the bot keeps the next card queued until the current reply-safety spacing has elapsed,
+then sends it automatically; the operator no longer receives a "wait and tap again"
+alert. Rejecting a card releases the next one immediately because no reply was posted.
+Author and verified-audience conversation follow-ups remain immediate. The timer starts
+from Telegram approval because the bot deliberately cannot observe the final manual X
+Reply click.
 
 Set the real posting username with:
 
@@ -261,10 +295,26 @@ eligibility, profile visits, or exact revenue attributable to one reply.
 /money payout 2026-08-01 125.40 USD
 ```
 
-`/pace adaptive` converts the daily cap into a rolling hourly ceiling. Three new
+`/pace adaptive` converts the daily cap into a rolling hourly ceiling. `/risk` adds an
+anti-reply-farming layer based on approved cards:
+
+- `strict`: at most 12 approved replies/hour; Japanese 20/day and 4/hour; unrelated
+  approvals are spaced by a stable 120-240 second safety window;
+- `balanced` (recommended): at most 20/hour; Japanese 30/day and 6/hour; unrelated
+  approvals are spaced by 60-120 seconds;
+- `open`: removes these extra numeric heuristics but keeps quality, duplication,
+  relevance, sensitive-topic, per-author, and manual-submission protections.
+
+These values are conservative operator heuristics, not published X rate limits. X
+prohibits bulk, duplicative, irrelevant, unsolicited, and aggressively automated
+engagement rather than publishing a guaranteed safe reply count. A genuine author or
+verified-audience follow-up is treated as a real conversation and is not delayed by the
+heuristic spacing window. The daily and per-author hard ceilings still apply.
+
+Three new
 X-account errors inside one hour pause new card generation while tracking continues.
 After checking `/setupcheck`, use `/pace resume`. `high` raises capacity but never
-auto-posts and is not a guarantee that a volume is safe under X policy.
+auto-posts; under `strict` or `balanced`, the anti-farming hourly ceiling still wins.
 
 ## Limits and goals
 
@@ -284,7 +334,10 @@ REPLY_VIDEO_BATCH_SIZE=3
   monetization or subscriber-ranking data.
 - `network` emphasizes author responses and repeat relationships.
 
-The daily value is an approval-card ceiling, not a guaranteed posting quota.
+The daily value counts only cards the user approves, not pending or rejected drafts,
+and is not a guaranteed posting quota. `/replycap show` displays global and Japanese
+daily/hourly usage. `/profileaudit` also checks whether the recent timeline contains
+original posts instead of looking reply-only.
 Available candidates, deduplication, quality checks, batch size, X limits, and manual
 submission still determine actual volume.
 
@@ -332,14 +385,20 @@ Logs are written to `logs/bot.out.log` and `logs/bot.err.log`.
 6. Enable **Auto Run** for queued Gemini work and **Automation** for schedules.
 7. Keep low-resource mode enabled on a small VPS.
 
-The required extension version is `0.8.7`. After replacing project files, press
+The required extension version is `0.8.8`. After replacing project files, press
 **Reload** on the extension card whenever `browser_extension/` changed.
 
-Version `0.8.7` allows up to 60 seconds for Gemini's editor to accept and submit a
+Version `0.8.8` allows up to 60 seconds for Gemini's editor to accept and submit a
 large reply-target prompt on a low-spec VPS, while still bounding frame upload and
-DOM-read operations. It also reduces expensive shadow-DOM scans; fails a no-progress
-Gemini response after four minutes; uses a lightweight watchdog only while a provider
-job is active; and requeues an interrupted job as soon as its heartbeat lease expires.
+DOM-read operations. It also reduces expensive shadow-DOM scans; fails an attempt with
+no readable Gemini progress after at most two minutes; and wraps the complete attempt
+in a separate deadline so a stuck Chrome API promise cannot look healthy merely by
+sending heartbeats. With the normal 360-second bridge budget, one stalled attempt is
+retried once on a fresh managed Gemini tab. Login, quota, rate-limit, and invalid-frame
+errors fail immediately instead of wasting the second attempt.
+
+The extension uses a lightweight watchdog only while a provider job is active and
+requeues an interrupted job as soon as its heartbeat lease expires.
 The active job ID remains persisted until completion or confirmed expiry. Heartbeat
 injection is restored after every managed Gemini navigation, while a 30-second reclaim
 watchdog keeps retrying across delayed MV3 alarms instead of relying on two one-shot
@@ -387,7 +446,7 @@ Prefer `/importcookie`, `/replylangs`, `/replygoal`, `/replycap`, `/replybatch`,
 update the running bot immediately and persist supported values to `.env`.
 
 Do not increase the bridge timeout simply to hide a stuck provider tab. Values are
-clamped to 120-360 seconds, and extension `0.8.7` should recover or recycle a stalled
+clamped to 120-360 seconds, and extension `0.8.8` should recover or recycle a stalled
 tab earlier.
 
 ## Media downloads
@@ -442,9 +501,9 @@ node --check browser_extension\background.js
 
 - **No reply-ready posts:** run `/setupcheck` and `/xaccounts`; refresh X cookies if
   the pool reports authentication, challenge, or rate-limit errors.
-- **Chrome never claimed the job:** reload extension `0.8.7`, verify the bridge URL
+- **Chrome never claimed the job:** reload extension `0.8.8`, verify the bridge URL
   and token, and enable Auto Run or click **Run next job**.
-- **Heartbeat stopped:** keep Chrome open. Version `0.8.7` reattaches the page heartbeat
+- **Heartbeat stopped:** keep Chrome open. Version `0.8.8` reattaches the page heartbeat
   after Gemini navigation, preserves interrupted job state, and retries lease reclaim
   every 30 seconds. It still cannot recover a terminated or completely frozen Chrome
   process.

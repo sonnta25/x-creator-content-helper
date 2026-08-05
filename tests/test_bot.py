@@ -13,6 +13,27 @@ from src.bot import (
     MENU_ACTIONS,
     MENU_LAYOUTS,
     MENU_INBOX,
+    MENU_EXPERIMENTS,
+    MENU_EXPERIMENTS_OFF,
+    MENU_EXPERIMENTS_ON,
+    MENU_EXPERIMENTS_SHOW,
+    MENU_GOAL_EARN,
+    MENU_GOAL_NETWORK,
+    MENU_GOAL_QUALIFY,
+    MENU_GOAL_SHOW,
+    MENU_PACE,
+    MENU_PACE_ADAPTIVE,
+    MENU_PACE_CONSERVATIVE,
+    MENU_PACE_HIGH,
+    MENU_PACE_PAUSE,
+    MENU_PACE_RESUME,
+    MENU_PACE_SHOW,
+    MENU_REPLY_GOAL,
+    MENU_RISK,
+    MENU_RISK_BALANCED,
+    MENU_RISK_OPEN,
+    MENU_RISK_SHOW,
+    MENU_RISK_STRICT,
     MENU_REPLY_BATCH,
     MENU_REPLY_TARGETS,
     MENU_REPLY_VIDEO,
@@ -125,6 +146,94 @@ def test_grouped_menu_keeps_replyvideo_and_automation_controls() -> None:
     assert MENU_REPLY_BATCH in MENU_LAYOUTS["automation"][1]
     assert MENU_ACTIONS[MENU_REPLY_VIDEO] == ("command", "replyvideo")
     assert MENU_ACTIONS[MENU_VIDEO_SCHEDULE] == ("command", "videoevery")
+
+
+def test_reply_safety_menu_exposes_every_mode_as_a_button() -> None:
+    buttons = {
+        button
+        for row in MENU_LAYOUTS["risk"]
+        for button in row
+    }
+
+    assert {MENU_RISK_SHOW, MENU_RISK_STRICT, MENU_RISK_BALANCED, MENU_RISK_OPEN} <= buttons
+    assert MENU_ACTIONS[MENU_RISK] == ("menu", "risk")
+    assert MENU_ACTIONS[MENU_RISK_SHOW] == ("command_args", "risk show")
+    assert MENU_ACTIONS[MENU_RISK_STRICT] == ("command_args", "risk strict")
+    assert MENU_ACTIONS[MENU_RISK_BALANCED] == ("command_args", "risk balanced")
+    assert MENU_ACTIONS[MENU_RISK_OPEN] == ("command_args", "risk open")
+
+
+def test_all_finite_setting_modes_are_button_selectable() -> None:
+    assert MENU_ACTIONS[MENU_REPLY_GOAL] == ("menu", "goal")
+    assert MENU_ACTIONS[MENU_GOAL_SHOW] == ("command_args", "replygoal show")
+    assert MENU_ACTIONS[MENU_GOAL_QUALIFY] == ("command_args", "replygoal qualify")
+    assert MENU_ACTIONS[MENU_GOAL_EARN] == ("command_args", "replygoal earn")
+    assert MENU_ACTIONS[MENU_GOAL_NETWORK] == ("command_args", "replygoal network")
+
+    assert MENU_ACTIONS[MENU_PACE] == ("menu", "pace")
+    assert MENU_ACTIONS[MENU_PACE_SHOW] == ("command_args", "pace show")
+    assert MENU_ACTIONS[MENU_PACE_CONSERVATIVE] == ("command_args", "pace conservative")
+    assert MENU_ACTIONS[MENU_PACE_ADAPTIVE] == ("command_args", "pace adaptive")
+    assert MENU_ACTIONS[MENU_PACE_HIGH] == ("command_args", "pace high")
+    assert MENU_ACTIONS[MENU_PACE_PAUSE] == ("command_args", "pace pause")
+    assert MENU_ACTIONS[MENU_PACE_RESUME] == ("command_args", "pace resume")
+
+    assert MENU_ACTIONS[MENU_EXPERIMENTS] == ("menu", "experiments")
+    assert MENU_ACTIONS[MENU_EXPERIMENTS_SHOW] == (
+        "command_args",
+        "experiments status",
+    )
+    assert MENU_ACTIONS[MENU_EXPERIMENTS_ON] == ("command_args", "experiments on")
+    assert MENU_ACTIONS[MENU_EXPERIMENTS_OFF] == ("command_args", "experiments off")
+
+
+def test_mode_button_passes_its_argument_without_force_reply() -> None:
+    captured = {}
+
+    class Message:
+        text = MENU_RISK_BALANCED
+
+        async def reply_text(self, _text, **_kwargs):
+            return None
+
+    bot = ContentBot(Settings(telegram_bot_token="123:ABC"))
+
+    async def fake_risk(_update, context):
+        captured["args"] = context.args
+
+    bot.risk = fake_risk
+    update = SimpleNamespace(
+        effective_message=Message(),
+        effective_chat=SimpleNamespace(id=1),
+        effective_user=SimpleNamespace(id=2),
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.menu_action(update, context))
+
+    assert captured["args"] == ["balanced"]
+
+
+def test_risk_without_arguments_opens_choice_keyboard(tmp_path) -> None:
+    captured = {}
+
+    class Message:
+        async def reply_text(self, text, **kwargs):
+            captured["text"] = text
+            captured["markup"] = kwargs.get("reply_markup")
+
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+        )
+    )
+    update = SimpleNamespace(effective_message=Message())
+
+    asyncio.run(bot.risk(update, SimpleNamespace(args=[])))
+
+    assert "Choose a reply-safety mode" in captured["text"]
+    assert isinstance(captured["markup"], ReplyKeyboardMarkup)
 
 
 def test_reply_caps_count_only_cards_that_were_approved() -> None:
@@ -261,6 +370,135 @@ def test_replycap_show_reports_approved_usage_and_pending_drafts(tmp_path) -> No
     assert "Pending drafts not counted: 1" in message.texts[-1]
 
 
+def test_risk_mode_clamps_global_hourly_reply_capacity(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            creator_daily_reply_cap=500,
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+
+    assert bot._adaptive_hourly_ceiling() == 20
+    bot.revenue_ops.set_risk_mode("strict")
+    assert bot._adaptive_hourly_ceiling() == 12
+    bot.revenue_ops.set_risk_mode("open")
+    assert bot._adaptive_hourly_ceiling() == 42
+
+
+def test_japanese_guardrail_counts_only_approved_cards(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    for index in range(6):
+        approval = bot.approvals.create(
+            kind="reply",
+            text=f"Specific Japanese reply {index}",
+            chat_id=1,
+            approver_user_id=1,
+            metadata={"language": "ja", "root_author": f"author{index}"},
+        )
+        bot.approvals.decide(
+            approval.id,
+            approve=True,
+            chat_id=1,
+            user_id=1,
+            destination="mobile",
+        )
+    bot.approvals.create(
+        kind="reply",
+        text="Pending Japanese draft",
+        chat_id=1,
+        approver_user_id=1,
+        metadata={"language": "ja", "root_author": "pending-author"},
+    )
+
+    assert bot._japanese_reply_slots_remaining() == 0
+
+
+def test_natural_spacing_delays_delivery_without_blocking_approval(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    first = bot.approvals.create(
+        kind="reply",
+        text="First approved reply",
+        chat_id=1,
+        approver_user_id=1,
+        metadata={"language": "en", "root_author": "first"},
+    )
+    first = bot.approvals.decide(
+        first.id,
+        approve=True,
+        chat_id=1,
+        user_id=1,
+        destination="mobile",
+    )
+    next_reply = bot.approvals.create(
+        kind="reply",
+        text="Next unrelated reply",
+        chat_id=1,
+        approver_user_id=1,
+        metadata={"language": "en", "root_author": "second"},
+    )
+    followup = bot.approvals.create(
+        kind="reply",
+        text="Direct author follow-up",
+        chat_id=1,
+        approver_user_id=1,
+        metadata={
+            "language": "ja",
+            "root_author": "third",
+            "relationship_followup": True,
+        },
+    )
+    now = (first.decided_at or datetime.now(UTC)) + timedelta(seconds=5)
+
+    assert bot._reply_approval_safety_block(next_reply, now=now) == ""
+    assert bot._reply_approval_delay_seconds(next_reply, now=now) > 0
+    assert bot._reply_approval_safety_block(followup, now=now) == ""
+    assert bot._reply_approval_delay_seconds(followup, now=now) == 0
+
+
+def test_balanced_mode_skips_japanese_tragedy_targets(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+        )
+    )
+    earthquake = XSearchResult(
+        id=99,
+        username="alerts",
+        display_name="Alerts",
+        text="緊急地震速報 第4報",
+        created_at=datetime.now(UTC).isoformat(),
+        url="https://x.com/alerts/status/99",
+        language="ja",
+        viral_score=90,
+        reply_opportunity_score=90,
+    )
+
+    assert bot._apply_reply_target_mode([earthquake], "balanced") == []
+    bot.revenue_ops.set_risk_mode("open")
+    assert bot._apply_reply_target_mode([earthquake], "balanced")
+
+
 def test_menu_keyboard_hides_after_a_selection() -> None:
     from src.bot import _menu_keyboard
 
@@ -303,6 +541,10 @@ def test_duplicate_guard_rejects_near_copypasta_only() -> None:
     )
     assert not _is_semantic_duplicate(
         "Cheap inference changes which workflows can run continuously.",
+        existing,
+    )
+    assert _is_semantic_duplicate(
+        "The real bottleneck is distribution rather than model quality.",
         existing,
     )
 
@@ -416,6 +658,87 @@ def test_session_queue_sends_one_unsent_card_at_a_time(tmp_path) -> None:
     assert asyncio.run(bot._send_next_session_approval("session-1")) is True
     assert sent == ["Reply 0", "Reply 1"]
     assert asyncio.run(bot._send_next_session_approval("session-1")) is False
+
+
+def test_reply_delivery_queue_schedules_next_card_instead_of_showing_wait_alert(
+    tmp_path,
+) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Queued reply",
+        chat_id=1,
+        target_url="https://x.com/source/status/2",
+        metadata={
+            "reply_delivery_queue_id": "batch-1",
+            "reply_delivery_queue_index": 1,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    scheduled = {}
+    sent = []
+
+    bot._reply_approval_delay_seconds = lambda _approval: 131
+    bot._schedule_delayed_approval_queue = lambda queue_id, **kwargs: scheduled.update(
+        {"queue_id": queue_id, **kwargs}
+    )
+
+    async def send(item):
+        sent.append(item.id)
+
+    bot._send_approval = send
+
+    assert asyncio.run(
+        bot._send_next_reply_delivery("batch-1", respect_pacing=True)
+    ) is True
+    refreshed = bot.approvals.get(approval.id)
+
+    assert sent == []
+    assert scheduled["queue_id"] == "batch-1"
+    assert scheduled["delay_seconds"] == 131
+    assert refreshed is not None
+    assert refreshed.metadata["reply_delivery_card_sent"] is False
+    assert refreshed.metadata["reply_delivery_not_before"]
+
+
+def test_rejected_card_releases_next_delivery_immediately(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="Queued reply",
+        chat_id=1,
+        target_url="https://x.com/source/status/3",
+        metadata={
+            "reply_delivery_queue_id": "batch-2",
+            "reply_delivery_queue_index": 1,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    sent = []
+
+    async def send(item):
+        sent.append(item.id)
+
+    bot._send_approval = send
+
+    assert asyncio.run(
+        bot._send_next_reply_delivery("batch-2", respect_pacing=False)
+    ) is True
+    refreshed = bot.approvals.get(approval.id)
+
+    assert sent == [approval.id]
+    assert refreshed is not None
+    assert refreshed.metadata["reply_delivery_card_sent"] is True
 
 
 def test_final_opportunity_check_rejects_a_suddenly_saturated_thread() -> None:
@@ -747,17 +1070,30 @@ def test_replyvideo_search_lanes_are_serialized_for_one_cookie_pool() -> None:
     assert search.max_active == 1
 
 
-def test_replyvideo_mix_prefers_two_global_and_one_vietnamese() -> None:
+def test_replyvideo_mix_prefers_two_japanese_then_best_global_alternative() -> None:
     results = [
         XSearchResult(id=1, username="a", display_name="", text="a", created_at="", url="1", language="en"),
         XSearchResult(id=2, username="b", display_name="", text="b", created_at="", url="2", language="ja"),
         XSearchResult(id=3, username="c", display_name="", text="c", created_at="", url="3", language="ko"),
         XSearchResult(id=4, username="d", display_name="", text="d", created_at="", url="4", language="vi"),
+        XSearchResult(id=5, username="e", display_name="", text="e", created_at="", url="5", language="ja"),
     ]
 
     selected = _select_reply_video_mix(results)
 
-    assert [item.language for item in selected] == ["en", "ja", "vi"]
+    assert [item.language for item in selected] == ["ja", "ja", "en"]
+
+
+def test_replyvideo_mix_falls_back_cleanly_when_japanese_is_scarce() -> None:
+    results = [
+        XSearchResult(id=1, username="a", display_name="", text="a", created_at="", url="1", language="en"),
+        XSearchResult(id=2, username="b", display_name="", text="b", created_at="", url="2", language="ja"),
+        XSearchResult(id=3, username="c", display_name="", text="c", created_at="", url="3", language="vi"),
+    ]
+
+    selected = _select_reply_video_mix(results)
+
+    assert [item.language for item in selected] == ["ja", "en", "vi"]
 
 
 def test_replyvideo_context_quality_rejects_empty_emoji_and_boilerplate() -> None:

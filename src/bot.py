@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import re
@@ -72,6 +73,7 @@ from src.revenue_ops import (
     MONETIZATION_YELLOW,
     RevenueOpsStore,
     assess_monetization_safety,
+    reply_farming_guardrails,
 )
 
 
@@ -155,10 +157,6 @@ COMMAND_INPUT_PROMPTS = {
         "Send `show`, `targets 2-5`, or `video 2-5`.",
         "show, targets 3, or video 2",
     ),
-    "replygoal": (
-        "Send `qualify`, `earn`, `network`, or `show`.",
-        "qualify, earn, network, or show",
-    ),
     "replycap": (
         "Send `show`, `daily 1-2000`, or `author 1-25`.",
         "show, daily 500, or author 5",
@@ -172,18 +170,6 @@ COMMAND_INPUT_PROMPTS = {
         "Send `status`, `report 90d`, `payout YYYY-MM-DD amount USD`, or "
         "`set premium|stripe|identity|2fa on|off`.",
         "status or payout details",
-    ),
-    "risk": (
-        "Send `show`, `strict`, `balanced`, or `open`.",
-        "show, strict, balanced, or open",
-    ),
-    "pace": (
-        "Send `show`, `conservative`, `adaptive`, `high`, `pause`, or `resume`.",
-        "show, adaptive, high, pause, or resume",
-    ),
-    "experiments": (
-        "Send `status`, `on`, or `off`.",
-        "status, on, or off",
     ),
 }
 
@@ -218,11 +204,28 @@ MENU_X_REMOVE = "🗑️ Remove account"
 MENU_DOWNLOAD = "📥 Download media"
 MENU_PERSONA = "🎭 Creator persona"
 MENU_REPLY_GOAL = "🧭 Creator goal"
+MENU_GOAL_SHOW = "📋 Goal status"
+MENU_GOAL_QUALIFY = "🎯 Qualify"
+MENU_GOAL_EARN = "💰 Earn"
+MENU_GOAL_NETWORK = "🤝 Network"
 MENU_WATCH_AUTHOR = "⭐ Author watchlist"
 MENU_MONEY = "💵 Monetization"
-MENU_RISK = "🛡️ Revenue safety"
+MENU_RISK = "🛡️ Reply safety"
+MENU_RISK_SHOW = "📋 Current mode"
+MENU_RISK_STRICT = "🔒 Strict"
+MENU_RISK_BALANCED = "⚖️ Balanced"
+MENU_RISK_OPEN = "🔓 Open"
 MENU_PACE = "⏱️ Adaptive pace"
+MENU_PACE_SHOW = "📋 Pace status"
+MENU_PACE_CONSERVATIVE = "🐢 Conservative"
+MENU_PACE_ADAPTIVE = "⚙️ Adaptive"
+MENU_PACE_HIGH = "⚡ High"
+MENU_PACE_PAUSE = "⏸ Pause"
+MENU_PACE_RESUME = "▶️ Resume"
 MENU_EXPERIMENTS = "🧪 Experiments"
+MENU_EXPERIMENTS_SHOW = "📋 Experiment status"
+MENU_EXPERIMENTS_ON = "✅ Experiments on"
+MENU_EXPERIMENTS_OFF = "🚫 Experiments off"
 MENU_PROFILE_AUDIT = "👤 Profile audit"
 MENU_WINS = "🏆 Winning insights"
 
@@ -268,6 +271,30 @@ MENU_LAYOUTS: dict[str, tuple[tuple[str, ...], ...]] = {
         (MENU_MONEY, MENU_RISK),
         (MENU_MAIN,),
     ),
+    "risk": (
+        (MENU_RISK_SHOW,),
+        (MENU_RISK_STRICT, MENU_RISK_BALANCED),
+        (MENU_RISK_OPEN,),
+        (MENU_CREATOR, MENU_MAIN),
+    ),
+    "goal": (
+        (MENU_GOAL_SHOW,),
+        (MENU_GOAL_QUALIFY, MENU_GOAL_EARN),
+        (MENU_GOAL_NETWORK,),
+        (MENU_CREATOR, MENU_MAIN),
+    ),
+    "pace": (
+        (MENU_PACE_SHOW,),
+        (MENU_PACE_CONSERVATIVE, MENU_PACE_ADAPTIVE),
+        (MENU_PACE_HIGH,),
+        (MENU_PACE_PAUSE, MENU_PACE_RESUME),
+        (MENU_AUTOMATION, MENU_MAIN),
+    ),
+    "experiments": (
+        (MENU_EXPERIMENTS_SHOW,),
+        (MENU_EXPERIMENTS_ON, MENU_EXPERIMENTS_OFF),
+        (MENU_INSIGHTS, MENU_MAIN),
+    ),
 }
 
 MENU_ACTIONS: dict[str, tuple[str, str]] = {
@@ -300,12 +327,29 @@ MENU_ACTIONS: dict[str, tuple[str, str]] = {
     MENU_X_REMOVE: ("command", "xremove"),
     MENU_DOWNLOAD: ("command", "download"),
     MENU_PERSONA: ("command", "persona"),
-    MENU_REPLY_GOAL: ("command", "replygoal"),
+    MENU_REPLY_GOAL: ("menu", "goal"),
+    MENU_GOAL_SHOW: ("command_args", "replygoal show"),
+    MENU_GOAL_QUALIFY: ("command_args", "replygoal qualify"),
+    MENU_GOAL_EARN: ("command_args", "replygoal earn"),
+    MENU_GOAL_NETWORK: ("command_args", "replygoal network"),
     MENU_WATCH_AUTHOR: ("command", "watchauthor"),
     MENU_MONEY: ("command", "money"),
-    MENU_RISK: ("command", "risk"),
-    MENU_PACE: ("command", "pace"),
-    MENU_EXPERIMENTS: ("command", "experiments"),
+    MENU_RISK: ("menu", "risk"),
+    MENU_RISK_SHOW: ("command_args", "risk show"),
+    MENU_RISK_STRICT: ("command_args", "risk strict"),
+    MENU_RISK_BALANCED: ("command_args", "risk balanced"),
+    MENU_RISK_OPEN: ("command_args", "risk open"),
+    MENU_PACE: ("menu", "pace"),
+    MENU_PACE_SHOW: ("command_args", "pace show"),
+    MENU_PACE_CONSERVATIVE: ("command_args", "pace conservative"),
+    MENU_PACE_ADAPTIVE: ("command_args", "pace adaptive"),
+    MENU_PACE_HIGH: ("command_args", "pace high"),
+    MENU_PACE_PAUSE: ("command_args", "pace pause"),
+    MENU_PACE_RESUME: ("command_args", "pace resume"),
+    MENU_EXPERIMENTS: ("menu", "experiments"),
+    MENU_EXPERIMENTS_SHOW: ("command_args", "experiments status"),
+    MENU_EXPERIMENTS_ON: ("command_args", "experiments on"),
+    MENU_EXPERIMENTS_OFF: ("command_args", "experiments off"),
     MENU_PROFILE_AUDIT: ("command", "profileaudit"),
     MENU_WINS: ("command", "wins"),
 }
@@ -344,7 +388,7 @@ BOT_COMMANDS = [
     BotCommand("setupcheck", "Check X, tracking, scheduling, and learning health"),
     BotCommand("watchauthor", "Manage priority author watchlist"),
     BotCommand("money", "Track monetization eligibility and payouts"),
-    BotCommand("risk", "Set monetization safety mode"),
+    BotCommand("risk", "Set reply and monetization safety mode"),
     BotCommand("pace", "Set adaptive reply-card pacing"),
     BotCommand("experiments", "Control and review reply format experiments"),
     BotCommand("profileaudit", "Audit profile conversion readiness"),
@@ -379,6 +423,7 @@ class ContentBot:
         self._application: Application | None = None
         self._automation_running: set[str] = set()
         self._automation_tasks: set[asyncio.Task[None]] = set()
+        self._delayed_approval_tasks: dict[str, asyncio.Task[None]] = {}
         self._pending_inputs: dict[tuple[int, int], _PendingCommandInput] = {}
         self._reply_tracking_task: asyncio.Task[None] | None = None
 
@@ -396,6 +441,7 @@ class ContentBot:
             )
             self._automation_tasks.add(self._reply_tracking_task)
             self._reply_tracking_task.add_done_callback(self._automation_tasks.discard)
+            await self._restore_reply_delivery_queues()
 
         async def post_shutdown(app: Application) -> None:
             del app
@@ -499,6 +545,10 @@ class ContentBot:
                 "x_accounts": "🔐 X accounts",
                 "video": "🎬 Video tools",
                 "creator": "⚙️ Creator settings",
+                "risk": "🛡️ Reply safety",
+                "goal": "🧭 Creator goal",
+                "pace": "⏱️ Adaptive pace",
+                "experiments": "🧪 Experiments",
             }
             await message.reply_text(
                 titles[value] + "\nChoose a feature:",
@@ -507,6 +557,15 @@ class ContentBot:
             return
         if action_type == "help":
             await self.start(update, context)
+            return
+        if action_type == "command_args":
+            command, *args = value.split()
+            handler = getattr(self, command, None)
+            if handler is None:
+                await message.reply_text("This feature is currently unavailable.")
+                return
+            context.args = args
+            await handler(update, context)
             return
         handler = getattr(self, value, None)
         if handler is None:
@@ -662,14 +721,18 @@ class ContentBot:
         message = update.effective_message
         raw = " ".join(context.args).strip().lower()
         if not raw:
-            await self._request_command_input(update, "replygoal")
+            await message.reply_text(
+                "Choose the ranking goal used for new reply candidates.",
+                reply_markup=_menu_keyboard("goal"),
+            )
             return
         if raw in {"show", "current"}:
             await message.reply_text(
                 f"Creator goal: {self.settings.creator_goal}\n\n"
                 "qualify = impressions and eligibility\n"
                 "earn = higher-value verified/Premium audience proxy\n"
-                "network = author responses and repeat relationships"
+                "network = author responses and repeat relationships",
+                reply_markup=_menu_keyboard("goal"),
             )
             return
         if raw not in {"qualify", "earn", "network"}:
@@ -678,7 +741,8 @@ class ContentBot:
         update_env_value("CREATOR_GOAL", raw)
         self.settings = replace(self.settings, creator_goal=raw)
         await message.reply_text(
-            f"Creator goal set to {raw}. New target rankings use it immediately."
+            f"Creator goal set to {raw}. New target rankings use it immediately.",
+            reply_markup=_menu_keyboard("goal"),
         )
 
     async def watchauthor(
@@ -879,14 +943,33 @@ class ContentBot:
         message = update.effective_message
         raw = " ".join(context.args).strip().lower()
         if not raw:
-            await self._request_command_input(update, "risk")
+            await message.reply_text(
+                "Choose a reply-safety mode. Balanced is recommended for normal use.",
+                reply_markup=_menu_keyboard("risk"),
+            )
             return
         if raw in {"show", "status"}:
+            guardrails = reply_farming_guardrails(self.revenue_ops.risk_mode)
+            farming_limits = (
+                "No extra volume guardrails"
+                if guardrails.global_hourly_cap is None
+                else (
+                    f"Global {guardrails.global_hourly_cap}/hour; Japanese "
+                    f"{guardrails.japanese_daily_cap}/day and "
+                    f"{guardrails.japanese_hourly_cap}/hour; approval spacing "
+                    f"{guardrails.minimum_approval_gap_seconds}-"
+                    f"{guardrails.minimum_approval_gap_seconds * 2}s"
+                )
+            )
             await message.reply_text(
                 f"Revenue safety mode: {self.revenue_ops.risk_mode}\n"
                 "strict = exclude red and yellow candidates\n"
-                "balanced = exclude red and strongly downrank yellow candidates\n"
-                "open = allow red only outside earn, with a visible warning"
+                "balanced = exclude red, downrank yellow, and skip Japanese tragedy/war targets\n"
+                "open = allow red only outside earn, with a visible warning\n"
+                f"Anti-farming pace: {farming_limits}\n\n"
+                "These are operator safety heuristics, not published X rate limits. "
+                "Duplicate, generic, promotional, and off-topic drafts remain blocked in every mode.",
+                reply_markup=_menu_keyboard("risk"),
             )
             return
         try:
@@ -894,7 +977,11 @@ class ContentBot:
         except RuntimeError as exc:
             await message.reply_text(str(exc))
             return
-        await message.reply_text(f"Revenue safety mode set to {raw}.")
+        await message.reply_text(
+            f"Reply safety mode set to {raw}. Candidate filtering and approved-reply "
+            "pace guardrails apply immediately.",
+            reply_markup=_menu_keyboard("risk"),
+        )
 
     async def pace(
         self,
@@ -904,26 +991,38 @@ class ContentBot:
         message = update.effective_message
         raw = " ".join(context.args).strip().lower()
         if not raw:
-            await self._request_command_input(update, "pace")
+            await message.reply_text(
+                "Choose an adaptive pace mode or pause/resume card generation.",
+                reply_markup=_menu_keyboard("pace"),
+            )
             return
         if raw in {"show", "status"}:
             hourly = self.revenue_ops.hourly_ceiling(self.settings.creator_daily_reply_cap)
+            effective_hourly = self._adaptive_hourly_ceiling()
             await message.reply_text(
                 f"Pace: {self.revenue_ops.pace_mode}; "
                 f"{'PAUSED' if self.revenue_ops.pace_paused else 'running'}\n"
-                f"Base hourly card ceiling: {hourly}; available now after feedback/backoff: "
+                f"Base hourly card ceiling: {hourly}; effective safety ceiling: "
+                f"{effective_hourly}; available now after usage/feedback: "
                 f"{self._hourly_reply_capacity()}\n"
-                "This is a safety ceiling, not a posting quota. Final X submission stays manual."
+                "This is a safety ceiling, not a posting quota. Final X submission stays manual.",
+                reply_markup=_menu_keyboard("pace"),
             )
             return
         if raw == "pause":
             self.revenue_ops.set_pace_paused(True)
-            await message.reply_text("New reply-card generation paused. Tracking remains active.")
+            await message.reply_text(
+                "New reply-card generation paused. Tracking remains active.",
+                reply_markup=_menu_keyboard("pace"),
+            )
             return
         if raw == "resume":
             self.revenue_ops.set_pace_paused(False)
             self.revenue_ops.clear_health_errors()
-            await message.reply_text("Reply-card generation resumed and health backoff cleared.")
+            await message.reply_text(
+                "Reply-card generation resumed and health backoff cleared.",
+                reply_markup=_menu_keyboard("pace"),
+            )
             return
         try:
             self.revenue_ops.set_pace_mode(raw)
@@ -931,8 +1030,10 @@ class ContentBot:
             await message.reply_text(str(exc))
             return
         await message.reply_text(
-            f"Pace set to {raw}; hourly ceiling is "
-            f"{self.revenue_ops.hourly_ceiling(self.settings.creator_daily_reply_cap)} cards."
+            f"Pace set to {raw}; effective hourly safety ceiling is "
+            f"{self._adaptive_hourly_ceiling()} cards under /risk "
+            f"{self.revenue_ops.risk_mode}.",
+            reply_markup=_menu_keyboard("pace"),
         )
 
     async def experiments(
@@ -943,15 +1044,24 @@ class ContentBot:
         message = update.effective_message
         raw = " ".join(context.args).strip().lower()
         if not raw:
-            await self._request_command_input(update, "experiments")
+            await message.reply_text(
+                "Choose whether controlled reply-format experiments are enabled.",
+                reply_markup=_menu_keyboard("experiments"),
+            )
             return
         if raw == "on":
             self.reply_learning.set_experiment_enabled(True)
-            await message.reply_text("Controlled reply-format experiments enabled.")
+            await message.reply_text(
+                "Controlled reply-format experiments enabled.",
+                reply_markup=_menu_keyboard("experiments"),
+            )
             return
         if raw == "off":
             self.reply_learning.set_experiment_enabled(False)
-            await message.reply_text("Experiments disabled; generation uses adaptive format.")
+            await message.reply_text(
+                "Experiments disabled; generation uses adaptive format.",
+                reply_markup=_menu_keyboard("experiments"),
+            )
             return
         if raw not in {"status", "show"}:
             await message.reply_text("Usage: /experiments status|on|off")
@@ -962,7 +1072,8 @@ class ContentBot:
             f"Reply experiments: {'ON' if self.reply_learning.experiment_enabled else 'OFF'}\n"
             "Variants rotate across different targets, never as duplicate replies to one post.\n"
             f"Active variants: {', '.join(EXPERIMENT_VARIANTS)}\n\n"
-            f"30-day results:\n{lines}"
+            f"30-day results:\n{lines}",
+            reply_markup=_menu_keyboard("experiments"),
         )
 
     async def profileaudit(
@@ -979,6 +1090,20 @@ class ContentBot:
         status = await message.reply_text(f"Auditing @{owner} profile...")
         try:
             profile = await self.x_search.user_profile(owner)
+            timeline: list[XSearchResult] = []
+            timeline_note = ""
+            try:
+                timeline = await self.x_search.user_tweets_and_replies(owner, limit=40)
+            except Exception as exc:
+                timeline_note = f"Recent content mix unavailable: {_friendly_error(exc)}"
+            recent_replies = sum(item.is_reply for item in timeline)
+            recent_originals = sum(
+                not item.is_reply and not item.is_retweet for item in timeline
+            )
+            content_total = recent_replies + recent_originals
+            original_share = (
+                recent_originals / content_total if content_total else 0.0
+            )
             bio = str(profile.get("description") or "").strip()
             niche_terms = {
                 token.casefold()
@@ -995,15 +1120,31 @@ class ContentBot:
                 (bool(profile.get("pinned_ids")), "pinned post"),
                 (bool(profile.get("verified")), "verified/Premium marker visible"),
             ]
+            if content_total:
+                checks.append(
+                    (
+                        recent_originals >= 3 and original_share >= 0.15,
+                        "recent timeline includes original posts, not replies only",
+                    )
+                )
             lines = "\n".join(
                 f"- {'OK' if passed else 'FIX'}: {label}" for passed, label in checks
             )
             await status.edit_text(
                 f"Profile conversion audit for @{owner}\n"
                 f"Followers: {int(profile.get('followers') or 0):,}\n"
-                f"Bio: {bio or '(empty)'}\n\n{lines}\n\n"
+                f"Bio: {bio or '(empty)'}\n"
+                + (
+                    f"Recent original/reply mix: {recent_originals}/{recent_replies} "
+                    f"({original_share:.0%} original)\n"
+                    if content_total
+                    else ""
+                )
+                + (f"{timeline_note}\n" if timeline_note else "")
+                + f"\n{lines}\n\n"
                 "The profile should answer in seconds: who this is for, what recurring value "
-                "they get, and why they should follow after seeing one reply."
+                "they get, and why they should follow after seeing one reply. Keep original "
+                "posts active alongside replies so the account does not look reply-only."
             )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
@@ -1459,6 +1600,27 @@ class ContentBot:
                 approval.kind == "reply" and approval.status == "pending"
                 for approval in approvals
             )
+            farming_guardrails = reply_farming_guardrails(
+                self.revenue_ops.risk_mode
+            )
+            japanese_usage = ""
+            if farming_guardrails.japanese_daily_cap is not None:
+                japanese_today = _language_approvals_created_today(
+                    approvals,
+                    language="ja",
+                    timezone_name=self.settings.creator_timezone,
+                )
+                japanese_hour = _language_approvals_created_since(
+                    approvals,
+                    language="ja",
+                    since=datetime.now(UTC) - timedelta(hours=1),
+                )
+                japanese_usage = (
+                    f"- Japanese safety: {japanese_today}/"
+                    f"{farming_guardrails.japanese_daily_cap} today; "
+                    f"{japanese_hour}/{farming_guardrails.japanese_hourly_cap} "
+                    "in the last 60 minutes\n"
+                )
             try:
                 creator_timezone = ZoneInfo(self.settings.creator_timezone)
             except ZoneInfoNotFoundError:
@@ -1480,6 +1642,7 @@ class ContentBot:
                 f"- Available now: {available_now}\n"
                 f"- Pending drafts not counted: {pending}\n"
                 f"- Per author/day: {self.settings.reply_author_daily_cap}\n"
+                f"{japanese_usage}"
                 f"- Daily reset: {next_creator_day:%Y-%m-%d %H:%M} "
                 f"{self.settings.creator_timezone}\n\n"
                 + (
@@ -1814,7 +1977,22 @@ class ContentBot:
             )
             < self.settings.reply_author_daily_cap
         ]
-        selected = _select_diverse_candidates(eligible, generation_size)
+        japanese_slots = self._japanese_reply_slots_remaining()
+        selected: list[XSearchResult] = []
+        selected_japanese = 0
+        for result in _select_diverse_candidates(eligible, len(eligible)):
+            is_japanese = str(result.language or "").casefold().startswith("ja")
+            if (
+                is_japanese
+                and japanese_slots is not None
+                and selected_japanese >= japanese_slots
+            ):
+                continue
+            selected.append(result)
+            if is_japanese:
+                selected_japanese += 1
+            if len(selected) >= generation_size:
+                break
         if not selected:
             return 0
         strategy_by_url = {
@@ -1861,6 +2039,7 @@ class ContentBot:
         )
         generation_latency_seconds = round(time.monotonic() - generation_started, 1)
         created: list[AutomationApproval] = []
+        delivery_queue_id = session_id or f"batch-{chat_id}-{time.time_ns()}"
         recent_texts = _recent_reply_texts(self.approvals.items(), limit=120)
         for draft in drafts:
             if len(created) >= requested_batch_size:
@@ -1903,10 +2082,15 @@ class ContentBot:
                     "generation_latency_seconds": generation_latency_seconds,
                     "creator_goal": self.settings.creator_goal,
                     "creator_timezone": self.settings.creator_timezone,
+                    "reply_safety_mode": self.revenue_ops.risk_mode,
+                    "manual_final_submission": True,
                     "reply_session_id": session_id,
                     "reply_session_index": len(created),
                     "reply_session_sequential": bool(sequential),
                     "session_card_sent": False,
+                    "reply_delivery_queue_id": delivery_queue_id,
+                    "reply_delivery_queue_index": len(created),
+                    "reply_delivery_card_sent": False,
                 },
             )
             created.append(approval)
@@ -1917,16 +2101,142 @@ class ContentBot:
                 approval.id,
                 reply_session_size=len(created),
             )
-        if sequential and session_id:
-            await self._send_next_session_approval(session_id)
-        else:
-            for approval in created:
-                self.approvals.update_metadata(approval.id, session_card_sent=True)
-                await self._send_approval(approval)
+        if created:
+            await self._send_next_reply_delivery(
+                delivery_queue_id,
+                respect_pacing=True,
+            )
         return len(created)
+
+    def _japanese_reply_slots_remaining(self) -> int | None:
+        guardrails = reply_farming_guardrails(self.revenue_ops.risk_mode)
+        if guardrails.japanese_daily_cap is None:
+            return None
+        approvals = self.approvals.items()
+        used_today = _language_approvals_created_today(
+            approvals,
+            language="ja",
+            timezone_name=self.settings.creator_timezone,
+        )
+        used_hour = _language_approvals_created_since(
+            approvals,
+            language="ja",
+            since=datetime.now(UTC) - timedelta(hours=1),
+        )
+        return max(
+            0,
+            min(
+                guardrails.japanese_daily_cap - used_today,
+                (guardrails.japanese_hourly_cap or 0) - used_hour,
+            ),
+        )
+
+    def _reply_approval_safety_block(
+        self,
+        approval: AutomationApproval,
+        *,
+        now: datetime | None = None,
+    ) -> str:
+        current = now or datetime.now(UTC)
+        approvals = self.approvals.items()
+        if _reply_approvals_created_today(
+            approvals,
+            timezone_name=self.settings.creator_timezone,
+        ) >= self.settings.creator_daily_reply_cap:
+            return "Daily approved-reply cap reached. Try again after the creator-day reset."
+
+        author = str((approval.metadata or {}).get("root_author") or "").strip()
+        if author and _author_approvals_created_today(
+            approvals,
+            username=author,
+            timezone_name=self.settings.creator_timezone,
+        ) >= self.settings.reply_author_daily_cap:
+            return f"Per-author safety cap reached for @{author.lstrip('@')}."
+
+        # A direct author/audience response is an actual conversation, not an
+        # unsolicited viral-target hop. Keep hard account caps, but do not delay
+        # a time-sensitive human follow-up with heuristic burst limits.
+        if bool((approval.metadata or {}).get("relationship_followup")):
+            return ""
+
+        guardrails = reply_farming_guardrails(self.revenue_ops.risk_mode)
+        if (
+            guardrails.global_hourly_cap is not None
+            and _reply_approvals_created_since(
+                approvals,
+                since=current - timedelta(hours=1),
+            )
+            >= guardrails.global_hourly_cap
+        ):
+            return (
+                "Anti-farming hourly guardrail reached. Approved capacity returns "
+                "gradually over the next 60 minutes."
+            )
+
+        language = str((approval.metadata or {}).get("language") or "").casefold()
+        if language.startswith("ja") and guardrails.japanese_daily_cap is not None:
+            if _language_approvals_created_today(
+                approvals,
+                language="ja",
+                timezone_name=self.settings.creator_timezone,
+            ) >= guardrails.japanese_daily_cap:
+                return "Japanese reply safety cap reached for this creator day."
+            if _language_approvals_created_since(
+                approvals,
+                language="ja",
+                since=current - timedelta(hours=1),
+            ) >= (guardrails.japanese_hourly_cap or 0):
+                return (
+                    "Japanese hourly safety cap reached. Wait for approved replies "
+                    "to leave the rolling 60-minute window."
+                )
+
+        return ""
+
+    def _reply_approval_delay_seconds(
+        self,
+        approval: AutomationApproval,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        if bool((approval.metadata or {}).get("relationship_followup")):
+            return 0
+        current = now or datetime.now(UTC)
+        guardrails = reply_farming_guardrails(self.revenue_ops.risk_mode)
+        base_gap = guardrails.minimum_approval_gap_seconds
+        if base_gap <= 0:
+            return 0
+        approved = [
+            item
+            for item in self.approvals.items()
+            if _is_approved_reply_card(item) and item.decided_at is not None
+        ]
+        if not approved:
+            return 0
+        last_approved_at = max(
+            item.decided_at for item in approved if item.decided_at is not None
+        )
+        jitter = int.from_bytes(
+            hashlib.sha256(
+                f"{self.revenue_ops.risk_mode}:{approval.id}".encode("utf-8")
+            ).digest()[:2],
+            "big",
+        ) % (base_gap + 1)
+        required_gap = base_gap + jitter
+        remaining = math.ceil(
+            required_gap - max(0.0, (current - last_approved_at).total_seconds())
+        )
+        if remaining > 0:
+            return remaining
+        return 0
 
     def _adaptive_hourly_ceiling(self) -> int:
         ceiling = self.revenue_ops.hourly_ceiling(self.settings.creator_daily_reply_cap)
+        farming_limit = reply_farming_guardrails(
+            self.revenue_ops.risk_mode
+        ).global_hourly_cap
+        if farming_limit is not None:
+            ceiling = min(ceiling, farming_limit)
         recent_decisions = sorted(
             [
                 approval
@@ -2009,25 +2319,144 @@ class ContentBot:
         return current.view_count is None or views_per_reply >= (150 if video_mode else 80)
 
     async def _send_next_session_approval(self, session_id: str) -> bool:
+        return await self._send_next_approval_queue(
+            session_id,
+            queue_key="reply_session_id",
+            index_key="reply_session_index",
+            sent_key="session_card_sent",
+            respect_pacing=False,
+        )
+
+    async def _send_next_reply_delivery(
+        self,
+        queue_id: str,
+        *,
+        respect_pacing: bool,
+    ) -> bool:
+        return await self._send_next_approval_queue(
+            queue_id,
+            queue_key="reply_delivery_queue_id",
+            index_key="reply_delivery_queue_index",
+            sent_key="reply_delivery_card_sent",
+            respect_pacing=respect_pacing,
+        )
+
+    async def _send_next_approval_queue(
+        self,
+        queue_id: str,
+        *,
+        queue_key: str,
+        index_key: str,
+        sent_key: str,
+        respect_pacing: bool,
+    ) -> bool:
         pending = sorted(
-            self.approvals.pending_by_metadata("reply_session_id", session_id),
+            self.approvals.pending_by_metadata(queue_key, queue_id),
             key=lambda approval: int(
-                (approval.metadata or {}).get("reply_session_index") or 0
+                (approval.metadata or {}).get(index_key) or 0
             ),
         )
         next_card = next(
             (
                 approval
                 for approval in pending
-                if not bool((approval.metadata or {}).get("session_card_sent"))
+                if not bool((approval.metadata or {}).get(sent_key))
             ),
             None,
         )
         if next_card is None:
             return False
-        self.approvals.update_metadata(next_card.id, session_card_sent=True)
+        delay_seconds = (
+            self._reply_approval_delay_seconds(next_card)
+            if respect_pacing
+            else 0
+        )
+        if delay_seconds > 0:
+            self.approvals.update_metadata(
+                next_card.id,
+                reply_delivery_not_before=(
+                    datetime.now(UTC) + timedelta(seconds=delay_seconds)
+                ).isoformat(),
+            )
+            self._schedule_delayed_approval_queue(
+                queue_id,
+                queue_key=queue_key,
+                index_key=index_key,
+                sent_key=sent_key,
+                delay_seconds=delay_seconds,
+            )
+            return True
+        self.approvals.update_metadata(
+            next_card.id,
+            **{sent_key: True, "reply_delivery_not_before": ""},
+        )
         await self._send_approval(next_card)
         return True
+
+    def _schedule_delayed_approval_queue(
+        self,
+        queue_id: str,
+        *,
+        queue_key: str,
+        index_key: str,
+        sent_key: str,
+        delay_seconds: int,
+    ) -> None:
+        task_key = f"{queue_key}:{queue_id}"
+        active = self._delayed_approval_tasks.get(task_key)
+        if active is not None and not active.done():
+            return
+
+        async def deliver() -> None:
+            await asyncio.sleep(max(1, delay_seconds))
+            current_task = asyncio.current_task()
+            if self._delayed_approval_tasks.get(task_key) is current_task:
+                self._delayed_approval_tasks.pop(task_key, None)
+            await self._send_next_approval_queue(
+                queue_id,
+                queue_key=queue_key,
+                index_key=index_key,
+                sent_key=sent_key,
+                respect_pacing=True,
+            )
+
+        task = asyncio.create_task(
+            deliver(),
+            name=f"delayed-reply-card-{queue_id}",
+        )
+        self._delayed_approval_tasks[task_key] = task
+        self._automation_tasks.add(task)
+
+        def cleanup(done: asyncio.Task[None]) -> None:
+            self._automation_tasks.discard(done)
+            if self._delayed_approval_tasks.get(task_key) is done:
+                self._delayed_approval_tasks.pop(task_key, None)
+            error = None if done.cancelled() else done.exception()
+            if error is not None:
+                LOGGER.error(
+                    "Delayed reply-card delivery failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(cleanup)
+
+    async def _restore_reply_delivery_queues(self) -> None:
+        queue_ids = {
+            str((approval.metadata or {}).get("reply_delivery_queue_id") or "")
+            for approval in self.approvals.items()
+            if approval.kind == "reply" and approval.status == "pending"
+        }
+        for queue_id in sorted(queue_id for queue_id in queue_ids if queue_id):
+            pending = self.approvals.pending_by_metadata(
+                "reply_delivery_queue_id",
+                queue_id,
+            )
+            if any(
+                bool((approval.metadata or {}).get("reply_delivery_card_sent"))
+                for approval in pending
+            ):
+                continue
+            await self._send_next_reply_delivery(queue_id, respect_pacing=True)
 
     async def _reply_tracking_loop(self) -> None:
         while True:
@@ -2333,6 +2762,9 @@ class ContentBot:
             reply_session_id = str(
                 (existing.metadata or {}).get("reply_session_id") or ""
             )
+            reply_delivery_queue_id = str(
+                (existing.metadata or {}).get("reply_delivery_queue_id") or ""
+            )
             if decision == "why":
                 await query.answer()
                 answered = True
@@ -2374,6 +2806,15 @@ class ContentBot:
                     reply_markup=_approval_keyboard(approval),
                 )
                 return
+            if (
+                decision in {"approve", "mobile", "continue"}
+                and existing.kind == "reply"
+                and existing.status == "pending"
+            ):
+                safety_block = self._reply_approval_safety_block(existing)
+                if safety_block:
+                    await query.answer(safety_block, show_alert=True)
+                    return
             approval = self.approvals.decide(
                 approval_id,
                 approve=decision in {"approve", "mobile", "continue"},
@@ -2427,10 +2868,22 @@ class ContentBot:
                     else None
                 ),
             )
-            if (
+            if reply_delivery_queue_id:
+                await self._send_next_reply_delivery(
+                    reply_delivery_queue_id,
+                    respect_pacing=(
+                        approval.status == "mobile_approved"
+                        and not bool(
+                            (approval.metadata or {}).get("relationship_followup")
+                        )
+                    ),
+                )
+            elif (
                 reply_session_id
                 and bool((existing.metadata or {}).get("reply_session_sequential"))
             ):
+                # Backward compatibility for guided-session cards created by
+                # versions before the delivery queue was introduced.
                 await self._send_next_session_approval(reply_session_id)
         except Exception as exc:
             error = _friendly_error(exc)
@@ -2652,8 +3105,8 @@ class ContentBot:
         status = await self._application.bot.send_message(
             chat_id=self.approval_chat_id,
             text=(
-                "Scheduled /replyvideo started. Hunting fresh global and Vietnamese "
-                "videos with low reply competition..."
+                "Scheduled /replyvideo started. Prioritizing fresh Japanese videos, "
+                "then filling from other global lanes with low reply competition..."
             ),
         )
         try:
@@ -2827,7 +3280,8 @@ class ContentBot:
                 approver_user_id=approver_user_id,
             )
             await status.edit_text(
-                f"Sent {sent} reply card(s). Watching total: {watching_total}."
+                f"Queued {sent} reply card(s). Cards are delivered one at a time "
+                f"with automatic pacing. Watching total: {watching_total}."
             )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
@@ -2841,8 +3295,8 @@ class ContentBot:
             query = ""
         await message.chat.send_action(ChatAction.TYPING)
         status = await message.reply_text(
-            "Hunting fresh global and Vietnamese videos, prioritizing view velocity "
-            "and low reply competition..."
+            "Hunting fresh Japanese videos first, then filling from other global "
+            "lanes by view velocity and low reply competition..."
         )
         try:
             search_label, results, selection_note = await self._get_reply_video_context(
@@ -2899,7 +3353,10 @@ class ContentBot:
                 video_mode=True,
                 visual_attachments=visual_attachments,
             )
-            await status.edit_text(f"Sent {sent} viral-video reply card(s).")
+            await status.edit_text(
+                f"Queued {sent} viral-video reply card(s). Cards are delivered "
+                "one at a time with automatic pacing."
+            )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
         finally:
@@ -3234,7 +3691,8 @@ class ContentBot:
             "Scanning fresh X video lanes...\n"
             f"Lanes: {', '.join(label for label, _query in lanes)}\n"
             f"Strict window: {strict_age} minutes; emergency fill window: {fill_age} minutes\n"
-            "Target mix: two global videos plus one Vietnamese video when available."
+            "Target mix: up to two Japanese videos first, then the strongest "
+            "non-Japanese global video when available."
         )
         # A typical cookie-only VPS has one usable twscrape account. Run video
         # lanes serially so Top/Latest searches cannot lease the same small
@@ -3325,6 +3783,11 @@ class ContentBot:
             selected,
             self.settings.reply_target_mode,
         )
+        # Goal and safety scoring can reorder the enriched pool. Restore the
+        # video-specific language mix afterwards so Japanese remains a real
+        # preference rather than only an earlier search hint. /replytargets
+        # keeps its existing language-balanced ranking.
+        selected = _select_reply_video_mix(selected, max_items=8)
         self.reply_watch.classify(selected, source_type="replyvideo")
         strict_urls = {item.url for item in strict}
         warm_urls = {item.url for item in warm}
@@ -3526,6 +3989,19 @@ class ContentBot:
             ):
                 continue
             if safety.level == MONETIZATION_YELLOW and risk_mode == "strict":
+                continue
+            if (
+                str(result.language or "").casefold().startswith("ja")
+                and risk_mode == "balanced"
+                and {
+                    "disaster or tragedy",
+                    "war, conflict, or graphic violence",
+                }
+                & set(safety.reasons)
+            ):
+                # These conversations are especially sensitive to opportunistic
+                # viral replies. Balanced mode leaves political/current-affairs
+                # discussion available but avoids tragedy/war impression chasing.
                 continue
             text_terms = {
                 token.casefold()
@@ -4287,12 +4763,14 @@ def _select_reply_video_mix(
     *,
     max_items: int = REPLY_VIDEO_CONTEXT_ITEMS,
 ) -> list[XSearchResult]:
-    """Aim for 2 global + 1 Vietnamese while preserving score order within lanes."""
-    vietnamese = [item for item in results if item.language.casefold() == "vi"]
-    global_items = [item for item in results if item.language.casefold() != "vi"]
-    selected = global_items[:2]
-    if vietnamese and len(selected) < max_items:
-        selected.append(vietnamese[0])
+    """Prefer two Japanese videos, then retain global language diversity."""
+    if max_items <= 0:
+        return []
+    japanese = [item for item in results if item.language.casefold() == "ja"]
+    non_japanese = [item for item in results if item.language.casefold() != "ja"]
+    selected = japanese[: min(2, max_items)]
+    if non_japanese and len(selected) < max_items:
+        selected.append(non_japanese[0])
     seen = {item.url or str(item.id) for item in selected}
     for item in results:
         key = item.url or str(item.id)
@@ -4612,6 +5090,49 @@ def _author_approvals_created_today(
     )
 
 
+def _language_approvals_created_today(
+    approvals: list[AutomationApproval],
+    *,
+    language: str,
+    timezone_name: str,
+) -> int:
+    clean_language = str(language or "").strip().casefold()
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone = UTC
+    today = datetime.now(timezone).date()
+    return sum(
+        1
+        for approval in approvals
+        if _is_approved_reply_card(approval)
+        and approval.decided_at is not None
+        and approval.decided_at.astimezone(timezone).date() == today
+        and str((approval.metadata or {}).get("language") or "")
+        .casefold()
+        .startswith(clean_language)
+    )
+
+
+def _language_approvals_created_since(
+    approvals: list[AutomationApproval],
+    *,
+    language: str,
+    since: datetime,
+) -> int:
+    clean_language = str(language or "").strip().casefold()
+    return sum(
+        1
+        for approval in approvals
+        if _is_approved_reply_card(approval)
+        and approval.decided_at is not None
+        and approval.decided_at >= since
+        and str((approval.metadata or {}).get("language") or "")
+        .casefold()
+        .startswith(clean_language)
+    )
+
+
 def _recent_reply_texts(
     approvals: list[AutomationApproval],
     *,
@@ -4701,16 +5222,31 @@ def _parse_report_days(raw: str, *, allowed: tuple[int, ...]) -> int:
     return days
 
 
-def _is_semantic_duplicate(text: str, existing: list[str], *, threshold: float = 0.86) -> bool:
+def _is_semantic_duplicate(text: str, existing: list[str], *, threshold: float = 0.80) -> bool:
     normalize = lambda value: re.sub(r"\W+", " ", value.casefold()).strip()
     candidate = normalize(text)
     if not candidate:
         return True
-    return any(
-        SequenceMatcher(None, candidate, normalize(previous)).ratio() >= threshold
-        for previous in existing
-        if previous.strip()
-    )
+    compact_candidate = candidate.replace(" ", "")
+    candidate_ngrams = {
+        compact_candidate[index : index + 3]
+        for index in range(max(0, len(compact_candidate) - 2))
+    }
+    for previous in existing:
+        if not previous.strip():
+            continue
+        normalized_previous = normalize(previous)
+        if SequenceMatcher(None, candidate, normalized_previous).ratio() >= threshold:
+            return True
+        compact_previous = normalized_previous.replace(" ", "")
+        previous_ngrams = {
+            compact_previous[index : index + 3]
+            for index in range(max(0, len(compact_previous) - 2))
+        }
+        union = candidate_ngrams | previous_ngrams
+        if union and len(candidate_ngrams & previous_ngrams) / len(union) >= 0.72:
+            return True
+    return False
 
 
 def _summarize_mixed_reply_context(results: list[XSearchResult]) -> str:
@@ -4952,7 +5488,13 @@ def _friendly_error(exc: Exception) -> str:
             "the real tweet text."
         )
     if "extension bridge timed out waiting for chrome" in text.lower():
-        return _strip_exception_prefix(text).removesuffix(" <- TimeoutError")
+        detail = _strip_exception_prefix(text).removesuffix(" <- TimeoutError")
+        return (
+            f"{detail}\n\n"
+            "Reload Chrome extension 0.8.8 or newer. It bounds a stalled Gemini "
+            "attempt and retries once on a fresh managed tab instead of trusting "
+            "heartbeat activity alone."
+        )
     if "gemini image file input was not found" in text.lower():
         return (
             "Gemini's attachment control was not detected. Reload Chrome extension "

@@ -67,10 +67,17 @@ _YELLOW_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "wildfire",
             "mass casualty",
             "fatal crash",
+            "funeral",
+            "passed away",
+            "in memoriam",
             "緊急地震速報",
             "地震",
             "津波",
             "災害",
+            "訃報",
+            "死去",
+            "葬儀",
+            "追悼",
             "động đất",
             "sóng thần",
             "thảm họa",
@@ -125,6 +132,40 @@ class MonetizationAssessment:
     level: str
     score: float
     reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReplyFarmingGuardrails:
+    """Operator safety heuristics; these are not published X rate limits."""
+
+    global_hourly_cap: int | None
+    japanese_daily_cap: int | None
+    japanese_hourly_cap: int | None
+    minimum_approval_gap_seconds: int
+
+
+def reply_farming_guardrails(risk_mode: str) -> ReplyFarmingGuardrails:
+    mode = str(risk_mode or "balanced").strip().lower()
+    if mode == "strict":
+        return ReplyFarmingGuardrails(
+            global_hourly_cap=12,
+            japanese_daily_cap=20,
+            japanese_hourly_cap=4,
+            minimum_approval_gap_seconds=120,
+        )
+    if mode == "open":
+        return ReplyFarmingGuardrails(
+            global_hourly_cap=None,
+            japanese_daily_cap=None,
+            japanese_hourly_cap=None,
+            minimum_approval_gap_seconds=0,
+        )
+    return ReplyFarmingGuardrails(
+        global_hourly_cap=20,
+        japanese_daily_cap=30,
+        japanese_hourly_cap=6,
+        minimum_approval_gap_seconds=60,
+    )
 
 
 def assess_monetization_safety(result: XSearchResult | str) -> MonetizationAssessment:

@@ -237,10 +237,30 @@ def test_low_resource_mode_avoids_bootstrap_work_and_reduces_dom_polling() -> No
     assert "TAB_SCRIPT_TIMEOUT_MS = 15000" in background_js
     assert "ATTACHMENT_SCRIPT_TIMEOUT_MS = 45000" in background_js
     assert "PROMPT_SUBMISSION_TIMEOUT_MS = 60000" in background_js
-    assert "PROVIDER_NO_PROGRESS_TIMEOUT_MS = 240000" in background_js
+    assert "PROVIDER_NO_PROGRESS_TIMEOUT_MS = 120000" in background_js
+    assert "PROVIDER_MAX_ATTEMPTS = 2" in background_js
+    assert "PROVIDER_RETRY_MIN_JOB_TIMEOUT_SECONDS = 240" in background_js
+    assert "async function withDeadline" in background_js
+    assert "function isRetryableProviderError" in background_js
     assert "async function executeTabScript" in background_js
     assert "pollCount % 4 === 0" in background_js
     assert "allowDeepScan" in background_js
+
+
+def test_stalled_gemini_job_is_bounded_and_retried_once_on_a_fresh_tab() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+    text_job = background_js.split("async function runGeminiTextJob", 1)[1].split(
+        "function startJobHeartbeat", 1
+    )[0]
+
+    assert "for (let attempt = 1; attempt <= maxAttempts; attempt += 1)" in text_job
+    assert "finalOutput = await withDeadline(" in text_job
+    assert "await recycleProviderAfterFailure();" in text_job
+    assert "!isRetryableProviderError(error)" in text_job
+    assert '"usage limit"' in text_job
+    assert '"rate limit"' in text_job
 
     auto_alarm = background_js.split("async function ensureAutoAlarm", 1)[1].split(
         "async function ensureAutomationAlarm", 1

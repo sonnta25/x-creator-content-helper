@@ -2,7 +2,11 @@ import json
 from datetime import UTC, datetime, timedelta
 
 from src.models import XSearchResult
-from src.revenue_ops import RevenueOpsStore, assess_monetization_safety
+from src.revenue_ops import (
+    RevenueOpsStore,
+    assess_monetization_safety,
+    reply_farming_guardrails,
+)
 
 
 def _result(text: str) -> XSearchResult:
@@ -20,6 +24,21 @@ def test_monetization_safety_blocks_betting_and_flags_disasters() -> None:
     assert assess_monetization_safety(_result("New Polymarket betting odds")).level == "red"
     assert assess_monetization_safety(_result("緊急地震速報 第4報")).level == "yellow"
     assert assess_monetization_safety(_result("A practical AI workflow")).level == "green"
+    assert assess_monetization_safety(_result("著名な俳優の訃報と追悼コメント")).level == "yellow"
+
+
+def test_reply_farming_guardrails_follow_risk_mode() -> None:
+    strict = reply_farming_guardrails("strict")
+    balanced = reply_farming_guardrails("balanced")
+    open_mode = reply_farming_guardrails("open")
+
+    assert strict.global_hourly_cap == 12
+    assert strict.japanese_daily_cap == 20
+    assert balanced.global_hourly_cap == 20
+    assert balanced.japanese_daily_cap == 30
+    assert balanced.japanese_hourly_cap == 6
+    assert open_mode.global_hourly_cap is None
+    assert open_mode.minimum_approval_gap_seconds == 0
 
 
 def test_revenue_store_persists_watchlist_payout_and_eligibility(tmp_path) -> None:

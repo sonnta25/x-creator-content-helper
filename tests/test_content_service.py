@@ -5,6 +5,7 @@ import pytest
 from src.content_service import (
     ContentService,
     _reply_engine_prompt,
+    _reply_quality_violations,
     _single_reply_output_contract,
     _limit_x_text,
     _looks_like_prompt_leak,
@@ -175,6 +176,43 @@ def test_reply_prompt_requires_source_matched_natural_voice() -> None:
     assert "match the source post's language" in prompt
     assert "Humor and sarcasm are optional tools, never the default" in prompt
     assert "source-grounded contribution" in prompt
+    assert "すごいですね" in prompt
+    assert "natural です/ます" in prompt
+    assert "disasters, deaths, conflict, or mourning" in prompt
+
+
+def test_reply_quality_guard_rejects_farming_patterns() -> None:
+    assert "canned-japanese-opening" in _reply_quality_violations(
+        "すごいですね！本当に勉強になります。"
+    )
+    assert "generic-reaction" in _reply_quality_violations("草😂")
+    assert "self-promotion" in _reply_quality_violations(
+        "詳しくはプロフィールをチェックしてください。"
+    )
+    assert "link" in _reply_quality_violations("Details: https://example.com")
+    assert _reply_quality_violations(
+        "導入速度より、既存ユーザーの移行負担を抑える設計の方が成否を分けそうです。"
+    ) == []
+
+
+def test_generate_reply_from_text_repairs_canned_japanese_reply() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return "すごいですね！勉強になります。"
+            return "発表時期より、既存利用者の移行負担を抑える設計が成否を分けそうです。"
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    reply = asyncio.run(service.generate_reply_from_text("段階的な提供を始めます。"))
+
+    assert len(service.prompts) == 2
+    assert "canned-japanese-opening" in service.prompts[1]
+    assert reply.startswith("発表時期より")
 
 
 def test_replytargets_prompt_does_not_force_creator_niche() -> None:

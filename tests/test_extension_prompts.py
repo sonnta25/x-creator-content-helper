@@ -10,6 +10,10 @@ def test_gemini_single_pass_prompt_combines_task_and_reply_quality_rules() -> No
     assert "SINGLE-PASS WRITING AND QA" in prompt
     assert "specific source-grounded observation" in prompt
     assert "question-only reply is invalid" in prompt
+    assert "すごいですね" in prompt
+    assert "natural です/ます" in prompt
+    assert "self-promotion" in prompt
+    assert "disasters" in prompt
     assert "Return only the final answer required by the original task." in prompt
 
 

@@ -11,8 +11,6 @@ from dotenv import load_dotenv
 class Settings:
     telegram_bot_token: str
     content_provider: str = "extension_bridge"
-    generate_images: bool = False
-    image_provider: str = "extension_bridge"
     telegram_caption_limit: int = 1024
     x_cookie: str = ""
     x_account_name: str = "telegram_bot"
@@ -20,7 +18,6 @@ class Settings:
     x_accounts_db: str = "data/twscrape_accounts.db"
     x_search_limit: int = 8
     x_search_product: str = "Top"
-    x_post_char_limit: int = 2000
     reply_target_min_author_followers: int = 50_000
     reply_target_min_views: int = 500
     reply_target_max_age_minutes: int = 360
@@ -28,19 +25,21 @@ class Settings:
     reply_target_metrics_path: str = ""
     reply_learning_enabled: bool = True
     reply_learning_path: str = "data/reply_learning.json"
+    revenue_ops_path: str = "data/revenue_ops.json"
     reply_tracking_poll_minutes: int = 5
+    reply_tracking_checks_per_cycle: int = 8
     reply_watch_path: str = "data/reply_watchlist.json"
     reply_target_mode: str = "balanced"
+    creator_goal: str = "qualify"
     reply_target_batch_size: int = 3
     reply_video_batch_size: int = 3
-    creator_daily_reply_cap: int = 40
+    reply_pending_queue_cap: int = 5
+    reply_session_minutes: int = 20
+    reply_author_daily_cap: int = 5
+    stale_mobile_approval_hours: int = 6
+    reply_daily_digest_hour: int = 22
+    creator_daily_reply_cap: int = 500
     creator_timezone: str = "Asia/Ho_Chi_Minh"
-    content_language: str = "Vietnamese"
-    trend_language: str = "en"
-    trend_sources: str = "x,google_trends,rss"
-    google_trends_geo: str = "US"
-    trend_rss_urls: str = ""
-    hashtag_mode: str = "none"
     creator_niche: str = "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products"
     creator_voice: str = "witty, practical, dry, slightly contrarian, with a sharp creator POV"
     target_audience: str = "Vietnamese retail investors, crypto users, creators, founders, and professionals seeking timely practical insights on gold, crypto, and AI tools"
@@ -57,17 +56,19 @@ class Settings:
     reply_video_frame_count: int = 2
     telegram_reply_video_minutes: int | None = None
     telegram_reply_video_updated_at: int | None = None
+    telegram_follow_targets_minutes: int | None = None
+    telegram_follow_targets_updated_at: int | None = None
+    follow_target_batch_size: int = 12
+    follow_target_cooldown_hours: int = 24
+    follow_target_min_followers: int = 100
+    follow_target_max_followers: int = 50_000
+    follow_target_history_path: str = "data/follow_target_history.json"
     automation_approvals_path: str = ""
     download_max_file_mb: int = 45
     download_timeout_seconds: int = 180
     download_cookies_file: str = ""
     download_cookies_from_browser: str = ""
     download_browser_profile: str = ""
-    gemini_image_prompt_prefix: str = (
-        "Create one square realistic image for this social post. Return the image only, "
-        "with no extra text."
-    )
-
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv(_project_env_path(), override=True, encoding="utf-8-sig")
@@ -75,12 +76,6 @@ class Settings:
             telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
             content_provider=_choice_env(
                 "CONTENT_PROVIDER",
-                "extension_bridge",
-                {"extension_bridge"},
-            ),
-            generate_images=_bool_env("GENERATE_IMAGES", False),
-            image_provider=_choice_env(
-                "IMAGE_PROVIDER",
                 "extension_bridge",
                 {"extension_bridge"},
             ),
@@ -94,7 +89,6 @@ class Settings:
             or "data/twscrape_accounts.db",
             x_search_limit=_int_env("X_SEARCH_LIMIT", 8),
             x_search_product=os.getenv("X_SEARCH_PRODUCT", "Top").strip() or "Top",
-            x_post_char_limit=_int_env("X_POST_CHAR_LIMIT", 2000),
             reply_target_min_author_followers=max(
                 0, _int_env("REPLY_TARGET_MIN_AUTHOR_FOLLOWERS", 50_000)
             ),
@@ -118,8 +112,16 @@ class Settings:
                 "REPLY_LEARNING_PATH", "data/reply_learning.json"
             ).strip()
             or "data/reply_learning.json",
+            revenue_ops_path=os.getenv(
+                "REVENUE_OPS_PATH", "data/revenue_ops.json"
+            ).strip()
+            or "data/revenue_ops.json",
             reply_tracking_poll_minutes=max(
                 1, _int_env("REPLY_TRACKING_POLL_MINUTES", 5)
+            ),
+            reply_tracking_checks_per_cycle=min(
+                50,
+                max(2, _int_env("REPLY_TRACKING_CHECKS_PER_CYCLE", 8)),
             ),
             reply_watch_path=os.getenv(
                 "REPLY_WATCH_PATH", "data/reply_watchlist.json"
@@ -130,6 +132,11 @@ class Settings:
                 "balanced",
                 {"balanced", "reach", "qualified", "relationship"},
             ),
+            creator_goal=_choice_env(
+                "CREATOR_GOAL",
+                "qualify",
+                {"qualify", "earn", "network"},
+            ),
             reply_target_batch_size=min(
                 5,
                 max(2, _int_env("REPLY_TARGET_BATCH_SIZE", 3)),
@@ -138,24 +145,33 @@ class Settings:
                 5,
                 max(2, _int_env("REPLY_VIDEO_BATCH_SIZE", 3)),
             ),
+            reply_pending_queue_cap=min(
+                20,
+                max(2, _int_env("REPLY_PENDING_QUEUE_CAP", 5)),
+            ),
             creator_daily_reply_cap=max(
-                1, _int_env("CREATOR_DAILY_REPLY_CAP", 40)
+                1, _int_env("CREATOR_DAILY_REPLY_CAP", 500)
+            ),
+            reply_session_minutes=min(
+                120,
+                max(10, _int_env("REPLY_SESSION_MINUTES", 20)),
+            ),
+            reply_author_daily_cap=min(
+                25,
+                max(1, _int_env("REPLY_AUTHOR_DAILY_CAP", 5)),
+            ),
+            stale_mobile_approval_hours=min(
+                72,
+                max(2, _int_env("STALE_MOBILE_APPROVAL_HOURS", 6)),
+            ),
+            reply_daily_digest_hour=min(
+                23,
+                max(0, _int_env("REPLY_DAILY_DIGEST_HOUR", 22)),
             ),
             creator_timezone=os.getenv(
                 "CREATOR_TIMEZONE", "Asia/Ho_Chi_Minh"
             ).strip()
             or "Asia/Ho_Chi_Minh",
-            content_language=os.getenv(
-                "CONTENT_LANGUAGE", "Vietnamese"
-            ).strip()
-            or "Vietnamese",
-            trend_language=os.getenv("TREND_LANGUAGE", "en").strip().lower()
-            or "en",
-            trend_sources=os.getenv("TREND_SOURCES", "x,google_trends,rss").strip()
-            or "x,google_trends,rss",
-            google_trends_geo=os.getenv("GOOGLE_TRENDS_GEO", "US").strip() or "US",
-            trend_rss_urls=os.getenv("TREND_RSS_URLS", "").strip(),
-            hashtag_mode=_choice_env("HASHTAG_MODE", "none", {"none", "auto", "one"}),
             creator_niche=os.getenv(
                 "CREATOR_NICHE",
                 "gold markets, cryptocurrency, and practical AI tools such as ChatGPT, Claude, Grok, and emerging AI products",
@@ -182,7 +198,10 @@ class Settings:
                 "local-bridge-change-me",
             ).strip()
             or "local-bridge-change-me",
-            extension_bridge_timeout_seconds=_int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 360),
+            extension_bridge_timeout_seconds=min(
+                360,
+                max(120, _int_env("EXTENSION_BRIDGE_TIMEOUT_SECONDS", 360)),
+            ),
             telegram_approval_chat_id=_optional_int_env("TELEGRAM_APPROVAL_CHAT_ID"),
             telegram_reply_targets_minutes=_optional_int_env(
                 "TELEGRAM_REPLY_TARGETS_MINUTES"
@@ -208,6 +227,32 @@ class Settings:
             telegram_reply_video_updated_at=_optional_int_env(
                 "TELEGRAM_REPLY_VIDEO_UPDATED_AT"
             ),
+            telegram_follow_targets_minutes=_optional_int_env(
+                "TELEGRAM_FOLLOW_TARGETS_MINUTES"
+            ),
+            telegram_follow_targets_updated_at=_optional_int_env(
+                "TELEGRAM_FOLLOW_TARGETS_UPDATED_AT"
+            ),
+            follow_target_batch_size=min(
+                20,
+                max(1, _int_env("FOLLOW_TARGET_BATCH_SIZE", 12)),
+            ),
+            follow_target_cooldown_hours=min(
+                168,
+                max(1, _int_env("FOLLOW_TARGET_COOLDOWN_HOURS", 24)),
+            ),
+            follow_target_min_followers=max(
+                1, _int_env("FOLLOW_TARGET_MIN_FOLLOWERS", 100)
+            ),
+            follow_target_max_followers=max(
+                100,
+                _int_env("FOLLOW_TARGET_MAX_FOLLOWERS", 50_000),
+            ),
+            follow_target_history_path=os.getenv(
+                "FOLLOW_TARGET_HISTORY_PATH",
+                "data/follow_target_history.json",
+            ).strip()
+            or "data/follow_target_history.json",
             automation_approvals_path=os.getenv(
                 "AUTOMATION_APPROVALS_PATH",
                 "data/automation_approvals.json",
@@ -222,22 +267,7 @@ class Settings:
             download_browser_profile=os.getenv(
                 "DOWNLOAD_BROWSER_PROFILE", ""
             ).strip(),
-            gemini_image_prompt_prefix=(
-                os.getenv("GEMINI_IMAGE_PROMPT_PREFIX")
-                or os.getenv(
-                    "GROK_IMAGE_PROMPT_PREFIX",
-                    (
-                        "Create one square realistic image for this social post. "
-                        "Return the image only, with no extra text."
-                    ),
-                )
-            ).strip()
-            or "Create one square realistic image for this social post. Return the image only.",
         )
-
-    @property
-    def grok_image_prompt_prefix(self) -> str:
-        return self.gemini_image_prompt_prefix
 
 
 def _required(name: str) -> str:

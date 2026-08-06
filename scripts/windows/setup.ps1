@@ -108,17 +108,46 @@ Write-Host "Installing Python dependencies..."
 if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip." }
 & (Join-Path $PSScriptRoot "sync-dependencies.ps1") -ProjectRoot $ProjectRoot -Force
 
-# Preserve every operator setting that setup owns. This prevents an upgrade from
-# erasing the approval chat, schedule interval, trend sources, persona, or image mode.
+# Preserve every active operator setting so upgrades do not reset reply automation.
 $envContent = @"
 TELEGRAM_BOT_TOKEN=$TelegramBotToken
 TELEGRAM_APPROVAL_CHAT_ID=$(Get-EnvValue "TELEGRAM_APPROVAL_CHAT_ID")
 TELEGRAM_REPLY_TARGETS_MINUTES=$(Get-EnvValue "TELEGRAM_REPLY_TARGETS_MINUTES")
 TELEGRAM_REPLY_TARGETS_UPDATED_AT=$(Get-EnvValue "TELEGRAM_REPLY_TARGETS_UPDATED_AT")
+TELEGRAM_REPLY_VIDEO_MINUTES=$(Get-EnvValue "TELEGRAM_REPLY_VIDEO_MINUTES")
+TELEGRAM_REPLY_VIDEO_UPDATED_AT=$(Get-EnvValue "TELEGRAM_REPLY_VIDEO_UPDATED_AT")
+TELEGRAM_FOLLOW_TARGETS_MINUTES=$(Get-EnvValue "TELEGRAM_FOLLOW_TARGETS_MINUTES" "20")
+TELEGRAM_FOLLOW_TARGETS_UPDATED_AT=$(Get-EnvValue "TELEGRAM_FOLLOW_TARGETS_UPDATED_AT")
 AUTOMATION_APPROVALS_PATH=$(Get-EnvValue "AUTOMATION_APPROVALS_PATH" "data/automation_approvals.json")
 REPLY_TARGET_MAX_AGE_MINUTES=$(Get-EnvValue "REPLY_TARGET_MAX_AGE_MINUTES" "360")
 REPLY_TARGET_LANGUAGES=$(Get-EnvValue "REPLY_TARGET_LANGUAGES" "en,ja")
 REPLY_TARGET_METRICS_PATH=$(Get-EnvValue "REPLY_TARGET_METRICS_PATH" "data/reply_target_metrics.json")
+REPLY_TARGET_MODE=$(Get-EnvValue "REPLY_TARGET_MODE" "balanced")
+CREATOR_GOAL=$(Get-EnvValue "CREATOR_GOAL" "qualify")
+REPLY_WATCH_PATH=$(Get-EnvValue "REPLY_WATCH_PATH" "data/reply_watchlist.json")
+REPLY_TARGET_BATCH_SIZE=$(Get-EnvValue "REPLY_TARGET_BATCH_SIZE" "3")
+REPLY_VIDEO_BATCH_SIZE=$(Get-EnvValue "REPLY_VIDEO_BATCH_SIZE" "3")
+FOLLOW_TARGET_BATCH_SIZE=$(Get-EnvValue "FOLLOW_TARGET_BATCH_SIZE" "12")
+FOLLOW_TARGET_COOLDOWN_HOURS=$(Get-EnvValue "FOLLOW_TARGET_COOLDOWN_HOURS" "24")
+FOLLOW_TARGET_MIN_FOLLOWERS=$(Get-EnvValue "FOLLOW_TARGET_MIN_FOLLOWERS" "100")
+FOLLOW_TARGET_MAX_FOLLOWERS=$(Get-EnvValue "FOLLOW_TARGET_MAX_FOLLOWERS" "50000")
+FOLLOW_TARGET_HISTORY_PATH=$(Get-EnvValue "FOLLOW_TARGET_HISTORY_PATH" "data/follow_target_history.json")
+REPLY_PENDING_QUEUE_CAP=$(Get-EnvValue "REPLY_PENDING_QUEUE_CAP" "5")
+CREATOR_DAILY_REPLY_CAP=$(Get-EnvValue "CREATOR_DAILY_REPLY_CAP" "500")
+REPLY_AUTHOR_DAILY_CAP=$(Get-EnvValue "REPLY_AUTHOR_DAILY_CAP" "5")
+REPLY_SESSION_MINUTES=$(Get-EnvValue "REPLY_SESSION_MINUTES" "20")
+REPLY_VIDEO_MIN_VIEWS=$(Get-EnvValue "REPLY_VIDEO_MIN_VIEWS" "15000")
+REPLY_VIDEO_MAX_AGE_MINUTES=$(Get-EnvValue "REPLY_VIDEO_MAX_AGE_MINUTES" "45")
+REPLY_VIDEO_FRAME_ANALYSIS=$(Get-EnvValue "REPLY_VIDEO_FRAME_ANALYSIS" "true")
+REPLY_VIDEO_FRAME_COUNT=$(Get-EnvValue "REPLY_VIDEO_FRAME_COUNT" "2")
+REPLY_LEARNING_ENABLED=$(Get-EnvValue "REPLY_LEARNING_ENABLED" "true")
+REPLY_LEARNING_PATH=$(Get-EnvValue "REPLY_LEARNING_PATH" "data/reply_learning.json")
+REVENUE_OPS_PATH=$(Get-EnvValue "REVENUE_OPS_PATH" "data/revenue_ops.json")
+REPLY_TRACKING_POLL_MINUTES=$(Get-EnvValue "REPLY_TRACKING_POLL_MINUTES" "5")
+REPLY_TRACKING_CHECKS_PER_CYCLE=$(Get-EnvValue "REPLY_TRACKING_CHECKS_PER_CYCLE" "8")
+REPLY_DAILY_DIGEST_HOUR=$(Get-EnvValue "REPLY_DAILY_DIGEST_HOUR" "22")
+STALE_MOBILE_APPROVAL_HOURS=$(Get-EnvValue "STALE_MOBILE_APPROVAL_HOURS" "6")
+CREATOR_TIMEZONE=$(Get-EnvValue "CREATOR_TIMEZONE" "Asia/Ho_Chi_Minh")
 
 DOWNLOAD_MAX_FILE_MB=$(Get-EnvValue "DOWNLOAD_MAX_FILE_MB" "45")
 DOWNLOAD_TIMEOUT_SECONDS=$(Get-EnvValue "DOWNLOAD_TIMEOUT_SECONDS" "180")
@@ -132,27 +161,18 @@ EXTENSION_BRIDGE_PORT=$(Get-EnvValue "EXTENSION_BRIDGE_PORT" "8765")
 EXTENSION_BRIDGE_TOKEN=$(Get-EnvValue "EXTENSION_BRIDGE_TOKEN" "local-bridge-change-me")
 EXTENSION_BRIDGE_TIMEOUT_SECONDS=$(Get-EnvValue "EXTENSION_BRIDGE_TIMEOUT_SECONDS" "360")
 
-GENERATE_IMAGES=$(Get-EnvValue "GENERATE_IMAGES" "false")
-IMAGE_PROVIDER=extension_bridge
-GEMINI_IMAGE_PROMPT_PREFIX=$(Get-EnvValue "GEMINI_IMAGE_PROMPT_PREFIX" "Create one square realistic image for this social post. Return the image only, with no extra text.")
-
 X_COOKIE=$(Get-EnvValue "X_COOKIE")
 X_ACCOUNT_NAME=$(Get-EnvValue "X_ACCOUNT_NAME" "telegram_bot")
+X_OWNER_USERNAME=$(Get-EnvValue "X_OWNER_USERNAME")
 X_ACCOUNTS_DB=$(Get-EnvValue "X_ACCOUNTS_DB" "data/twscrape_accounts.db")
 X_SEARCH_LIMIT=$(Get-EnvValue "X_SEARCH_LIMIT" "8")
 X_SEARCH_PRODUCT=$(Get-EnvValue "X_SEARCH_PRODUCT" "Top")
 REPLY_TARGET_MIN_AUTHOR_FOLLOWERS=$(Get-EnvValue "REPLY_TARGET_MIN_AUTHOR_FOLLOWERS" "50000")
 REPLY_TARGET_MIN_VIEWS=$(Get-EnvValue "REPLY_TARGET_MIN_VIEWS" "500")
-X_POST_CHAR_LIMIT=$(Get-EnvValue "X_POST_CHAR_LIMIT" "2000")
 
-TREND_SOURCES=$(Get-EnvValue "TREND_SOURCES" "x,google_trends,rss")
-GOOGLE_TRENDS_GEO=$(Get-EnvValue "GOOGLE_TRENDS_GEO" "US")
-TREND_RSS_URLS=$(Get-EnvValue "TREND_RSS_URLS")
-HASHTAG_MODE=$(Get-EnvValue "HASHTAG_MODE" "auto")
-
-CREATOR_NICHE=$(Get-EnvValue "CREATOR_NICHE" "AI tools, creator growth, and online business")
+CREATOR_NICHE=$(Get-EnvValue "CREATOR_NICHE" "gold markets, cryptocurrency, and practical AI tools")
 CREATOR_VOICE=$(Get-EnvValue "CREATOR_VOICE" "witty, practical, dry, slightly contrarian, with a sharp creator POV")
-TARGET_AUDIENCE=$(Get-EnvValue "TARGET_AUDIENCE" "Vietnamese X users, creators, founders, and indie hackers")
+TARGET_AUDIENCE=$(Get-EnvValue "TARGET_AUDIENCE" "Vietnamese retail investors, crypto users, creators, founders, and professionals")
 "@
 Set-Content -LiteralPath (Join-Path $ProjectRoot ".env") -Value $envContent -Encoding UTF8
 
@@ -170,4 +190,4 @@ if ($EnableVpsRestartSchedule) {
 & (Join-Path $ProjectRoot "scripts\windows\stop.ps1")
 & (Join-Path $ProjectRoot "scripts\windows\start.ps1")
 
-Write-Host "Setup complete. Try /tweettrend3 or /replytargets in Telegram."
+Write-Host "Setup complete. Try /replytargets, /replyvideo, /followtargets, or /download in Telegram."

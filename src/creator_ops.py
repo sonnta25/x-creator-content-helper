@@ -27,6 +27,7 @@ class ReplyWatchStore:
         self,
         results: list[XSearchResult],
         *,
+        source_type: str = "replytargets",
         now: datetime | None = None,
     ) -> tuple[list[XSearchResult], list[XSearchResult]]:
         current = now or datetime.now(UTC)
@@ -61,6 +62,8 @@ class ReplyWatchStore:
                 "last_seen_at": current.isoformat(),
                 "seen_count": seen_count,
                 "state": state,
+                "source_type": source_type,
+                "has_video": bool(result.has_video),
                 "viral_score": result.viral_score,
                 "opportunity_score": result.reply_opportunity_score,
                 "reply_count": result.reply_count,
@@ -78,20 +81,22 @@ class ReplyWatchStore:
             row["drafted_at"] = datetime.now(UTC).isoformat()
             self._save()
 
-    def watching(self, limit: int = 5) -> list[dict[str, Any]]:
-        rows = [
-            dict(row)
-            for row in self.data.get("items", {}).values()
-            if isinstance(row, dict) and row.get("state") == "watching"
-        ]
-        rows.sort(
-            key=lambda row: (
-                float(row.get("opportunity_score", 0.0)),
-                float(row.get("viral_score", 0.0)),
-            ),
-            reverse=True,
-        )
-        return rows[: max(0, limit)]
+    def mark_expired(self, url: str, *, reason: str = "") -> None:
+        row = self.data.get("items", {}).get(url)
+        if isinstance(row, dict):
+            row["state"] = "expired"
+            row["expired_at"] = datetime.now(UTC).isoformat()
+            row["expired_reason"] = str(reason or "")
+            self._save()
+
+    def inventory(self) -> dict[str, int]:
+        counts = {"watching": 0, "ready": 0, "drafted": 0, "expired": 0}
+        for row in self.data.get("items", {}).values():
+            if not isinstance(row, dict):
+                continue
+            state = str(row.get("state") or "watching")
+            counts[state] = counts.get(state, 0) + 1
+        return counts
 
     def candidates_for_refresh(
         self,
@@ -99,6 +104,7 @@ class ReplyWatchStore:
         limit: int = 6,
         languages: list[str] | tuple[str, ...] | None = None,
         states: tuple[str, ...] = ("watching",),
+        source_type: str = "replytargets",
         max_age_minutes: int | None = None,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
@@ -113,6 +119,9 @@ class ReplyWatchStore:
         rows: list[dict[str, Any]] = []
         for row in self.data.get("items", {}).values():
             if not isinstance(row, dict) or row.get("state") not in states:
+                continue
+            row_source = str(row.get("source_type") or "replytargets")
+            if source_type and row_source != source_type:
                 continue
             language = str(row.get("language") or "").strip().lower()
             if allowed_languages and language and language not in allowed_languages:

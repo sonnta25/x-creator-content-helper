@@ -7,7 +7,6 @@ from src.reply_learning import (
     MIN_FINAL_SAMPLES_TO_TUNE,
     ReplyLearningStore,
     match_posted_content,
-    match_posted_reply,
 )
 
 
@@ -66,7 +65,7 @@ def _approval(
     )
 
 
-def test_matches_posted_reply_by_parent_time_and_text() -> None:
+def test_matches_posted_content_by_parent_time_and_text() -> None:
     approved_at = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
     record = {
         "target_id": 42,
@@ -85,7 +84,7 @@ def test_matches_posted_reply_by_parent_time_and_text() -> None:
         created_at=approved_at + timedelta(minutes=3),
     )
 
-    assert match_posted_reply(record, [wrong_parent, correct]) == correct
+    assert match_posted_content(record, [wrong_parent, correct]) == correct
 
 
 def test_tracking_persists_and_finishes_at_24h(tmp_path) -> None:
@@ -300,3 +299,175 @@ def test_author_response_builds_relationship_strength_and_stop_signal(tmp_path) 
     )
     assert store.records("tracking")[0]["conversation_stopped"] is True
     assert strength_after_stop < strength_before_stop
+
+
+def test_style_memory_and_multidimensional_report_use_real_posted_replies(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+    for index in range(5):
+        approval = _approval(
+            f"style-{index}",
+            target_id=500 + index,
+            approved_at=now - timedelta(days=1),
+        )
+        approval.text = f"Specific draft {index}"
+        approval.metadata.update(
+            {
+                "language": "ja" if index < 3 else "en",
+                "source_type": "replyvideo" if index < 3 else "replytargets",
+                "creator_timezone": "Asia/Ho_Chi_Minh",
+                "root_author_followers": 20_000 if index < 3 else 100_000,
+                "author_tier": "mid_8k_50k" if index < 3 else "large_50k_300k",
+                "candidate_age_bucket": "10_30m",
+                "distribution_stage": "sweet_5k_50k",
+                "discovery_daypart": "asia_morning" if index < 3 else "us_evening",
+            }
+        )
+        store.register_approval(approval)
+        posted = _result(
+            800 + index,
+            target_id=500 + index,
+            text=f"Real posted reply {index}",
+            created_at=now - timedelta(hours=20 - index),
+            views=25_000 if index < 3 else 1_000,
+            likes=20,
+        )
+        posted = XSearchResult(**{**posted.__dict__, "language": approval.metadata["language"]})
+        store.mark_discovered(approval.id, posted)
+        store.add_snapshot(
+            approval.id,
+            checkpoint_minutes=1440,
+            reply=posted,
+            root=_result(500 + index, views=100_000, username="source"),
+            captured_at=now,
+        )
+
+    examples = store.style_examples(
+        language="ja",
+        source_type="replyvideo",
+        limit=2,
+    )
+    report = store.report(now=now + timedelta(minutes=1))
+
+    assert len(examples) == 2
+    assert all(text.startswith("Real posted reply") for text in examples)
+    assert report["median_views"] > 0
+    assert report["over_20k"] == 3
+    assert report["by_language"]["ja"]["count"] == 3
+    assert report["by_source"]["replyvideo"]["count"] == 3
+    assert report["by_author_tier"]["mid_8k_50k"]["count"] == 3
+    assert report["by_age_bucket"]["10_30m"]["count"] == 5
+    assert report["by_distribution_stage"]["sweet_5k_50k"]["count"] == 5
+    assert report["by_daypart"]["asia_morning"]["count"] == 3
+    assert report["by_hour_local"]
+    assert store.performance_adjustment(
+        language="ja",
+        source_type="replyvideo",
+    ) > 1.0
+
+
+def test_daily_digest_marker_persists(tmp_path) -> None:
+    path = tmp_path / "learning.json"
+    store = ReplyLearningStore(path)
+    store.mark_digest_sent("2026-08-03")
+
+    assert ReplyLearningStore(path).last_digest_date == "2026-08-03"
+
+
+def test_reply_windows_contribute_to_follower_lift_and_experiment_report(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    now = datetime(2026, 8, 4, 12, tzinfo=UTC)
+    approval = _approval("reply-lift", target_id=900, approved_at=now - timedelta(days=1))
+    approval.metadata.update(
+        {
+            "experiment_variant": "concise_statement",
+            "approval_latency_seconds": 45,
+            "verified_audience_proxy": 70,
+        }
+    )
+    store.register_approval(approval)
+    posted = _result(
+        901,
+        target_id=900,
+        created_at=now - timedelta(hours=23),
+        views=25_000,
+        followers=1_000,
+    )
+    store.mark_discovered(approval.id, posted)
+    later = _result(
+        901,
+        target_id=900,
+        created_at=now - timedelta(hours=23),
+        views=25_000,
+        followers=1_025,
+    )
+    store.add_snapshot(
+        approval.id,
+        checkpoint_minutes=1440,
+        reply=later,
+        root=_result(900, views=100_000, username="source"),
+        owner_followers=1_025,
+        captured_at=now,
+    )
+
+    report = store.report(now=now + timedelta(minutes=1))
+
+    assert report["follower_window_lift"] == 25
+    assert report["by_experiment"]["concise_statement"]["count"] == 1
+    assert report["median_approval_latency_seconds"] == 45
+
+
+def test_experiment_variants_rotate_and_can_be_disabled(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+
+    first = store.choose_experiment_variant()
+    second = store.choose_experiment_variant()
+    assert first != second
+
+    store.set_experiment_enabled(False)
+    assert store.choose_experiment_variant() == "adaptive"
+
+
+def test_author_portfolios_expose_auto_watch_signals(tmp_path) -> None:
+    store = ReplyLearningStore(tmp_path / "learning.json")
+    now = datetime(2026, 8, 4, 12, tzinfo=UTC)
+    approval = _approval(
+        "portfolio-signals",
+        target_id=700,
+        approved_at=now - timedelta(hours=2),
+    )
+    approval.metadata.update(
+        {
+            "verified_audience_proxy": 65,
+            "monetization_risk_level": "green",
+            "root_author_followers": 25_000,
+            "author_tier": "mid_8k_50k",
+        }
+    )
+    store.register_approval(approval)
+    posted = _result(
+        701,
+        target_id=700,
+        created_at=now - timedelta(hours=1),
+        views=25_000,
+    )
+    store.mark_discovered(approval.id, posted)
+    store.add_snapshot(
+        approval.id,
+        checkpoint_minutes=60,
+        reply=posted,
+        root=_result(700, views=100_000, username="source"),
+        author_replied=True,
+        captured_at=now,
+    )
+
+    rows = store.author_portfolios()
+
+    assert len(rows) == 1
+    assert rows[0]["username"] == "source"
+    assert rows[0]["median_views"] == 25_000
+    assert rows[0]["verified_audience_proxy"] == 65
+    assert rows[0]["author_followers"] == 25_000
+    assert rows[0]["author_tier"] == "mid_8k_50k"
+    assert rows[0]["green_rate"] == 1.0
+    assert rows[0]["last_interaction_at"] == posted.created_at

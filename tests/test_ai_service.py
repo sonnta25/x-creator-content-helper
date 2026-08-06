@@ -12,7 +12,6 @@ from src.extension_bridge import (
     ExtensionBridgeJob,
     ExtensionBridgeServer,
     _attachment_payloads,
-    _clean_final_image_prompt,
 )
 from src.extension_bridge_service import ExtensionBridgeService
 from src.models import ImageAttachment
@@ -27,6 +26,37 @@ def test_extension_bridge_provider_is_selected() -> None:
     assert isinstance(create_ai_service(settings), ExtensionBridgeService)
 
 
+def test_extension_bridge_serializes_provider_jobs_before_timeout_starts() -> None:
+    server = ExtensionBridgeServer(Settings(telegram_bot_token="123:ABC"))
+    active = 0
+    max_active = 0
+
+    async def no_start():
+        return None
+
+    async def wait_for_job(job):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return job.final_prompt
+
+    server.start = no_start
+    server._wait_for_job = wait_for_job
+
+    async def submit_both():
+        return await asyncio.gather(
+            server.submit_text_job("first"),
+            server.submit_text_job("second"),
+        )
+
+    results = asyncio.run(submit_both())
+
+    assert len(results) == 2
+    assert max_active == 1
+
+
 def test_extension_bridge_service_covers_text_generation_methods() -> None:
     service = create_ai_service(
         Settings(
@@ -36,13 +66,8 @@ def test_extension_bridge_service_covers_text_generation_methods() -> None:
     )
 
     for method_name in (
-        "generate_topic_post",
-        "generate_topic_post_from_x_context",
-        "generate_trend_post",
-        "generate_trend_post_variants",
-        "generate_daily_brief",
-        "generate_retweet_remix",
         "generate_reply_from_text",
+        "generate_reply_revision",
         "generate_reply_targets",
     ):
         assert hasattr(service, method_name)
@@ -68,33 +93,11 @@ def test_extension_bridge_service_rejects_prompt_leak_output() -> None:
         raise AssertionError("Expected prompt leak output to be rejected")
 
 
-def test_clean_final_image_prompt_removes_long_guardrails() -> None:
-    prompt = (
-        "A founder reviewing AI dashboards in a small office. "
-        "Realistic candid documentary photography style, natural lighting, "
-        "real-world camera framing, believable anatomy. "
-        + "extra detail " * 200
-    )
-
-    clean = _clean_final_image_prompt(
-        prompt,
-        "Create one square realistic image for this social post. Return the image only.",
-    )
-
-    assert clean.startswith("Create one square realistic image")
-    assert "Create one square realistic image:" in clean
-    assert "Realistic candid documentary photography style" not in clean
-    assert "no previous attachments" in clean
-    assert len(clean) < 1200
-
-
 def test_bridge_claims_each_text_job_once_for_a_single_gemini_pass() -> None:
     async def exercise() -> None:
         server = ExtensionBridgeServer(Settings(telegram_bot_token="123:ABC"))
         job = ExtensionBridgeJob(
             id="job-1",
-            kind="text",
-            original_prompt="You are a Twitter/X Reply Engine. Return only ONE final reply.",
             phase="final_pending",
             final_prompt="Write one final reply.",
         )
@@ -122,8 +125,6 @@ def test_bridge_requeues_a_job_after_its_extension_lease_expires() -> None:
         server = ExtensionBridgeServer(Settings(telegram_bot_token="123:ABC"))
         job = ExtensionBridgeJob(
             id="job-stale",
-            kind="text",
-            original_prompt="Reply task",
             phase="final_running",
             final_prompt="Write one reply.",
             last_heartbeat_at=time.monotonic() - JOB_LEASE_SECONDS - 1,
@@ -136,6 +137,142 @@ def test_bridge_requeues_a_job_after_its_extension_lease_expires() -> None:
         assert reclaimed["job"]["id"] == job.id
         assert job.phase == "final_running"
         assert job.claim_attempts == 2
+
+    asyncio.run(exercise())
+
+
+def test_bridge_waiter_requeues_stalled_job_for_extension_recovery(monkeypatch) -> None:
+    async def exercise() -> None:
+        monkeypatch.setattr(extension_bridge_module, "JOB_LEASE_SECONDS", 0.01)
+        monkeypatch.setattr(extension_bridge_module, "JOB_HEALTH_POLL_SECONDS", 0.005)
+        server = ExtensionBridgeServer(
+            Settings(
+                telegram_bot_token="123:ABC",
+                extension_bridge_timeout_seconds=1,
+            )
+        )
+        job = ExtensionBridgeJob(
+            id="job-interrupted",
+            phase="final_running",
+            final_prompt="Write one reply.",
+            last_heartbeat_at=time.monotonic() - 0.02,
+            claim_attempts=1,
+        )
+        server._jobs[job.id] = job
+
+        waiter = asyncio.create_task(server._wait_for_job(job))
+        for _ in range(20):
+            if job.phase == "final_pending":
+                break
+            await asyncio.sleep(0.005)
+
+        assert job.phase == "final_pending"
+        reclaimed = json.loads((await server._next_job()).split(b"\r\n\r\n", 1)[1])
+        assert reclaimed["job"]["id"] == job.id
+        assert job.claim_attempts == 2
+        job.future.set_result("Recovered result")
+        assert await waiter == "Recovered result"
+
+    asyncio.run(exercise())
+
+
+def test_bridge_allows_original_worker_to_resume_a_requeued_lease() -> None:
+    async def exercise() -> None:
+        server = ExtensionBridgeServer(Settings(telegram_bot_token="123:ABC"))
+        job = ExtensionBridgeJob(
+            id="job-resumed-heartbeat",
+            phase="final_pending",
+            final_prompt="Write one reply.",
+            last_heartbeat_at=0.0,
+            claim_attempts=1,
+        )
+        server._jobs[job.id] = job
+
+        response = await server._accept_heartbeat(job.id)
+        payload = json.loads(response.split(b"\r\n\r\n", 1)[1])
+
+        assert payload["ok"] is True
+        assert payload["recovered_lease"] is True
+        assert job.phase == "final_running"
+        assert job.last_heartbeat_at > 0
+
+    asyncio.run(exercise())
+
+
+def test_bridge_gives_a_recovered_worker_a_fresh_stall_window(monkeypatch) -> None:
+    async def exercise() -> None:
+        monkeypatch.setattr(extension_bridge_module, "JOB_LEASE_SECONDS", 0.03)
+        monkeypatch.setattr(extension_bridge_module, "JOB_HEALTH_POLL_SECONDS", 0.005)
+        monkeypatch.setattr(extension_bridge_module, "JOB_RECOVERY_WAIT_SECONDS", 0.2)
+        server = ExtensionBridgeServer(
+            Settings(
+                telegram_bot_token="123:ABC",
+                extension_bridge_timeout_seconds=1,
+            )
+        )
+        job = ExtensionBridgeJob(
+            id="job-recovered-twice",
+            phase="final_running",
+            final_prompt="Write one reply.",
+            last_heartbeat_at=time.monotonic() - 0.04,
+            claim_attempts=1,
+        )
+        server._jobs[job.id] = job
+        waiter = asyncio.create_task(server._wait_for_job(job))
+
+        for _ in range(40):
+            if job.phase == "final_pending":
+                break
+            await asyncio.sleep(0.005)
+        assert job.phase == "final_pending"
+
+        # Keep the recovered lease healthy beyond most of the first recovery
+        # window. A later interruption must start a new window, not reuse the
+        # almost-expired timestamp from the first stall.
+        for _ in range(8):
+            await server._accept_heartbeat(job.id)
+            await asyncio.sleep(0.02)
+
+        for _ in range(40):
+            if job.phase == "final_pending":
+                break
+            await asyncio.sleep(0.005)
+        assert job.phase == "final_pending"
+        await asyncio.sleep(0.05)
+
+        reclaimed = json.loads((await server._next_job()).split(b"\r\n\r\n", 1)[1])
+        assert reclaimed["job"]["id"] == job.id
+        job.future.set_result("Recovered after a second interruption")
+        assert await waiter == "Recovered after a second interruption"
+
+    asyncio.run(exercise())
+
+
+def test_bridge_stopped_heartbeat_fails_at_recovery_deadline(monkeypatch) -> None:
+    async def exercise() -> None:
+        monkeypatch.setattr(extension_bridge_module, "JOB_LEASE_SECONDS", 0.005)
+        monkeypatch.setattr(extension_bridge_module, "JOB_HEALTH_POLL_SECONDS", 0.005)
+        monkeypatch.setattr(extension_bridge_module, "JOB_RECOVERY_WAIT_SECONDS", 0.03)
+        server = ExtensionBridgeServer(
+            Settings(
+                telegram_bot_token="123:ABC",
+                extension_bridge_timeout_seconds=1,
+            )
+        )
+        job = ExtensionBridgeJob(
+            id="job-not-reclaimed",
+            phase="final_running",
+            final_prompt="Write one reply.",
+            last_heartbeat_at=time.monotonic() - 0.02,
+            claim_attempts=1,
+        )
+        server._jobs[job.id] = job
+        started = time.monotonic()
+
+        with pytest.raises(RuntimeError, match="heartbeat stopped.*did not reclaim"):
+            await server._wait_for_job(job)
+
+        assert time.monotonic() - started < 0.2
 
     asyncio.run(exercise())
 
@@ -155,8 +292,6 @@ def test_bridge_active_heartbeat_extends_soft_timeout(monkeypatch) -> None:
         )
         job = ExtensionBridgeJob(
             id="job-active",
-            kind="text",
-            original_prompt="Reply task",
             phase="final_running",
             final_prompt="Write one reply.",
             last_heartbeat_at=time.monotonic(),
@@ -173,6 +308,36 @@ def test_bridge_active_heartbeat_extends_soft_timeout(monkeypatch) -> None:
     asyncio.run(exercise())
 
 
+def test_bridge_health_poll_does_not_timeout_an_unclaimed_job_early(
+    monkeypatch,
+) -> None:
+    async def exercise() -> None:
+        monkeypatch.setattr(extension_bridge_module, "JOB_HEALTH_POLL_SECONDS", 0.01)
+        server = ExtensionBridgeServer(
+            Settings(
+                telegram_bot_token="123:ABC",
+                extension_bridge_timeout_seconds=0.2,
+            )
+        )
+        job = ExtensionBridgeJob(
+            id="job-claimed-later",
+            phase="final_pending",
+            final_prompt="Write one reply.",
+        )
+        server._jobs[job.id] = job
+
+        waiter = asyncio.create_task(server._wait_for_job(job))
+        await asyncio.sleep(0.04)
+        assert waiter.done() is False
+
+        claimed = json.loads((await server._next_job()).split(b"\r\n\r\n", 1)[1])
+        assert claimed["job"]["id"] == job.id
+        job.future.set_result("Chrome claimed after several health polls")
+        assert await waiter == "Chrome claimed after several health polls"
+
+    asyncio.run(exercise())
+
+
 def test_bridge_timeout_explains_when_chrome_never_claimed_job() -> None:
     async def exercise() -> None:
         server = ExtensionBridgeServer(
@@ -183,8 +348,6 @@ def test_bridge_timeout_explains_when_chrome_never_claimed_job() -> None:
         )
         job = ExtensionBridgeJob(
             id="job-unclaimed",
-            kind="text",
-            original_prompt="Reply task",
             phase="final_pending",
             final_prompt="Write one reply.",
         )
@@ -209,8 +372,8 @@ def test_bridge_routes_scheduled_trigger_to_automation_handler() -> None:
         async def trigger_replyvideo(self, payload):
             return {"ok": True, "video_query": payload.get("query", "")}
 
-        async def trigger_tweettrend3(self, payload):
-            return {"ok": True}
+        async def trigger_followtargets(self, payload):
+            return {"ok": True, "minutes": payload.get("follow_targets_minutes")}
 
         async def next_approved_action(self):
             return None
@@ -249,6 +412,17 @@ def test_bridge_routes_scheduled_trigger_to_automation_handler() -> None:
         assert video_response.startswith(b"HTTP/1.1 202 Accepted")
         assert b'"video_query": "football"' in video_response
 
+        follow_response = await server._route(
+            {
+                "method": "POST",
+                "target": "/automation/triggers/followtargets",
+                "headers": {"x-extension-bridge-token": "test-token"},
+                "body": b'{"follow_targets_minutes":20}',
+            }
+        )
+        assert follow_response.startswith(b"HTTP/1.1 202 Accepted")
+        assert b'"minutes": 20' in follow_response
+
     asyncio.run(exercise())
 
 
@@ -267,8 +441,6 @@ def test_next_text_job_exposes_frame_attachments_to_extension() -> None:
         server = ExtensionBridgeServer(Settings(telegram_bot_token="123:ABC"))
         job = ExtensionBridgeJob(
             id="visual-job",
-            kind="text",
-            original_prompt="Analyze frames",
             phase="final_pending",
             final_prompt="Write grounded replies",
             attachments=[

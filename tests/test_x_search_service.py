@@ -1,13 +1,14 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+import src.x_search_service as x_search_service_module
 from src.models import XSearchResult, XTrend
 from src.config import Settings
 import pytest
 
 from src.x_search_service import (
     TREND_CATEGORIES,
-    TREND_FALLBACK_QUERIES,
     _to_search_result,
     default_english_query,
     extract_tweet_id,
@@ -17,22 +18,59 @@ from src.x_search_service import (
     rank_fast_growing_posts,
     rank_viral_video_posts,
     recent_search_query,
-    summarize_trends_context,
 )
 from src.x_search_service import XSearchService
 
 
+def test_x_search_service_serializes_overlapping_searches(monkeypatch) -> None:
+    class FakeApi:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        def search(self, query, **_kwargs):
+            async def stream():
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    await asyncio.sleep(0.01)
+                    yield SimpleNamespace(query=query)
+                finally:
+                    self.active -= 1
+
+            return stream()
+
+    async def exercise() -> None:
+        service = XSearchService(Settings(telegram_bot_token="123:ABC"))
+        api = FakeApi()
+        service._api = api
+        monkeypatch.setattr(
+            x_search_service_module,
+            "_to_search_result",
+            lambda tweet: XSearchResult(
+                id=1,
+                username="source",
+                display_name="Source",
+                text=tweet.query,
+                created_at="",
+                url=f"https://x.com/source/status/{tweet.query}",
+            ),
+        )
+
+        first, second = await asyncio.gather(
+            service.search("one", limit=1),
+            service.search("two", limit=1),
+        )
+
+        assert first[0].text.endswith("lang:en")
+        assert second[0].text.endswith("lang:en")
+        assert api.max_active == 1
+
+    asyncio.run(exercise())
+
+
 def test_trend_categories_match_supported_twscrape_ids() -> None:
     assert TREND_CATEGORIES == {"trending", "news", "sport", "entertainment"}
-    assert set(TREND_FALLBACK_QUERIES) == TREND_CATEGORIES
-
-
-def test_summarize_trends_context() -> None:
-    context = summarize_trends_context(
-        [XTrend(name="OpenAI", rank="1", description="Trending in Technology")]
-    )
-
-    assert context == "1. OpenAI (rank 1) - Trending in Technology"
 
 
 def test_normalize_account_name() -> None:
@@ -431,8 +469,14 @@ def test_to_search_result_captures_author_reach() -> None:
         username = "large"
         displayname = "Large Account"
         followersCount = 250_000
+        friendsCount = 200_000
+        statusesCount = 12_000
+        rawDescription = "Vietnamese creator"
+        location = "Vietnam"
+        protected = False
         verified = True
-        blue = False
+        blue = True
+        blueType = None
 
     class Tweet:
         id = 22
@@ -451,10 +495,46 @@ def test_to_search_result_captures_author_reach() -> None:
     result = _to_search_result(Tweet())
 
     assert result.author_followers_count == 250_000
+    assert result.author_following_count == 200_000
+    assert result.author_statuses_count == 12_000
     assert result.author_verified is True
+    assert result.author_blue_verified is True
+    assert result.author_blue_type == ""
+    assert result.author_description == "Vietnamese creator"
+    assert result.author_location == "Vietnam"
+    assert result.author_protected is False
     assert result.author_id == 7
     assert result.conversation_id == 22
     assert result.in_reply_to_tweet_id == 11
+
+
+def test_owner_following_usernames_is_cached() -> None:
+    class FakeAPI:
+        calls = 0
+
+        async def user_by_login(self, username):
+            return SimpleNamespace(id=7, username=username, friendsCount=2)
+
+        def following(self, user_id, limit):
+            del user_id, limit
+            self.calls += 1
+
+            async def stream():
+                yield SimpleNamespace(username="First")
+                yield SimpleNamespace(username="Second")
+
+            return stream()
+
+    service = XSearchService(Settings(telegram_bot_token="123:ABC"))
+    fake = FakeAPI()
+    service._api = fake
+
+    first = asyncio.run(service.owner_following_usernames("Owner"))
+    second = asyncio.run(service.owner_following_usernames("Owner"))
+
+    assert first == {"owner", "first", "second"}
+    assert second == first
+    assert fake.calls == 1
 
 
 def test_to_search_result_marks_video_and_keeps_exposed_alt_text() -> None:

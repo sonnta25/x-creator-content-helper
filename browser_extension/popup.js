@@ -16,14 +16,16 @@ const DEFAULTS = {
   replyVideoMinutes: 5,
   replyVideoQuery: "",
   replyVideoWindows: "08:00-11:00,12:00-14:00,19:00-22:00",
-  trendTimes: "09:00,18:00",
-  trendCategory: "auto",
+  followTargetsMinutes: 20,
   nextReplyTargetsAt: 0,
   lastReplyTargetsTriggeredAt: 0,
   replyTargetsConfigUpdatedAt: 0,
   nextReplyVideoAt: 0,
   lastReplyVideoTriggeredAt: 0,
   replyVideoConfigUpdatedAt: 0,
+  nextFollowTargetsAt: 0,
+  lastFollowTargetsTriggeredAt: 0,
+  followTargetsConfigUpdatedAt: 0,
   lastStatus: "Ready."
 };
 
@@ -48,8 +50,8 @@ const els = {
   replyVideoQuery: document.getElementById("replyVideoQuery"),
   replyVideoWindows: document.getElementById("replyVideoWindows"),
   replyVideoScheduleStatus: document.getElementById("replyVideoScheduleStatus"),
-  trendTimes: document.getElementById("trendTimes"),
-  trendCategory: document.getElementById("trendCategory"),
+  followTargetsMinutes: document.getElementById("followTargetsMinutes"),
+  followTargetsScheduleStatus: document.getElementById("followTargetsScheduleStatus"),
   save: document.getElementById("save"),
   run: document.getElementById("run"),
   diagnoseGemini: document.getElementById("diagnoseGemini"),
@@ -135,7 +137,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
   if (areaName === "local" && (
     changes.nextReplyTargetsAt || changes.lastReplyTargetsTriggeredAt ||
-    changes.nextReplyVideoAt || changes.lastReplyVideoTriggeredAt
+    changes.nextReplyVideoAt || changes.lastReplyVideoTriggeredAt ||
+    changes.nextFollowTargetsAt || changes.lastFollowTargetsTriggeredAt
   )) {
     if (changes.nextReplyTargetsAt) {
       currentConfig.nextReplyTargetsAt = Number(changes.nextReplyTargetsAt.newValue || 0);
@@ -148,6 +151,14 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     }
     if (changes.lastReplyVideoTriggeredAt) {
       currentConfig.lastReplyVideoTriggeredAt = Number(changes.lastReplyVideoTriggeredAt.newValue || 0);
+    }
+    if (changes.nextFollowTargetsAt) {
+      currentConfig.nextFollowTargetsAt = Number(changes.nextFollowTargetsAt.newValue || 0);
+    }
+    if (changes.lastFollowTargetsTriggeredAt) {
+      currentConfig.lastFollowTargetsTriggeredAt = Number(
+        changes.lastFollowTargetsTriggeredAt.newValue || 0
+      );
     }
     renderReplyScheduleStatus(currentConfig);
   }
@@ -197,8 +208,7 @@ function renderConfig(config) {
   els.replyVideoMinutes.value = String(config.replyVideoMinutes);
   els.replyVideoQuery.value = config.replyVideoQuery;
   els.replyVideoWindows.value = config.replyVideoWindows;
-  els.trendTimes.value = config.trendTimes;
-  els.trendCategory.value = config.trendCategory;
+  els.followTargetsMinutes.value = String(config.followTargetsMinutes);
   els.autoRun.textContent = config.autoRun ? "ON" : "OFF";
   els.autoRun.classList.toggle("is-on", config.autoRun);
   els.autoRun.setAttribute("aria-pressed", config.autoRun ? "true" : "false");
@@ -218,13 +228,19 @@ function renderReplyScheduleStatus(config) {
   els.replyVideoScheduleStatus.textContent = config.automationEnabled
     ? `Last trigger: ${format(config.lastReplyVideoTriggeredAt)} Â· Next run: ${format(config.nextReplyVideoAt)}`
     : "Automation is OFF; /replyvideo will not run on a schedule.";
+  els.followTargetsScheduleStatus.textContent = config.automationEnabled
+    ? `Last trigger: ${format(config.lastFollowTargetsTriggeredAt)} · Next run: ${format(config.nextFollowTargetsAt)} · Uses /replyvideo windows`
+    : "Automation is OFF; /followtargets will not run on a schedule.";
 }
 
 function readConfigFromForm() {
   return {
     bridgeUrl: els.bridgeUrl.value.trim().replace(/\/$/, "") || DEFAULTS.bridgeUrl,
     token: els.token.value.trim() || DEFAULTS.token,
-    timeoutSeconds: Math.max(30, Number(els.timeoutSeconds.value || DEFAULTS.timeoutSeconds)),
+    timeoutSeconds: Math.min(
+      360,
+      Math.max(120, Number(els.timeoutSeconds.value || DEFAULTS.timeoutSeconds))
+    ),
     pollSeconds: Math.max(
       currentConfig.lowResourceMode ? 60 : 30,
       Number(els.pollSeconds.value || DEFAULTS.pollSeconds)
@@ -247,15 +263,18 @@ function readConfigFromForm() {
     replyVideoMinutes: Math.max(3, Number(els.replyVideoMinutes.value || DEFAULTS.replyVideoMinutes)),
     replyVideoQuery: els.replyVideoQuery.value.trim(),
     replyVideoWindows: els.replyVideoWindows.value.trim() || DEFAULTS.replyVideoWindows,
-    trendTimes: els.trendTimes.value.trim() || DEFAULTS.trendTimes,
-    trendCategory: els.trendCategory.value || DEFAULTS.trendCategory,
+    followTargetsMinutes: Math.max(5, Number(
+      els.followTargetsMinutes.value || DEFAULTS.followTargetsMinutes
+    )),
     nextReplyTargetsAt: Number(currentConfig.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(currentConfig.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(currentConfig.replyTargetsConfigUpdatedAt || 0),
     nextReplyVideoAt: Number(currentConfig.nextReplyVideoAt || 0),
     lastReplyVideoTriggeredAt: Number(currentConfig.lastReplyVideoTriggeredAt || 0),
     replyVideoConfigUpdatedAt: Number(currentConfig.replyVideoConfigUpdatedAt || 0),
-    trendRunKeys: Array.isArray(currentConfig.trendRunKeys) ? currentConfig.trendRunKeys : []
+    nextFollowTargetsAt: Number(currentConfig.nextFollowTargetsAt || 0),
+    lastFollowTargetsTriggeredAt: Number(currentConfig.lastFollowTargetsTriggeredAt || 0),
+    followTargetsConfigUpdatedAt: Number(currentConfig.followTargetsConfigUpdatedAt || 0)
   };
 }
 

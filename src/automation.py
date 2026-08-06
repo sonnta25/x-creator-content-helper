@@ -152,6 +152,78 @@ class AutomationApprovalStore:
         self.prune()
         return list(self._items.values())
 
+    def migrate_reply_only(
+        self,
+        *,
+        stale_mobile_hours: int = 6,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Archive removed post workflows and release stale mobile reply locks."""
+        current = now or datetime.now(UTC)
+        archived_posts = 0
+        released_mobile = 0
+        for approval in self._items.values():
+            age = current - (approval.decided_at or approval.created_at)
+            if approval.kind == "post" and approval.status not in {
+                "archived",
+                "rejected",
+                "expired",
+                "failed",
+            }:
+                approval.status = "archived"
+                approval.error = "Archived after the bot moved to a reply-only workflow."
+                archived_posts += 1
+                continue
+            if (
+                approval.kind == "reply"
+                and approval.status == "mobile_approved"
+                and age >= timedelta(hours=max(2, stale_mobile_hours))
+            ):
+                approval.status = "not_found"
+                approval.error = (
+                    "Posting could not be confirmed before the stale approval window ended."
+                )
+                released_mobile += 1
+        if archived_posts or released_mobile:
+            self._save()
+        return {
+            "archived_posts": archived_posts,
+            "released_mobile": released_mobile,
+        }
+
+    def pending_by_metadata(self, key: str, value: object) -> list[AutomationApproval]:
+        return [
+            approval
+            for approval in self.items()
+            if approval.status == "pending"
+            and (approval.metadata or {}).get(key) == value
+        ]
+
+    def cancel_pending_by_metadata(self, key: str, value: object) -> int:
+        cancelled = 0
+        for approval in self._items.values():
+            if (
+                approval.status == "pending"
+                and (approval.metadata or {}).get(key) == value
+            ):
+                approval.status = "rejected"
+                approval.error = "Cancelled with the reply session."
+                approval.decided_at = datetime.now(UTC)
+                cancelled += 1
+        if cancelled:
+            self._save()
+        return cancelled
+
+    def expire(self, approval_id: str, *, error: str = "") -> AutomationApproval:
+        approval = self.get(approval_id)
+        if approval is None:
+            raise RuntimeError("Unknown approval request.")
+        if approval.status == "pending":
+            approval.status = "expired"
+            approval.error = str(error or "").strip()
+            self._save()
+        return approval
+
     def update_text(self, approval_id: str, text: str) -> AutomationApproval:
         approval = self.get(approval_id)
         if approval is None:
@@ -230,6 +302,7 @@ class AutomationApprovalStore:
                 "mobile_approved",
                 "published",
                 "not_found",
+                "archived",
             }
         ]
         for key in removable[: max(0, len(self._items) - keep)]:

@@ -18,14 +18,35 @@ $excludedDirs = @(
     ".agents",
     ".codex",
     ".git",
+    ".github",
     ".pytest_cache",
     ".venv",
     "__pycache__",
     "data",
     "dist",
-    "logs"
+    "logs",
+    "tests"
 )
-$excludedFiles = @(".env")
+$excludedFiles = @(".env", ".gitignore")
+$excludedSensitivePatterns = @(
+    ".env.*",
+    "*cookie*",
+    "auth_token*",
+    "ct0*",
+    "*.pem",
+    "*.key"
+)
+
+function Test-ExcludedFile {
+    param([System.IO.FileInfo] $File)
+
+    if ($excludedFiles -contains $File.Name) { return $true }
+    if ($File.Name -eq ".env.example") { return $false }
+    foreach ($pattern in $excludedSensitivePatterns) {
+        if ($File.Name -like $pattern) { return $true }
+    }
+    return $false
+}
 
 function Get-PackageFiles {
     param([string] $Path)
@@ -47,7 +68,7 @@ function Get-PackageFiles {
             continue
         }
 
-        if ($excludedFiles -contains $child.Name) {
+        if (Test-ExcludedFile -File $child) {
             continue
         }
 
@@ -66,7 +87,23 @@ try {
         Copy-Item -LiteralPath $file.FullName -Destination $target -Force
     }
 
-    Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $OutputPath -Force
+    $archiveCreated = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $OutputPath -Force
+            $archiveCreated = $true
+            break
+        } catch {
+            if ($attempt -ge 3) {
+                throw
+            }
+            Write-Warning "Archive attempt $attempt failed because a staging file was temporarily locked. Retrying..."
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
+    if (-not $archiveCreated) {
+        throw "Deployment archive was not created."
+    }
     Write-Host "Package created: $OutputPath"
 } finally {
     if (Test-Path $stagingRoot) {

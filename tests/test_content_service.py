@@ -1,30 +1,21 @@
 import asyncio
 
+import pytest
+
 from src.content_service import (
-    EDITORIAL_VISUAL_STRATEGIST_INSTRUCTIONS,
-    REPLY_ENGINE_INSTRUCTIONS,
-    TOPIC_KNOWLEDGE_ENGINE_INSTRUCTIONS,
     ContentService,
     _reply_engine_prompt,
+    _reply_quality_violations,
     _single_reply_output_contract,
-    _single_tweet_output_contract,
-    _hashtag_instruction,
-    _limit_x_post_text,
     _limit_x_text,
     _looks_like_prompt_leak,
     _parse_json,
     _parse_reply_targets,
     _parse_single_reply,
     _reply_is_question_only,
-    _parse_trend_variants,
-    _remove_ai_art_terms,
-    _realistic_image_prompt,
-    _response_error_detail,
-    _retweet_scene_locked_prompt,
-    _tweet_engine_prompt,
 )
 from src.config import Settings
-from src.models import GeneratedContent, ImageAttachment
+from src.models import ImageAttachment, ReplyRevision
 
 
 def test_limit_x_text_keeps_complete_sentences() -> None:
@@ -52,222 +43,6 @@ def test_limit_x_text_falls_back_to_word_boundary() -> None:
     assert not limited.endswith(".")
 
 
-def test_limit_x_post_text_allows_long_form_posts() -> None:
-    text = (
-        "First paragraph gives the hook and context.\n\n"
-        "Second paragraph adds detail, tradeoff, and a more personal read. " * 8
-    )
-
-    limited = _limit_x_post_text(text, 1000)
-
-    assert len(limited) > 280
-    assert len(limited) <= 1000
-    assert "\n\n" in limited
-
-
-def test_hashtag_instruction_modes() -> None:
-    assert "Do not include hashtags" in _hashtag_instruction("none")
-    assert "at most 1" in _hashtag_instruction("auto")
-    assert "exactly 1" in _hashtag_instruction("one")
-
-
-def test_topic_knowledge_engine_mentions_topic() -> None:
-    prompt = TOPIC_KNOWLEDGE_ENGINE_INSTRUCTIONS.format(topic="crypto ETFs")
-
-    assert "autonomous Twitter/X Knowledge Engine" in prompt
-    assert "something to say about crypto ETFs" in prompt
-    assert "Generate hashtags only when the bot's hashtag mode allows them" in prompt
-    assert "does not need to be" in prompt
-    assert "Point-of-View Editor" in prompt
-
-
-def test_reply_engine_is_text_only() -> None:
-    assert "Twitter/X Reply Engine" in REPLY_ENGINE_INSTRUCTIONS
-    assert "Never use hashtags" in REPLY_ENGINE_INSTRUCTIONS
-    prompt = _reply_engine_prompt(
-        Settings(telegram_bot_token="123:ABC"),
-        task="Generate ONE reply.",
-        context="Post text:\nAI agents are just fancy macros.",
-        output_contract=_single_reply_output_contract(),
-    )
-    assert "Return only ONE final reply" in prompt
-    assert "Shared reply-family rules" in prompt
-    assert "Humor and sarcasm are optional tools, never the default" in prompt
-    assert "one distinctive" in prompt
-    assert "question-only reply is invalid" in prompt
-    assert "concrete read first" in prompt
-
-
-def test_tweet_engine_prompt_is_shared_for_tweet_family() -> None:
-    prompt = _tweet_engine_prompt(
-        Settings(telegram_bot_token="123:ABC"),
-        topic="AI agents",
-        brief="Create one English X tweet.",
-        context="Recent X context:\nPeople are debating agent hype.",
-        output_contract=_single_tweet_output_contract(),
-    )
-
-    assert "autonomous Twitter/X Knowledge Engine" in prompt
-    assert "Shared tweet-family rules" in prompt
-    assert "/tweet, /tweetx, and /tweettrend3" in prompt
-    assert "clear stance or personal lens" in prompt
-    assert "Recent X context" in prompt
-    assert "Editorial Visual Strategist rules for image_prompt" in prompt
-
-
-def test_tweet_engine_prompt_stays_compact_for_browser_bridge() -> None:
-    prompt = _tweet_engine_prompt(
-        Settings(telegram_bot_token="123:ABC"),
-        topic="AI tools for creator growth",
-        brief="Create one English X tweet.",
-        context="Recent X context:\n" + ("A short grounded trend signal. " * 100),
-        output_contract=_single_tweet_output_contract(),
-    )
-
-    assert len(prompt) < 7500
-
-
-def test_tweet_engine_prompt_can_request_vietnamese_output() -> None:
-    prompt = _tweet_engine_prompt(
-        Settings(telegram_bot_token="123:ABC"),
-        topic="AI agents",
-        brief="Create one Vietnamese X tweet.",
-        context="Recent X context:\nPeople are debating agent hype.",
-        output_language="Vietnamese",
-        output_contract=_single_tweet_output_contract(),
-    )
-
-    assert "Write the final post text in Vietnamese" in prompt
-    assert "write natural Vietnamese" in prompt
-    assert "Any image_prompt must be English" in prompt
-
-
-def test_topic_post_defaults_to_vietnamese_for_the_vietnamese_audience() -> None:
-    service = _FakeJsonService(Settings(telegram_bot_token="123:ABC"))
-
-    asyncio.run(service.generate_topic_post("AI agents"))
-
-    assert "Create one Vietnamese long-form X post for a Vietnamese audience" in service.last_prompt
-    assert "Write the final post text in Vietnamese" in service.last_prompt
-
-
-def test_trend_variants_stay_grounded_in_the_supplied_context() -> None:
-    class CaptureTrendService(ContentService):
-        def __init__(self) -> None:
-            super().__init__(Settings(telegram_bot_token="123:ABC"))
-            self.last_prompt = ""
-
-        async def _generate_text(self, prompt: str) -> str:
-            self.last_prompt = prompt
-            return '{"variants":[{"angle":"Observation","text":"Pistons are trending.","hashtags":["#NBA"],"image_prompt":"realistic basketball arena","score":"Originality 3/5"}]}'
-
-    service = CaptureTrendService()
-    asyncio.run(service.generate_trend_post_variants("Detroit Pistons", "Pistons won a Summer League game.", "Vietnamese"))
-
-    assert "Do not force a sports" in service.last_prompt
-    assert "Treat the live X context as the factual boundary" in service.last_prompt
-    assert "creator/founder lesson" not in service.last_prompt
-
-
-def test_single_trend_post_is_grounded_in_one_topic() -> None:
-    class CaptureTrendService(ContentService):
-        def __init__(self) -> None:
-            super().__init__(Settings(telegram_bot_token="123:ABC"))
-            self.last_prompt = ""
-
-        async def _generate_text(self, prompt: str) -> str:
-            self.last_prompt = prompt
-            return (
-                '{"text":"Pistons are trending.","topic":"Detroit Pistons",'
-                '"image_prompt":"realistic basketball arena"}'
-            )
-
-    service = CaptureTrendService()
-    generated = asyncio.run(
-        service.generate_trend_post(
-            "Detroit Pistons",
-            "Pistons won a Summer League game.",
-            "Vietnamese",
-        )
-    )
-
-    assert generated.topic == "Detroit Pistons"
-    assert "about this specific trend" in service.last_prompt
-
-
-def test_single_trend_post_recovers_when_gemini_omits_image_prompt() -> None:
-    class CaptureTrendService(ContentService):
-        async def _generate_text(self, _prompt: str) -> str:
-            return '{"post":"AI tool launches are getting cheaper.","title":"AI tools"}'
-
-    generated = asyncio.run(
-        CaptureTrendService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
-            "AI tools",
-            "Recent launch discussion.",
-            "Vietnamese",
-        )
-    )
-
-    assert generated.text == "AI tool launches are getting cheaper"
-    assert generated.topic == "AI tools"
-    assert "AI tools" in generated.image_prompt
-
-
-def test_single_trend_post_accepts_reported_gemini_json() -> None:
-    class ReportedGeminiService(ContentService):
-        async def _generate_text(self, _prompt: str) -> str:
-            return r'''
-            {
-              "text": "Đọc danh sách mấy token presale kiểu như memecoin AI hay đống dự án crypto mới định hình ra mắt tháng này thấy cứ lặp đi lặp lại.",
-              "image_prompt": "An authentic smartphone photo inside a cramped co-working space, showing a messy desk with a laptop displaying a crypto token dashboard, natural afternoon light, documentary style, no text, no logos.",
-              "topic": "Best Crypto Presales to Buy Now"
-            }
-            '''
-
-    generated = asyncio.run(
-        ReportedGeminiService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
-            "Best Crypto Presales to Buy Now",
-            "Recent crypto launch context.",
-            "Vietnamese",
-        )
-    )
-
-    assert generated.text.startswith("Đọc danh sách mấy token presale")
-    assert generated.topic == "Best Crypto Presales to Buy Now"
-
-
-def test_single_trend_post_unwraps_provider_response_object() -> None:
-    class WrappedGeminiService(ContentService):
-        async def _generate_text(self, _prompt: str) -> str:
-            return '''
-            {
-              "response": {
-                "text": "Một góc nhìn ngắn về thị trường crypto.",
-                "image_prompt": "A candid photo of a crypto trader at a messy desk.",
-                "topic": "Crypto market"
-              }
-            }
-            '''
-
-    generated = asyncio.run(
-        WrappedGeminiService(Settings(telegram_bot_token="123:ABC")).generate_trend_post(
-            "Crypto market",
-            "Recent crypto context.",
-            "Vietnamese",
-        )
-    )
-
-    assert generated.text == "Một góc nhìn ngắn về thị trường crypto"
-    assert generated.topic == "Crypto market"
-
-
-def test_editorial_visual_strategist_prompt_targets_real_photos() -> None:
-    assert "Editorial Visual Strategist" in EDITORIAL_VISUAL_STRATEGIST_INSTRUCTIONS
-    assert "look like a real photograph" in EDITORIAL_VISUAL_STRATEGIST_INSTRUCTIONS
-    assert "glowing robots" in EDITORIAL_VISUAL_STRATEGIST_INSTRUCTIONS
-    assert "Return ONLY ONE complete image generation prompt" in EDITORIAL_VISUAL_STRATEGIST_INSTRUCTIONS
-
-
 def test_generate_reply_from_text_returns_plain_reply() -> None:
     service = _FakeTextService(Settings(telegram_bot_token="123:ABC"))
 
@@ -275,9 +50,7 @@ def test_generate_reply_from_text_returns_plain_reply() -> None:
         service.generate_reply_from_text("AI agents are just fancy macros.")
     )
 
-    assert generated.text == "Honestly, most agents are just workflows with better branding"
-    assert generated.image_prompt == ""
-    assert generated.topic == "reply"
+    assert generated == "Honestly, most agents are just workflows with better branding"
     assert "Twitter/X Reply Engine" in service.last_prompt
     assert "AI agents are just fancy macros." in service.last_prompt
 
@@ -323,7 +96,7 @@ def test_generate_reply_from_text_repairs_question_only_draft() -> None:
 
     assert len(service.prompts) == 2
     assert "question without first contributing value" in service.prompts[1]
-    assert generated.text.startswith("The slower sequence makes retention")
+    assert generated.startswith("The slower sequence makes retention")
 
 
 def test_reply_question_only_detector_accepts_observation_then_question() -> None:
@@ -403,6 +176,43 @@ def test_reply_prompt_requires_source_matched_natural_voice() -> None:
     assert "match the source post's language" in prompt
     assert "Humor and sarcasm are optional tools, never the default" in prompt
     assert "source-grounded contribution" in prompt
+    assert "すごいですね" in prompt
+    assert "natural です/ます" in prompt
+    assert "disasters, deaths, conflict, or mourning" in prompt
+
+
+def test_reply_quality_guard_rejects_farming_patterns() -> None:
+    assert "canned-japanese-opening" in _reply_quality_violations(
+        "すごいですね！本当に勉強になります。"
+    )
+    assert "generic-reaction" in _reply_quality_violations("草😂")
+    assert "self-promotion" in _reply_quality_violations(
+        "詳しくはプロフィールをチェックしてください。"
+    )
+    assert "link" in _reply_quality_violations("Details: https://example.com")
+    assert _reply_quality_violations(
+        "導入速度より、既存ユーザーの移行負担を抑える設計の方が成否を分けそうです。"
+    ) == []
+
+
+def test_generate_reply_from_text_repairs_canned_japanese_reply() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.prompts: list[str] = []
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                return "すごいですね！勉強になります。"
+            return "発表時期より、既存利用者の移行負担を抑える設計が成否を分けそうです。"
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    reply = asyncio.run(service.generate_reply_from_text("段階的な提供を始めます。"))
+
+    assert len(service.prompts) == 2
+    assert "canned-japanese-opening" in service.prompts[1]
+    assert reply.startswith("発表時期より")
 
 
 def test_replytargets_prompt_does_not_force_creator_niche() -> None:
@@ -440,9 +250,42 @@ def test_replytargets_prompt_does_not_force_creator_niche() -> None:
     assert "natural Japanese for a Japanese post" in service.last_prompt
     assert "same language as its candidate post" in service.last_prompt
     assert "original author can actually answer" in service.last_prompt
+    assert "8k-50k mid-tier author" in service.last_prompt
+    assert "credible peer" in service.last_prompt
+    assert "source_summary_vi" in service.last_prompt
+    assert "reply_translation_vi" in service.last_prompt
+    assert "Vietnamese source summary" in service.last_prompt
     assert "gold and crypto only" not in service.last_prompt
     assert "gold investors only" not in service.last_prompt
     assert "readers already participating in the source post's conversation" in service.last_prompt
+
+
+def test_replytargets_prompt_applies_per_url_format_experiment() -> None:
+    class ReplyTargetService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/7",'
+                '"target":"@source launch","reply":"The distribution edge is the real moat."}]}'
+            )
+
+    service = ReplyTargetService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "AI",
+            "1. URL: https://x.com/source/status/7\nPost: New launch",
+            experiment_by_url={
+                "https://x.com/source/status/7": "concise_statement"
+            },
+        )
+    )
+
+    assert "Run the assigned format experiment" in service.last_prompt
+    assert "under 140 characters" in service.last_prompt
 
 
 def test_replyvideo_prompt_is_grounded_and_does_not_claim_full_video_access() -> None:
@@ -512,132 +355,6 @@ def test_looks_like_prompt_leak_detects_user_reported_output() -> None:
     assert _looks_like_prompt_leak("Tham khảo nội dung sau: Generated JSON:")
 
 
-def test_realistic_image_prompt_adds_photorealistic_guardrails() -> None:
-    prompt = _realistic_image_prompt("A creator at a laptop reacting to crypto news")
-
-    assert "Realistic candid documentary photography style" in prompt
-    assert "fictional adults only" in prompt
-    assert "small natural group instead of a dense crowd" in prompt
-    assert "plausible real-life photo" in prompt
-    assert "Tasteful glamorous fashion styling is allowed" in prompt
-    assert "keep styling non-explicit" in prompt
-    assert "neon lens flares" in prompt
-    assert "fake jersey badges" in prompt
-    assert _realistic_image_prompt(prompt) == prompt
-
-
-def test_remove_ai_art_terms_filters_stylized_language() -> None:
-    prompt = _remove_ai_art_terms(
-        "cinematic ultra-detailed 3D render poster art of a crypto creator with lens flare"
-    )
-
-    assert "crypto creator" in prompt
-    assert "cinematic" not in prompt.lower()
-    assert "ultra-detailed" not in prompt.lower()
-    assert "3d render" not in prompt.lower()
-    assert "poster art" not in prompt.lower()
-    assert "lens flare" not in prompt.lower()
-
-
-def test_response_error_detail_extracts_provider_error() -> None:
-    import httpx
-
-    response = httpx.Response(
-        500,
-        json={"error": "model requires more system memory than is available"},
-    )
-
-    assert _response_error_detail(response) == "model requires more system memory than is available"
-
-
-def test_retweet_scene_locked_prompt_preserves_female_visual_note() -> None:
-    prompt = _retweet_scene_locked_prompt(
-        "Brazil football supporter in a stadium",
-        visual_note="cô gái cổ động viên Brazil áo vàng ngồi khán đài",
-    )
-
-    assert "cô gái cổ động viên Brazil áo vàng ngồi khán đài" in prompt
-    assert "fictional adult woman" in prompt
-    assert "do not change her into a man" in prompt
-
-
-def test_parse_trend_variants() -> None:
-    variants = _parse_trend_variants(
-        """
-        {
-          "variants": [
-            {
-              "angle": "Useful observation",
-              "text": "AI dashboards are starting to look like cable bundles with better branding.",
-              "hashtags": ["AI", "#CreatorTools"],
-              "image_prompt": "Square social image of tangled app dashboards turning into one clean panel",
-              "score": "Originality 4/5, Clarity 5/5, Follow potential 4/5"
-            }
-          ]
-        }
-        """
-    )
-
-    assert len(variants) == 1
-    assert variants[0].hashtags == ["#AI", "#CreatorTools"]
-    assert variants[0].image_prompt.startswith("Square social image")
-
-
-def test_parse_trend_variants_skips_prompt_leak_text() -> None:
-    variants = _parse_trend_variants(
-        """
-        {
-          "variants": [
-            {
-              "angle": "Bad",
-              "text": "You are a Twitter/X Tweet QA + Humanizer. Your input is ONE generated tweet.",
-              "hashtags": ["#AI"],
-              "image_prompt": "square realistic office photo",
-              "score": "Originality 1/5"
-            },
-            {
-              "angle": "Useful observation",
-              "text": "AI dashboards are starting to look like cable bundles with better branding.",
-              "hashtags": ["#AI", "#CreatorTools"],
-              "image_prompt": "Square realistic photo of a creator reviewing app dashboards",
-              "score": "Originality 4/5"
-            }
-          ]
-        }
-        """
-    )
-
-    assert len(variants) == 1
-    assert variants[0].angle == "Useful observation"
-
-
-def test_parse_trend_variants_accepts_option_text_format() -> None:
-    variants = _parse_trend_variants(
-        """
-Option 1: Useful observation
-
-The Sohail Khan-Seema Sajdeh split chat shows how entertainment marriages get dissected online. 25 years together and it still boils down to who owns the narrative now.
-
-Hashtags: #EntertainmentBiz #CreatorLife
-
-Score: Originality 4/5, Clarity 5/5, Follow potential 4/5
-
-Option 2: Spicy take
-
-Celebrity breakups are basically media strategy tests now. The relationship ends, but the audience audit starts immediately.
-
-Hashtags: #EntertainmentBiz #PopCulture
-        """
-    )
-
-    assert len(variants) == 2
-    assert variants[0].angle == "Useful observation"
-    assert variants[0].text.startswith("The Sohail Khan-Seema")
-    assert variants[0].hashtags == ["#EntertainmentBiz", "#CreatorLife"]
-    assert variants[0].score.startswith("Originality 4/5")
-    assert "realistic" in variants[0].image_prompt.lower()
-
-
 def test_parse_reply_targets() -> None:
     targets = _parse_reply_targets(
         """
@@ -647,7 +364,9 @@ def test_parse_reply_targets() -> None:
               "url": "https://x.com/user/status/123",
               "target": "@user - AI tooling",
               "reason": "Good fit for a practical counterpoint.",
-              "reply": "The underrated part is not the tool count, it's having one workflow people can actually stick with."
+              "reply": "The underrated part is not the tool count, it's having one workflow people can actually stick with.",
+              "source_summary_vi": "Tác giả bàn về việc sử dụng nhiều công cụ AI.",
+              "reply_translation_vi": "Điểm bị xem nhẹ không phải số lượng công cụ mà là một quy trình mọi người thực sự duy trì được."
             }
           ]
         }
@@ -657,6 +376,8 @@ def test_parse_reply_targets() -> None:
     assert len(targets) == 1
     assert targets[0].url == "https://x.com/user/status/123"
     assert targets[0].reply.startswith("The underrated part")
+    assert targets[0].source_summary_vi.startswith("Tác giả")
+    assert targets[0].reply_translation_vi.startswith("Điểm bị xem nhẹ")
 
 
 def test_parse_reply_targets_accepts_common_browser_model_key_variants() -> None:
@@ -765,7 +486,9 @@ def test_generate_reply_targets_repairs_batch_with_only_one_of_two_candidates() 
     )
 
     assert len(service.prompts) == 2
-    assert "exactly 2\ndistinct targets" in service.prompts[1]
+    assert "exactly 1\ndistinct targets" in service.prompts[1]
+    assert "- https://x.com/second/status/2" in service.prompts[1]
+    assert "Do not return or rewrite any other URL" in service.prompts[1]
     assert [target.url for target in targets] == [
         "https://x.com/first/status/1",
         "https://x.com/second/status/2",
@@ -832,6 +555,35 @@ def test_generate_reply_targets_includes_selected_learning_strategy() -> None:
     assert "lead with one concrete source-grounded observation" in service.last_prompt
 
 
+def test_generate_reply_targets_uses_style_memory_without_copy_instruction() -> None:
+    class StyleService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.last_prompt = ""
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.last_prompt = prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/89",'
+                '"target":"@source - launch","reply":"The rollout speed makes retention the useful signal.",'
+                '"source_summary_vi":"Bài viết nói về kế hoạch ra mắt.",'
+                '"reply_translation_vi":"Tốc độ triển khai khiến khả năng giữ chân trở thành tín hiệu hữu ích."}]}'
+            )
+
+    service = StyleService(Settings(telegram_bot_token="123:ABC"))
+    asyncio.run(
+        service.generate_reply_targets(
+            "product launch",
+            "URL: https://x.com/source/status/89\nPost: We changed the rollout plan.",
+            style_examples=["Distribution is the constraint hiding in plain sight."],
+        )
+    )
+
+    assert "Style memory from this account's stronger real posted replies" in service.last_prompt
+    assert "Never copy their wording" in service.last_prompt
+    assert "Distribution is the constraint" in service.last_prompt
+
+
 def test_generate_reply_targets_repairs_question_only_reply() -> None:
     class RepairingService(ContentService):
         def __init__(self, settings: Settings) -> None:
@@ -865,6 +617,176 @@ def test_generate_reply_targets_repairs_question_only_reply() -> None:
     assert targets[0].reply.startswith("The slower sequence")
 
 
+def test_generate_reply_targets_merges_safe_drafts_from_both_attempts() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.calls = 0
+
+        async def _generate_text(self, prompt: str) -> str:
+            del prompt
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    '{"targets":['
+                    '{"url":"https://x.com/first/status/1","target":"@first",'
+                    '"reply":"The revision from 3.9 to 4.3 is the detail worth watching."},'
+                    '{"url":"https://x.com/second/status/2","target":"@second",'
+                    '"reply":"Why did the timing change?"},'
+                    '{"url":"https://x.com/third/status/3","target":"@third",'
+                    '"reply":"The smaller reply load leaves the useful detail visible."}'
+                    ']}'
+                )
+            return (
+                '{"targets":['
+                '{"url":"https://x.com/first/status/1","target":"@first",'
+                '"reply":"Why did the estimate change?"},'
+                '{"url":"https://x.com/second/status/2","target":"@second",'
+                '"reply":"The later timing makes the second update more useful."},'
+                '{"url":"https://x.com/third/status/3","target":"@third",'
+                '"reply":"What changed after the first update?"}'
+                ']}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    context = "\n\n".join(
+        f"{index}. URL: https://x.com/{name}/status/{index}\nPost: Update {index}"
+        for index, name in enumerate(("first", "second", "third"), start=1)
+    )
+
+    targets = asyncio.run(service.generate_reply_targets("news", context))
+
+    assert service.calls == 2
+    assert [target.url for target in targets] == [
+        "https://x.com/first/status/1",
+        "https://x.com/second/status/2",
+        "https://x.com/third/status/3",
+    ]
+    assert targets[0].reply.startswith("The revision")
+    assert targets[1].reply.startswith("The later timing")
+    assert targets[2].reply.startswith("The smaller reply load")
+
+
+def test_generate_reply_targets_salvages_two_safe_drafts_after_repair() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.calls = 0
+
+        async def _generate_text(self, prompt: str) -> str:
+            del prompt
+            self.calls += 1
+            return (
+                '{"targets":['
+                '{"url":"https://x.com/first/status/1","target":"@first",'
+                '"reply":"The estimate change is the useful signal here."},'
+                '{"url":"https://x.com/second/status/2","target":"@second",'
+                '"reply":"The low reply count leaves room for the comparison."},'
+                '{"url":"https://x.com/third/status/3","target":"@third",'
+                '"reply":"Why did the timing change?"}'
+                ']}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    context = "\n\n".join(
+        f"{index}. URL: https://x.com/{name}/status/{index}\nPost: Update {index}"
+        for index, name in enumerate(("first", "second", "third"), start=1)
+    )
+
+    targets = asyncio.run(service.generate_reply_targets("news", context))
+
+    assert service.calls == 2
+    assert [target.url for target in targets] == [
+        "https://x.com/first/status/1",
+        "https://x.com/second/status/2",
+    ]
+
+
+def test_generate_reply_targets_runs_small_rescue_when_only_one_safe_draft_remains() -> None:
+    class RepairingService(ContentService):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.calls = 0
+
+        async def _generate_text(self, prompt: str) -> str:
+            self.calls += 1
+            if self.calls == 3:
+                assert "exactly 1\ndistinct targets" in prompt
+                assert "- https://x.com/second/status/2" in prompt
+                return (
+                    '{"targets":[{"url":"https://x.com/second/status/2",'
+                    '"target":"@second","reply":"The revised probability makes the market split the useful signal."}]}'
+                )
+            return (
+                '{"targets":['
+                '{"url":"https://x.com/first/status/1","target":"@first",'
+                '"reply":"The estimate change is the useful signal here."},'
+                '{"url":"https://x.com/second/status/2","target":"@second",'
+                '"reply":"Why did the probability change?"}'
+                ']}'
+            )
+
+    service = RepairingService(Settings(telegram_bot_token="123:ABC"))
+    targets = asyncio.run(
+        service.generate_reply_targets(
+            "markets",
+            (
+                "1. URL: https://x.com/first/status/1\nPost: Estimate changed.\n\n"
+                "2. URL: https://x.com/second/status/2\nPost: Probability changed."
+            ),
+        )
+    )
+
+    assert service.calls == 3
+    assert [target.url for target in targets] == [
+        "https://x.com/first/status/1",
+        "https://x.com/second/status/2",
+    ]
+
+
+def test_question_only_error_identifies_the_invalid_target_url() -> None:
+    class InvalidService(ContentService):
+        async def _generate_text(self, prompt: str) -> str:
+            del prompt
+            return (
+                '{"targets":[{"url":"https://x.com/source/status/90",'
+                '"target":"@source","reply":"Why did the timing change?"}]}'
+            )
+
+    service = InvalidService(Settings(telegram_bot_token="123:ABC"))
+    with pytest.raises(RuntimeError, match=r"Invalid target URLs: .*status/90"):
+        asyncio.run(
+            service.generate_reply_targets(
+                "news",
+                "URL: https://x.com/source/status/90\nPost: Timing changed.",
+            )
+        )
+
+
+def test_parse_reply_targets_recovers_blank_url_from_unique_target_handle() -> None:
+    targets = _parse_reply_targets(
+        (
+            '{"targets":[{"url":"","target":"@EqAlarm - 緊急地震速報第4報",'
+            '"reply":"第1報から第4報への修正幅が備えを見直す具体的な手掛かりになります。"}]}'
+        ),
+        allowed_urls=[
+            "https://x.com/EqAlarm/status/2084506447011099087",
+            "https://x.com/other/status/2",
+        ],
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url == "https://x.com/EqAlarm/status/2084506447011099087"
+
+
+def test_parse_reply_targets_does_not_guess_blank_url_for_unknown_handle() -> None:
+    with pytest.raises(RuntimeError, match="did not contain usable reply targets"):
+        _parse_reply_targets(
+            '{"targets":[{"url":"","target":"@unknown","reply":"Useful detail."}]}',
+            allowed_urls=["https://x.com/EqAlarm/status/1"],
+        )
+
+
 def test_generate_reply_targets_assigns_strategy_per_candidate_url() -> None:
     class StrategyService(ContentService):
         def __init__(self, settings: Settings) -> None:
@@ -892,39 +814,7 @@ def test_generate_reply_targets_assigns_strategy_per_candidate_url() -> None:
     )
 
     assert "https://x.com/source/status/88: natural_humor" in service.last_prompt
-    assert targets[0].strategy == "natural_humor"
-
-
-def test_generate_trend_posts_batch_uses_one_job_for_multiple_topics() -> None:
-    class BatchService(ContentService):
-        def __init__(self, settings: Settings) -> None:
-            super().__init__(settings)
-            self.prompts: list[str] = []
-
-        async def _generate_text(self, prompt: str) -> str:
-            self.prompts.append(prompt)
-            return """
-            {"posts":[
-              {"topic":"Gold","text":"Gold moved after the policy detail, not the headline.",
-               "image_prompt":"A square realistic photo of gold bars on a market desk"},
-              {"topic":"AI","text":"The useful AI update is the boring one: fewer handoffs.",
-               "image_prompt":"A square realistic photo of a clean automation workspace"}
-            ]}
-            """
-
-    service = BatchService(Settings(telegram_bot_token="123:ABC"))
-    posts = asyncio.run(
-        service.generate_trend_posts_batch(
-            [
-                ("Gold", "Policy detail and price context"),
-                ("AI", "Workflow release context"),
-            ]
-        )
-    )
-
-    assert len(service.prompts) == 1
-    assert [post.topic for post in posts] == ["Gold", "AI"]
-    assert "Return exactly 2 posts" in service.prompts[0]
+    assert targets[0].reply == "The quiet part just got its own launch plan"
 
 
 def test_generate_reply_revision_returns_copy_ready_text() -> None:
@@ -932,7 +822,10 @@ def test_generate_reply_revision_returns_copy_ready_text() -> None:
         async def _generate_text(self, prompt: str) -> str:
             assert "Make it shorter" in prompt
             assert "Current reply:" in prompt
-            return '{"reply":"The rollout tradeoff matters more than the launch date."}'
+            return (
+                '{"reply":"The rollout tradeoff matters more than the launch date.",'
+                '"reply_translation_vi":"Sự đánh đổi khi triển khai quan trọng hơn ngày ra mắt."}'
+            )
 
     service = RevisionService(Settings(telegram_bot_token="123:ABC"))
     revised = asyncio.run(
@@ -943,7 +836,10 @@ def test_generate_reply_revision_returns_copy_ready_text() -> None:
         )
     )
 
-    assert revised == "The rollout tradeoff matters more than the launch date"
+    assert revised == ReplyRevision(
+        reply="The rollout tradeoff matters more than the launch date",
+        reply_translation_vi="Sự đánh đổi khi triển khai quan trọng hơn ngày ra mắt.",
+    )
 
 
 def test_parse_reply_targets_recovers_all_items_from_unescaped_reply_quotes() -> None:
@@ -982,17 +878,14 @@ def test_parse_json_handles_multiple_objects_from_browser_output() -> None:
     payload = _parse_json(
         """
         Here is the draft:
-        {"text": "Old draft", "image_prompt": "old image", "topic": "AI"}
+        {"status": "thinking"}
 
         Final:
-        {"text": "AI tools quietly punish messy teams first. #AI #Work",
-         "image_prompt": "realistic photo of a team reviewing dashboards",
-         "topic": "AI tools"}
+        {"reply": "Messy teams expose the limits of automation first."}
         """
     )
 
-    assert payload["text"].startswith("AI tools quietly")
-    assert payload["topic"] == "AI tools"
+    assert payload["reply"].startswith("Messy teams")
 
 
 class _FakeTextService(ContentService):
@@ -1003,19 +896,3 @@ class _FakeTextService(ContentService):
     async def _generate_text(self, prompt: str) -> str:
         self.last_prompt = prompt
         return "Honestly, most agents are just workflows with better branding."
-
-
-class _FakeJsonService(ContentService):
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self.last_prompt = ""
-
-    async def _generate_text(self, prompt: str) -> str:
-        self.last_prompt = prompt
-        return """
-        {
-          "text": "ChatGPT Work is basically Codex moving into the main ChatGPT brand.\\n\\nIt keeps the Codex backbone: desktop agent work, files, folders, computer use, plugins, and GPT models.\\n\\nMy read: OpenAI is making work agents feel like normal ChatGPT, not a separate developer tool.",
-          "image_prompt": "realistic office photo of a developer reviewing ChatGPT Work on a laptop",
-          "topic": "ChatGPT Work and Codex"
-        }
-        """

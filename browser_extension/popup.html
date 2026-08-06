@@ -22,7 +22,7 @@
 
       <label>
         Timeout seconds
-        <input id="timeoutSeconds" type="number" min="30" step="30">
+        <input id="timeoutSeconds" type="number" min="120" max="360" step="30">
       </label>
 
       <label>
@@ -104,22 +104,13 @@
         <p id="replyVideoScheduleStatus" class="hint"></p>
 
         <label>
-          /tweettrend3 fixed times
-          <input id="trendTimes" spellcheck="false" placeholder="09:00, 18:30">
+          /followtargets scan interval (minutes)
+          <input id="followTargetsMinutes" type="number" min="5" step="1">
         </label>
+        <p class="hint">Finds Vietnamese Premium accounts and uses the same active windows as /replyvideo.</p>
+        <p id="followTargetsScheduleStatus" class="hint"></p>
 
-        <label>
-          /tweettrend3 category
-          <select id="trendCategory">
-            <option value="auto">auto</option>
-            <option value="trending">trending</option>
-            <option value="news">news</option>
-            <option value="sport">sport</option>
-            <option value="entertainment">entertainment</option>
-          </select>
-        </label>
-
-        <p class="hint">Send <code>/automationhere</code> once in the Telegram chat that should receive approvals.</p>
+        <p class="hint">Set <code>TELEGRAM_APPROVAL_CHAT_ID</code> in <code>.env</code> for scheduled approvals.</p>
       </section>
 
       <div class="actions">

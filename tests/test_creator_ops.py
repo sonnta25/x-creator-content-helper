@@ -56,7 +56,7 @@ def test_watchlist_allows_exceptional_first_observation_and_marks_drafted(tmp_pa
 
     assert ready == [candidate]
     assert watching == []
-    assert store.watching() == []
+    assert store.candidates_for_refresh() == []
 
 
 def test_watchlist_allows_qualified_japanese_candidate_earlier(tmp_path) -> None:
@@ -89,4 +89,23 @@ def test_watchlist_exposes_candidates_for_refresh_and_expires_old_rows(tmp_path)
 
     assert [row["tweet_id"] for row in rows] == [5]
     assert expired == []
-    assert store.watching() == []
+
+
+def test_watchlist_keeps_video_reservoir_separate_and_reports_inventory(tmp_path) -> None:
+    store = ReplyWatchStore(tmp_path / "watch.json")
+    target = _candidate(6)
+    video = XSearchResult(**{**_candidate(7).__dict__, "has_video": True})
+
+    store.classify([target], source_type="replytargets")
+    store.classify([video], source_type="replyvideo")
+
+    assert [row["tweet_id"] for row in store.candidates_for_refresh()] == [6]
+    assert [
+        row["tweet_id"]
+        for row in store.candidates_for_refresh(source_type="replyvideo")
+    ] == [7]
+    assert store.inventory()["watching"] == 2
+
+    store.mark_expired(video.url, reason="thread saturated")
+    assert store.inventory()["watching"] == 1
+    assert store.inventory()["expired"] == 1

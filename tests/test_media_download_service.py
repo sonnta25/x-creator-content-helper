@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -284,3 +285,95 @@ def test_download_aborts_when_progress_exceeds_size_limit() -> None:
 
     assert workdir is not None
     assert not workdir.exists()
+
+
+def test_image_post_falls_back_to_gallery_dl_and_returns_carousel() -> None:
+    captured_command: list[str] = []
+
+    class UnsupportedVideoDownloader:
+        def __init__(self, _options):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, _download):
+            raise RuntimeError("Unsupported URL")
+
+    def gallery_runner(command, **kwargs):
+        captured_command.extend(command)
+        assert kwargs["capture_output"] is True
+        assert kwargs["check"] is False
+        destination = Path(command[command.index("--destination") + 1])
+        nested = destination / "instagram" / "post"
+        nested.mkdir(parents=True)
+        (nested / "first.jpg").write_bytes(b"first image")
+        (nested / "second.webp").write_bytes(b"second image")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    service = MediaDownloadService(
+        Settings(telegram_bot_token="123:ABC"),
+        ydl_factory=UnsupportedVideoDownloader,
+        gallery_runner=gallery_runner,
+        resolver=_public_resolver,
+    )
+
+    result = service.download("https://www.instagram.com/p/example/")
+
+    assert result.media_kind == "images"
+    assert len(result.paths) == 2
+    assert all(path.name.startswith("creator-image-") for path in result.paths)
+    assert [path.suffix for path in result.paths] == [".jpg", ".webp"]
+    assert result.size_bytes == len(b"first image") + len(b"second image")
+    assert "--range" in captured_command
+    assert captured_command[captured_command.index("--range") + 1] == "1-10"
+    parent = next(
+        parent
+        for parent in result.path.resolve().parents
+        if parent.name.startswith("x-content-download-")
+    )
+    result.cleanup()
+    assert not parent.exists()
+
+
+def test_gallery_fallback_reuses_configured_browser_profile() -> None:
+    captured_command: list[str] = []
+
+    class UnsupportedVideoDownloader:
+        def __init__(self, _options):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url, _download):
+            raise RuntimeError("Unsupported URL")
+
+    def gallery_runner(command, **_kwargs):
+        captured_command.extend(command)
+        destination = Path(command[command.index("--destination") + 1])
+        (destination / "photo.jpg").write_bytes(b"photo")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    service = MediaDownloadService(
+        Settings(
+            telegram_bot_token="123:ABC",
+            download_cookies_from_browser="chrome",
+            download_browser_profile="Default",
+        ),
+        ydl_factory=UnsupportedVideoDownloader,
+        gallery_runner=gallery_runner,
+        resolver=_public_resolver,
+    )
+
+    result = service.download("https://x.com/user/status/123")
+
+    cookie_arg = captured_command.index("--cookies-from-browser")
+    assert captured_command[cookie_arg + 1] == "chrome:Default"
+    result.cleanup()

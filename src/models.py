@@ -4,28 +4,18 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class GeneratedContent:
-    text: str
-    image_prompt: str
-    topic: str
-
-
-@dataclass(frozen=True)
-class TrendPostVariant:
-    angle: str
-    text: str
-    image_prompt: str
-    hashtags: list[str]
-    score: str
-
-
-@dataclass(frozen=True)
 class ReplyTargetDraft:
     url: str
     target: str
-    reason: str
     reply: str
-    strategy: str = "specific_observation"
+    source_summary_vi: str = ""
+    reply_translation_vi: str = ""
+
+
+@dataclass(frozen=True)
+class ReplyRevision:
+    reply: str
+    reply_translation_vi: str = ""
 
 
 @dataclass(frozen=True)
@@ -54,7 +44,14 @@ class XSearchResult:
     like_count: int = 0
     view_count: int | None = None
     author_followers_count: int | None = None
+    author_following_count: int | None = None
+    author_statuses_count: int | None = None
     author_verified: bool = False
+    author_blue_verified: bool = False
+    author_blue_type: str = ""
+    author_description: str = ""
+    author_location: str = ""
+    author_protected: bool = False
     velocity_score: float = 0.0
     view_velocity_score: float = 0.0
     engagement_rate: float = 0.0
@@ -85,6 +82,39 @@ class XSearchResult:
     root_author_has_replied: bool = False
     audience_affinity_score: float = 0.0
     relationship_score: float = 0.0
+    rankability_score: float = 0.0
+    premium_audience_score: float = 0.0
+    verified_audience_proxy: float = 0.0
+    verified_replier_ratio: float = 0.0
+    monetization_safety_score: float = 100.0
+    monetization_risk_level: str = "green"
+    monetization_risk_reasons: tuple[str, ...] = ()
+    watched_author: bool = False
+    goal_score: float = 0.0
+    author_tier: str = "unknown"
+    discovery_daypart: str = "global_offpeak"
+    daypart_fit_score: float = 0.0
+    candidate_age_bucket: str = "unknown"
+    distribution_stage: str = "unknown"
+
+
+@dataclass(frozen=True)
+class FollowCandidate:
+    user_id: int
+    username: str
+    display_name: str
+    description: str
+    location: str
+    followers: int
+    following: int
+    statuses: int
+    profile_url: str
+    source_post_url: str
+    source_post_text: str
+    source_post_created_at: str
+    ratio: float
+    score: float
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,14 +122,3 @@ class XTrend:
     name: str
     rank: str
     description: str = ""
-
-
-@dataclass(frozen=True)
-class TrendSignal:
-    title: str
-    source: str
-    category: str
-    url: str = ""
-    description: str = ""
-    published_at: str = ""
-    score: float = 0.0

@@ -179,3 +179,31 @@ def test_pending_draft_can_be_revised_then_marked_published(tmp_path) -> None:
     assert restored.metadata["revision_count"] == 1
     assert restored.status == "published"
     assert store.has_active_target("https://x.com/source/status/42") is True
+
+
+def test_reply_only_migration_archives_posts_and_releases_stale_mobile_lock() -> None:
+    store = AutomationApprovalStore()
+    legacy_post = store.create(kind="post", text="Old post", chat_id=1)
+    reply = store.create(
+        kind="reply",
+        text="Old mobile reply",
+        chat_id=1,
+        target_url="https://x.com/source/status/99",
+    )
+    store.decide(
+        reply.id,
+        approve=True,
+        chat_id=1,
+        user_id=1,
+        destination="mobile",
+    )
+    current = datetime.now(UTC)
+    legacy_post.created_at = current - timedelta(days=1)
+    reply.decided_at = current - timedelta(hours=8)
+
+    result = store.migrate_reply_only(stale_mobile_hours=6, now=current)
+
+    assert result == {"archived_posts": 1, "released_mobile": 1}
+    assert legacy_post.status == "archived"
+    assert reply.status == "not_found"
+    assert store.has_active_target(reply.target_url) is False

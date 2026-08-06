@@ -56,6 +56,13 @@ class Settings:
     reply_video_frame_count: int = 2
     telegram_reply_video_minutes: int | None = None
     telegram_reply_video_updated_at: int | None = None
+    telegram_follow_targets_minutes: int | None = None
+    telegram_follow_targets_updated_at: int | None = None
+    follow_target_batch_size: int = 12
+    follow_target_cooldown_hours: int = 24
+    follow_target_min_followers: int = 100
+    follow_target_max_followers: int = 50_000
+    follow_target_history_path: str = "data/follow_target_history.json"
     automation_approvals_path: str = ""
     download_max_file_mb: int = 45
     download_timeout_seconds: int = 180
@@ -220,6 +227,32 @@ class Settings:
             telegram_reply_video_updated_at=_optional_int_env(
                 "TELEGRAM_REPLY_VIDEO_UPDATED_AT"
             ),
+            telegram_follow_targets_minutes=_optional_int_env(
+                "TELEGRAM_FOLLOW_TARGETS_MINUTES"
+            ),
+            telegram_follow_targets_updated_at=_optional_int_env(
+                "TELEGRAM_FOLLOW_TARGETS_UPDATED_AT"
+            ),
+            follow_target_batch_size=min(
+                20,
+                max(1, _int_env("FOLLOW_TARGET_BATCH_SIZE", 12)),
+            ),
+            follow_target_cooldown_hours=min(
+                168,
+                max(1, _int_env("FOLLOW_TARGET_COOLDOWN_HOURS", 24)),
+            ),
+            follow_target_min_followers=max(
+                1, _int_env("FOLLOW_TARGET_MIN_FOLLOWERS", 100)
+            ),
+            follow_target_max_followers=max(
+                100,
+                _int_env("FOLLOW_TARGET_MAX_FOLLOWERS", 50_000),
+            ),
+            follow_target_history_path=os.getenv(
+                "FOLLOW_TARGET_HISTORY_PATH",
+                "data/follow_target_history.json",
+            ).strip()
+            or "data/follow_target_history.json",
             automation_approvals_path=os.getenv(
                 "AUTOMATION_APPROVALS_PATH",
                 "data/automation_approvals.json",

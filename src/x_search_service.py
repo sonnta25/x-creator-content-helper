@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 from src.config import Settings
@@ -40,6 +41,7 @@ class XSearchService:
         # twscrape leases one account per request. Serializing access prevents
         # discovery and tracking from exhausting a small one-cookie pool.
         self._request_lock = asyncio.Lock()
+        self._following_cache: dict[str, tuple[float, set[str]]] = {}
 
     async def import_cookie_account(self, account_name: str, cookie: str) -> str:
         clean_name = normalize_account_name(account_name)
@@ -173,6 +175,46 @@ class XSearchService:
             "pinned_ids": [int(value) for value in pinned if str(value).isdigit()],
         }
 
+    async def owner_following_usernames(
+        self,
+        username: str,
+        *,
+        cache_seconds: int = 3 * 60 * 60,
+    ) -> set[str]:
+        """Return an exact-enough cached following set for candidate exclusion."""
+
+        clean_username = username.strip().lstrip("@").lower()
+        if not clean_username:
+            raise RuntimeError(
+                "X owner username is empty. Set X_OWNER_USERNAME before using follow discovery."
+            )
+        cached = self._following_cache.get(clean_username)
+        if cached is not None and time.monotonic() - cached[0] < max(60, cache_seconds):
+            return set(cached[1])
+
+        await self._request_lock.acquire()
+        try:
+            api = await self._get_api()
+            owner = await api.user_by_login(clean_username)
+            if owner is None:
+                raise RuntimeError(f"X user @{clean_username} was not found.")
+            expected = max(1, int(getattr(owner, "friendsCount", 0) or 0))
+            # X normally caps a regular account near this range. The extra
+            # headroom avoids silently classifying followed users as new.
+            fetch_limit = min(10_000, max(5_000, expected + 100))
+            usernames: set[str] = {clean_username}
+            async with aclosing(api.following(int(owner.id), limit=fetch_limit)) as stream:
+                async for user in stream:
+                    candidate = str(getattr(user, "username", "") or "").strip().lower()
+                    if candidate:
+                        usernames.add(candidate)
+        except Exception as exc:
+            raise RuntimeError(f"X following-list lookup failed: {exc}") from exc
+        finally:
+            self._request_lock.release()
+        self._following_cache[clean_username] = (time.monotonic(), usernames)
+        return set(usernames)
+
     async def tweet_replies(
         self,
         tweet_id: int,
@@ -286,7 +328,8 @@ def summarize_reply_video_context(results: list[XSearchResult], max_items: int =
             f"Age: {_format_age_minutes(result)}\n"
             f"Metrics: {result.like_count} likes, {result.retweet_count} reposts, "
             f"{result.quote_count} quotes, {result.reply_count} replies, "
-            f"{_format_views(result)}, {result.view_velocity_score:.1f} views/min, "
+            f"{_format_views(result)}, {_format_author_reach(result)}, "
+            f"{result.view_velocity_score:.1f} views/min, "
             f"{result.views_per_reply:.1f} views per competing reply, "
             f"video opportunity {result.reply_opportunity_score:.1f}/100\n"
             f"Caption: {_compact_text(result.text, 500)}\n"
@@ -327,10 +370,21 @@ def _to_search_result(tweet: Any) -> XSearchResult:
         like_count=int(getattr(tweet, "likeCount", 0) or 0),
         view_count=_optional_int(getattr(tweet, "viewCount", None)),
         author_followers_count=_optional_int(getattr(user, "followersCount", None)),
+        author_following_count=_optional_int(getattr(user, "friendsCount", None)),
+        author_statuses_count=_optional_int(getattr(user, "statusesCount", None)),
         author_verified=bool(
             getattr(user, "verified", False)
             or getattr(user, "blue", False)
         ),
+        author_blue_verified=bool(getattr(user, "blue", False)),
+        author_blue_type=str(getattr(user, "blueType", "") or ""),
+        author_description=str(
+            getattr(user, "rawDescription", "")
+            or getattr(user, "description", "")
+            or ""
+        ),
+        author_location=str(getattr(user, "location", "") or ""),
+        author_protected=bool(getattr(user, "protected", False)),
         media_urls=_media_urls(tweet),
         has_video=_has_video(tweet),
         media_descriptions=_media_descriptions(tweet),

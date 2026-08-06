@@ -444,6 +444,14 @@ class RevenueOpsStore:
                 continue
             score = min(40.0, median_views / 2_500) + response_rate * 25.0
             score += verified_proxy * 0.20 + relationship * 0.15 + green_rate * 10.0
+            author_tier = str(portfolio.get("author_tier") or "unknown")
+            score += {
+                "mid_8k_50k": 8.0,
+                "large_50k_300k": 4.0,
+                "mega_300k_plus": -4.0,
+                "emerging_under_8k": 1.0,
+                "unknown": 0.0,
+            }.get(author_tier, 0.0)
             candidates.append((round(score, 2), username, portfolio))
 
         candidates.sort(reverse=True)

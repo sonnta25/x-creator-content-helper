@@ -37,6 +37,14 @@ def test_dependency_sync_tracks_pyproject_and_checks_download_package() -> None:
     assert "return ($exitCode -eq 0)" in script
 
 
+def test_windows_timezone_database_is_a_locked_runtime_dependency() -> None:
+    project = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8-sig")
+    lock = (PROJECT_ROOT / "requirements.lock").read_text(encoding="utf-8-sig")
+
+    assert '"tzdata>=2025.1,<2027"' in project
+    assert "tzdata==2026.3" in lock
+
+
 def test_restart_script_stops_old_copies_before_starting_updated_bot() -> None:
     script = (WINDOWS_SCRIPTS / "restart.ps1").read_text(encoding="utf-8-sig")
 

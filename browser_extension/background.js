@@ -16,12 +16,16 @@ const DEFAULTS = {
   replyVideoMinutes: 5,
   replyVideoQuery: "",
   replyVideoWindows: "08:00-11:00,12:00-14:00,19:00-22:00",
+  followTargetsMinutes: 20,
   nextReplyTargetsAt: 0,
   lastReplyTargetsTriggeredAt: 0,
   replyTargetsConfigUpdatedAt: 0,
   nextReplyVideoAt: 0,
   lastReplyVideoTriggeredAt: 0,
   replyVideoConfigUpdatedAt: 0,
+  nextFollowTargetsAt: 0,
+  lastFollowTargetsTriggeredAt: 0,
+  followTargetsConfigUpdatedAt: 0,
   lastStatus: "Ready."
 };
 
@@ -80,7 +84,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     changes.creatorTimezone ||
     changes.replyTargetsMinutes || changes.replyTargetsMaxAgeMinutes ||
     changes.replyTargetsLanguages || changes.replyVideoMinutes ||
-    changes.replyVideoWindows
+    changes.replyVideoWindows || changes.followTargetsMinutes
   ) {
     if (changes.replyTargetsMinutes) {
       const minutes = Math.max(5, Number(changes.replyTargetsMinutes.newValue || DEFAULTS.replyTargetsMinutes));
@@ -89,6 +93,12 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     } else if (changes.replyVideoMinutes) {
       const minutes = Math.max(3, Number(changes.replyVideoMinutes.newValue || DEFAULTS.replyVideoMinutes));
       chromeStorageSet({ nextReplyVideoAt: Date.now() + minutes * 60 * 1000 })
+        .then(() => ensureAutomationAlarm());
+    } else if (changes.followTargetsMinutes) {
+      const minutes = Math.max(5, Number(
+        changes.followTargetsMinutes.newValue || DEFAULTS.followTargetsMinutes
+      ));
+      chromeStorageSet({ nextFollowTargetsAt: Date.now() + minutes * 60 * 1000 })
         .then(() => ensureAutomationAlarm());
     } else {
       ensureAutomationAlarm();
@@ -393,6 +403,11 @@ async function ensureAutomationAlarm(config = null) {
       nextReplyVideoAt: Date.now() + runtimeConfig.replyVideoMinutes * 60 * 1000
     });
   }
+  if (!runtimeConfig.nextFollowTargetsAt) {
+    await chromeStorageSet({
+      nextFollowTargetsAt: Date.now() + runtimeConfig.followTargetsMinutes * 60 * 1000
+    });
+  }
   const periodInMinutes = runtimeConfig.lowResourceMode ? 1 : 0.5;
   const existing = await chromeAlarmsGet(AUTOMATION_ALARM);
   if (!existing || Number(existing.periodInMinutes || 0) !== periodInMinutes) {
@@ -467,6 +482,27 @@ async function automationTick() {
     }
   }
 
+  if (!config.nextFollowTargetsAt) {
+    await chromeStorageSet({
+      nextFollowTargetsAt: nowMs + config.followTargetsMinutes * 60 * 1000
+    });
+  } else if (
+    nowMs >= config.nextFollowTargetsAt &&
+    isInsideScheduleWindows(now, config.replyVideoWindows, config.creatorTimezone)
+  ) {
+    await setStatus("Starting scheduled /followtargets...");
+    const trigger = await bridgeFetch(config, "/automation/triggers/followtargets", {
+      method: "POST",
+      body: { follow_targets_minutes: config.followTargetsMinutes }
+    });
+    if (trigger.status === "accepted") {
+      await chromeStorageSet({
+        nextFollowTargetsAt: nowMs + config.followTargetsMinutes * 60 * 1000,
+        lastFollowTargetsTriggeredAt: nowMs
+      });
+    }
+  }
+
   return { runJobs: shouldRunJobs };
 }
 
@@ -476,6 +512,8 @@ async function syncTelegramAutomationConfig(config) {
   const updatedAt = Number(remote.reply_targets_updated_at || 0);
   const videoMinutes = Number(remote.reply_video_minutes || 0);
   const videoUpdatedAt = Number(remote.reply_video_updated_at || 0);
+  const followMinutes = Number(remote.follow_targets_minutes || 0);
+  const followUpdatedAt = Number(remote.follow_targets_updated_at || 0);
   const bridgeTimeoutSeconds = boundedProviderTimeout(
     remote.extension_bridge_timeout_seconds
   );
@@ -517,6 +555,26 @@ async function syncTelegramAutomationConfig(config) {
         replyVideoMinutes: videoMinutes,
         replyVideoConfigUpdatedAt: videoUpdatedAt,
         nextReplyVideoAt
+      };
+    }
+  }
+  if (Number.isFinite(followMinutes) && followMinutes >= 5) {
+    const followIntervalChanged = followMinutes !== config.followTargetsMinutes;
+    const followRevisionChanged = (
+      followUpdatedAt > 0 && followUpdatedAt !== config.followTargetsConfigUpdatedAt
+    );
+    if (followIntervalChanged || followRevisionChanged) {
+      const nextFollowTargetsAt = Date.now() + followMinutes * 60 * 1000;
+      await chromeStorageSet({
+        followTargetsMinutes: followMinutes,
+        followTargetsConfigUpdatedAt: followUpdatedAt,
+        nextFollowTargetsAt
+      });
+      config = {
+        ...config,
+        followTargetsMinutes: followMinutes,
+        followTargetsConfigUpdatedAt: followUpdatedAt,
+        nextFollowTargetsAt
       };
     }
   }
@@ -780,7 +838,6 @@ function isRetryableProviderError(error) {
     "reached your limit",
     "login",
     "sign in",
-    "image file input was not found",
     "missing gemini prompt",
     "invalid image data"
   ];
@@ -1187,6 +1244,31 @@ function injectedProviderReady() {
     const rect = element.getBoundingClientRect();
     return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
   };
+  const normalize = (value) => String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const queryAllDeep = (selector) => {
+    const found = [];
+    const seen = new Set();
+    const visit = (root) => {
+      if (!root || seen.has(root)) return;
+      seen.add(root);
+      for (const element of root.querySelectorAll ? root.querySelectorAll(selector) : []) {
+        if (!found.includes(element)) found.push(element);
+      }
+      for (const element of root.querySelectorAll ? root.querySelectorAll("*") : []) {
+        if (element.shadowRoot) visit(element.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  };
+  const labelFor = (element) => normalize(
+    `${element.getAttribute("aria-label") || ""} `
+    + `${element.getAttribute("data-placeholder") || ""} `
+    + `${element.getAttribute("placeholder") || ""} ${element.textContent || ""}`
+  ).replace(/\s+/g, " ").trim();
   const selectors = [
     "#prompt-textarea",
     ".ProseMirror",
@@ -1195,13 +1277,37 @@ function injectedProviderReady() {
     "p[data-placeholder]",
     "textarea"
   ];
-  const input = selectors
-    .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-    .find(isVisible);
+  const score = (element) => {
+    const rect = element.getBoundingClientRect();
+    const label = labelFor(element);
+    let value = 0;
+    if (label.includes("search") || label.includes("tim kiem")
+        || label.includes("検索") || label.includes("검색")) value -= 250;
+    if (element.id === "prompt-textarea") value += 150;
+    if (element.classList.contains("ProseMirror")) value += 120;
+    if (element.getAttribute("role") === "textbox") value += 40;
+    if (element.getAttribute("contenteditable") === "true") value += 25;
+    if (label.includes("prompt") || label.includes("ask gemini")
+        || label.includes("nhap cau lenh") || label.includes("hoi gemini")) value += 80;
+    if (rect.width >= Math.min(280, window.innerWidth * 0.35)) value += 30;
+    if (rect.top >= window.innerHeight * 0.35) value += 30;
+    return value;
+  };
+  let candidates = Array.from(new Set(
+    selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+  )).filter(isVisible);
+  let input = candidates.sort((left, right) => score(right) - score(left))[0] || null;
+  if (!input || score(input) < 55) {
+    candidates = Array.from(new Set(
+      selectors.flatMap((selector) => queryAllDeep(selector))
+    )).filter(isVisible);
+    input = candidates.sort((left, right) => score(right) - score(left))[0] || null;
+  }
   return {
-    ready: Boolean(input),
+    ready: Boolean(input && score(input) >= 55),
     url: location.href,
-    title: document.title
+    title: document.title,
+    composer: input ? `${input.tagName.toLowerCase()}:${labelFor(input).slice(0, 100)}` : "none"
   };
 }
 
@@ -1298,9 +1404,11 @@ async function injectedAttachImages(attachments) {
     visit(root);
     return found;
   };
-  const queryFastThenDeep = (selector) => {
+  const queryFastThenDeep = (selector, alwaysDeep = false) => {
     const direct = Array.from(document.querySelectorAll(selector));
-    return direct.length ? direct : deepElements(document.documentElement, selector);
+    if (direct.length && !alwaysDeep) return direct;
+    const deep = deepElements(document.documentElement, selector);
+    return Array.from(new Set([...direct, ...deep]));
   };
   const fileInputs = () => queryFastThenDeep("input[type='file']").sort((left, right) => {
     const score = (input) => {
@@ -1311,10 +1419,12 @@ async function injectedAttachImages(attachments) {
   });
   const labelFor = (item) => asciiLower(
     `${item.getAttribute("aria-label") || ""} ${item.getAttribute("data-tooltip") || ""} `
-    + `${item.title || ""} ${item.textContent || ""}`
+    + `${item.getAttribute("mattooltip") || ""} ${item.getAttribute("data-testid") || ""} `
+    + `${item.getAttribute("data-test-id") || ""} ${item.title || ""} ${item.textContent || ""}`
   ).replace(/\s+/g, " ").trim();
   const clickableElements = () => queryFastThenDeep(
-    "button, [role='button'], [role='menuitem'], [role='option'], [aria-label]"
+    "button, [role='button'], [role='menuitem'], [role='option'], [aria-label]",
+    true
   ).filter(isVisible);
   const blobImageCount = () => queryFastThenDeep("img").filter((img) =>
     String(img.src || "").startsWith("blob:")
@@ -1328,12 +1438,24 @@ async function injectedAttachImages(attachments) {
   const clickAddMenu = () => clickMatching((label) => (
     label.includes("open upload file menu")
       || label.includes("upload file menu")
+      || label.includes("open attachment menu")
       || label.includes("add files")
       || label.includes("add file")
+      || label.includes("insert files")
       || label.includes("attach files")
       || label.includes("attach file")
+      || label.includes("mo trinh don tai tep")
+      || label.includes("mo trinh don dinh kem")
+      || label.includes("dinh kem tep")
+      || label.includes("dinh kem anh")
       || label.includes("them tep")
+      || label.includes("them anh")
       || label.includes("tai tep")
+      || label.includes("tai anh")
+      || label.includes("ファイルを追加")
+      || label.includes("ファイルを添付")
+      || label.includes("파일 추가")
+      || label.includes("파일 첨부")
       || label.includes("ファイルを追加")
       || label.includes("파일 추가")
   ));
@@ -1344,12 +1466,77 @@ async function injectedAttachImages(attachments) {
       || label.includes("upload from computer")
       || label.includes("upload from device")
       || label.includes("choose files")
+      || label.includes("select files")
       || label.includes("tai tep len")
       || label.includes("tai len tu may tinh")
+      || label.includes("tai len tu thiet bi")
+      || label.includes("chon tep")
+      || label.includes("chon anh")
+      || label.includes("ファイルをアップロード")
+      || label.includes("파일 업로드")
       || label.includes("ファイルをアップロード")
       || label.includes("파일 업로드")
     )
   ));
+  const findComposer = () => {
+    const candidates = queryFastThenDeep(
+      "#prompt-textarea, .ProseMirror, [contenteditable='true'], "
+      + "div[role='textbox'], p[data-placeholder], textarea",
+      true
+    ).filter(isVisible);
+    const score = (item) => {
+      const rect = item.getBoundingClientRect();
+      const label = labelFor(item);
+      const searchLike = label.includes("search") || label.includes("tim kiem")
+        || label.includes("検索") || label.includes("검색");
+      let value = searchLike ? -200 : 0;
+      if (item.id === "prompt-textarea") value += 120;
+      if (item.classList.contains("ProseMirror")) value += 100;
+      if (item.getAttribute("role") === "textbox") value += 35;
+      if (item.getAttribute("contenteditable") === "true") value += 25;
+      if (label.includes("prompt") || label.includes("ask gemini")
+          || label.includes("nhap cau lenh") || label.includes("hoi gemini")) value += 70;
+      if (rect.width >= Math.min(280, window.innerWidth * 0.35)) value += 25;
+      if (rect.top >= window.innerHeight * 0.35) value += 25;
+      return value;
+    };
+    return candidates.sort((left, right) => score(right) - score(left))[0] || null;
+  };
+  const clickNearbyAttachmentMenu = () => {
+    const composer = findComposer();
+    if (!composer) return "";
+    const composerRect = composer.getBoundingClientRect();
+    const excluded = [
+      "send", "gui", "microphone", "mic", "voice", "giong noi",
+      "model", "spark", "main action", "thao tac chinh"
+    ];
+    const ranked = clickableElements().map((item) => {
+      const rect = item.getBoundingClientRect();
+      const label = labelFor(item);
+      const verticalDistance = Math.abs(
+        (rect.top + rect.height / 2) - (composerRect.top + composerRect.height / 2)
+      );
+      const horizontallyRelevant = rect.right >= composerRect.left - 220
+        && rect.left <= composerRect.right + 80;
+      if (verticalDistance > 160 || !horizontallyRelevant
+          || excluded.some((term) => label.includes(term))) {
+        return { item, label, score: -1 };
+      }
+      let score = 0;
+      if (item.getAttribute("aria-haspopup") === "menu") score += 8;
+      if (/upload|attach|add.file|them.tep|tai.tep|dinh.kem/.test(label)) score += 12;
+      if (["add", "plus", "them", "dinh kem"].includes(label)) score += 10;
+      if (/upload|attach|add/.test(String(
+        item.getAttribute("data-testid") || item.getAttribute("data-test-id") || ""
+      ).toLowerCase())) score += 12;
+      if (item.querySelector("svg, mat-icon")) score += 1;
+      if (rect.left <= composerRect.left + 180) score += 2;
+      return { item, label, score };
+    }).sort((left, right) => right.score - left.score);
+    if (!ranked.length || ranked[0].score < 7) return "";
+    ranked[0].item.click();
+    return ranked[0].label.slice(0, 120) || "near-composer-menu";
+  };
   const decodeAttachment = (attachment) => {
     const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i.exec(String(attachment.data_url || ""));
     if (!match) throw new Error(`Invalid image data for ${attachment.name || "attachment"}.`);
@@ -1367,7 +1554,7 @@ async function injectedAttachImages(attachments) {
   let inputs = fileInputs();
   const triggerLog = [];
   if (!inputs.length) {
-    const addLabel = clickAddMenu();
+    const addLabel = clickAddMenu() || clickNearbyAttachmentMenu();
     if (addLabel) triggerLog.push(`add=${addLabel}`);
     for (let attempt = 0; attempt < 32 && !inputs.length; attempt += 1) {
       await sleep(250);
@@ -1381,11 +1568,22 @@ async function injectedAttachImages(attachments) {
   }
   const input = inputs[0];
   if (!input) {
+    const composer = findComposer();
+    const composerDebug = composer
+      ? `${composer.tagName.toLowerCase()}:${labelFor(composer).slice(0, 100) || "unlabelled"}`
+      : "none";
+    const composerRect = composer ? composer.getBoundingClientRect() : null;
+    const nearbyControls = clickableElements().filter((item) => {
+      if (!composerRect) return false;
+      const rect = item.getBoundingClientRect();
+      return Math.abs(rect.top - composerRect.top) < 220;
+    }).slice(0, 16);
     return {
       ok: false,
       error: "Gemini image file input was not found.",
       debug: `url=${location.href}; fileInputs=0; triggers=${triggerLog.join(" | ") || "none"}; `
-        + `visibleControls=${clickableElements().slice(0, 8).map(labelFor).filter(Boolean).join(" | ") || "none"}`
+        + `composer=${composerDebug}; nearbyControls=${nearbyControls.map(labelFor).filter(Boolean).join(" | ") || "none"}; `
+        + `visibleControls=${clickableElements().slice(-16).map(labelFor).filter(Boolean).join(" | ") || "none"}`
     };
   }
   let files;
@@ -1455,6 +1653,23 @@ async function injectedSubmitPrompt(prompt) {
     ].filter(Boolean).join(" | ");
   };
 
+  const queryAllDeep = (selector) => {
+    const found = [];
+    const visited = new Set();
+    const visit = (root) => {
+      if (!root || visited.has(root)) return;
+      visited.add(root);
+      for (const item of root.querySelectorAll ? root.querySelectorAll(selector) : []) {
+        if (!found.includes(item)) found.push(item);
+      }
+      for (const item of root.querySelectorAll ? root.querySelectorAll("*") : []) {
+        if (item.shadowRoot) visit(item.shadowRoot);
+      }
+    };
+    visit(document);
+    return found;
+  };
+
   const findInput = () => {
     const selectors = [
       "#prompt-textarea",
@@ -1464,11 +1679,31 @@ async function injectedSubmitPrompt(prompt) {
       "p[data-placeholder]",
       "textarea"
     ];
-    for (const selector of selectors) {
-      const items = Array.from(document.querySelectorAll(selector)).filter(isVisible);
-      if (items.length) return items[items.length - 1];
-    }
-    return null;
+    const candidates = Array.from(new Set(
+      selectors.flatMap((selector) => queryAllDeep(selector))
+    )).filter(isVisible);
+    const score = (item) => {
+      const rect = item.getBoundingClientRect();
+      const label = asciiLower(
+        `${item.getAttribute("aria-label") || ""} `
+        + `${item.getAttribute("data-placeholder") || ""} `
+        + `${item.getAttribute("placeholder") || ""}`
+      );
+      let value = 0;
+      if (label.includes("search") || label.includes("tim kiem")
+          || label.includes("検索") || label.includes("검색")) value -= 250;
+      if (item.id === "prompt-textarea") value += 150;
+      if (item.classList.contains("ProseMirror")) value += 120;
+      if (item.getAttribute("role") === "textbox") value += 40;
+      if (item.getAttribute("contenteditable") === "true") value += 25;
+      if (label.includes("prompt") || label.includes("ask gemini")
+          || label.includes("nhap cau lenh") || label.includes("hoi gemini")) value += 80;
+      if (rect.width >= Math.min(280, window.innerWidth * 0.35)) value += 30;
+      if (rect.top >= window.innerHeight * 0.35) value += 30;
+      return value;
+    };
+    const selected = candidates.sort((left, right) => score(right) - score(left))[0];
+    return selected && score(selected) >= 55 ? selected : null;
   };
 
   const visibleAssistantText = () => {
@@ -2340,12 +2575,18 @@ async function loadConfig() {
     replyVideoMinutes: Math.max(3, Number(saved.replyVideoMinutes || DEFAULTS.replyVideoMinutes)),
     replyVideoQuery: String(saved.replyVideoQuery || ""),
     replyVideoWindows: String(saved.replyVideoWindows || DEFAULTS.replyVideoWindows),
+    followTargetsMinutes: Math.max(5, Number(
+      saved.followTargetsMinutes || DEFAULTS.followTargetsMinutes
+    )),
     nextReplyTargetsAt: Number(saved.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(saved.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(saved.replyTargetsConfigUpdatedAt || 0),
     nextReplyVideoAt: Number(saved.nextReplyVideoAt || 0),
     lastReplyVideoTriggeredAt: Number(saved.lastReplyVideoTriggeredAt || 0),
     replyVideoConfigUpdatedAt: Number(saved.replyVideoConfigUpdatedAt || 0),
+    nextFollowTargetsAt: Number(saved.nextFollowTargetsAt || 0),
+    lastFollowTargetsTriggeredAt: Number(saved.lastFollowTargetsTriggeredAt || 0),
+    followTargetsConfigUpdatedAt: Number(saved.followTargetsConfigUpdatedAt || 0),
     lastStatus: String(session.lastStatus || saved.lastStatus || DEFAULTS.lastStatus)
   };
 }
@@ -2377,12 +2618,18 @@ async function saveConfig(config) {
     replyVideoMinutes: Math.max(3, Number(config.replyVideoMinutes || DEFAULTS.replyVideoMinutes)),
     replyVideoQuery: String(config.replyVideoQuery || ""),
     replyVideoWindows: String(config.replyVideoWindows || DEFAULTS.replyVideoWindows),
+    followTargetsMinutes: Math.max(5, Number(
+      config.followTargetsMinutes || DEFAULTS.followTargetsMinutes
+    )),
     nextReplyTargetsAt: Number(config.nextReplyTargetsAt || 0),
     lastReplyTargetsTriggeredAt: Number(config.lastReplyTargetsTriggeredAt || 0),
     replyTargetsConfigUpdatedAt: Number(config.replyTargetsConfigUpdatedAt || 0),
     nextReplyVideoAt: Number(config.nextReplyVideoAt || 0),
     lastReplyVideoTriggeredAt: Number(config.lastReplyVideoTriggeredAt || 0),
-    replyVideoConfigUpdatedAt: Number(config.replyVideoConfigUpdatedAt || 0)
+    replyVideoConfigUpdatedAt: Number(config.replyVideoConfigUpdatedAt || 0),
+    nextFollowTargetsAt: Number(config.nextFollowTargetsAt || 0),
+    lastFollowTargetsTriggeredAt: Number(config.lastFollowTargetsTriggeredAt || 0),
+    followTargetsConfigUpdatedAt: Number(config.followTargetsConfigUpdatedAt || 0)
   });
 }
 

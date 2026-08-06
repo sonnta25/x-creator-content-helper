@@ -35,6 +35,9 @@ The normal daily workflow is:
 6. Use `/inbox` when an original author responds and `/replyreport 7d` to review
    performance.
 
+For audience building, `/followtargets` creates a separate manual-follow shortlist.
+It never follows, unfollows, likes, or messages an account automatically.
+
 For a revenue-oriented setup, run `/money status` once and keep `/pace adaptive`
 plus `/risk balanced` enabled. The bot learns priority authors from tracked results;
 use `/watchauthor add @name` only when an account should be permanently pinned.
@@ -79,6 +82,7 @@ still use the private reply prompt.
 - `/inbox` — reopen pending original-author and verified-audience follow-ups.
 - `/replytargets [topic|auto]` — find viral posts and create reply cards.
 - `/replyvideo [topic]` — find fresh viral videos with low reply competition.
+- `/followtargets` — find Vietnamese Premium accounts you do not currently follow.
 - `/reply <text or X URL>` — write one standalone reply.
 - `/replyreport [7d|30d]` — show tracked reply performance.
 - `/wins [7d|30d|90d]` — show the strongest real reply angles as an insight bank.
@@ -89,9 +93,12 @@ still use the private reply prompt.
 - `/replygoal show|qualify|earn|network` — change the ranking objective.
 - `/replyevery <5-1440>` — set the scheduled post-reply interval in minutes.
 - `/videoevery <3-1440>` — set the scheduled video-reply interval.
+- `/followevery <5-1440>` — set the follow-candidate interval. Its active windows are
+  always the same windows configured for `/replyvideo`.
 - `/replybatch show|targets <2-5>|video <2-5>` — set cards requested per run.
 - `/replycap show|daily <1-2000>|author <1-25>` — inspect approved-card usage and
-  set daily or per-author ceilings. Pending and rejected drafts do not consume caps.
+  set daily or per-author ceilings. Pending and rejected drafts do not consume caps;
+  pending cards only reserve generation capacity until approved, rejected, or expired.
 - `/pace show|conservative|adaptive|high|pause|resume` — control adaptive hourly
   card ceilings and health backoff.
 - `/replylangs show|add|remove|set` — manage up to six X language codes.
@@ -139,6 +146,17 @@ posts that accelerate several hours later. Reply competition is scored separatel
 crowded threads and dominant existing replies reduce opportunity even when the root
 post is viral.
 
+For growth-stage accounts, the final target portfolio now favors authors in the
+8k-50k mid-tier conversion range, retains 50k-300k authors for reach, and leaves a
+slot open for the strongest breakout regardless of account size. This is a soft
+portfolio preference: exceptional momentum and low reply competition can still
+outrank the preferred author tiers.
+
+Selection adds a bounded audience-window bonus using `CREATOR_TIMEZONE`: Asia/Japan
+at 07:00-11:00, Europe at 14:00-17:00, and US/global English at 20:00-23:30. Language
+is only a proxy because most X posts expose no reliable country metadata. Outside
+those windows the bot keeps global exploration neutral.
+
 `REPLY_TARGET_MIN_VIEWS` is the normal selection baseline, not an unconditional hard
 gate. When fewer than two posts survive, the bot re-ranks the same fresh results with
 bounded momentum and view-floor fallbacks. The final tier can accept any visible view
@@ -184,6 +202,26 @@ determination or a private X monetization decision.
 
 Scheduled scans with no ready opportunity are silent and do not spend a Gemini job.
 Authentication, rate-limit, bridge, or provider failures are still reported.
+
+### `/followtargets`
+
+This lane is independent of Gemini and reply-card limits. By default, it runs every
+20 minutes only inside the `/replyvideo` active windows and proposes up to 12 people.
+Each run:
+
+1. refreshes and caches the posting account's Following list from `twscrape`;
+2. searches recent Vietnamese posts to find active community members;
+3. requires the account's X Premium/blue flag and excludes protected profiles;
+4. excludes your own account, accounts already followed, and suggestions shown within
+   the configured cooldown;
+5. ranks moderate-size accounts by following/follower balance, recent activity, and
+   Vietnamese profile signals; and
+6. sends one Telegram button that opens each candidate's profile.
+
+The Telegram card contains only a compact name/username list and one profile button per
+candidate. Ranking remains internal. The bot never auto-follows or performs
+follow/unfollow churn. If fewer than 12 truthful matches exist, it reports the smaller
+list instead of inserting an already-followed or obviously unbalanced account.
 
 ### `/replyvideo`
 
@@ -310,7 +348,10 @@ count is sampled across reply as well as legacy post windows, so follower lift n
 depends on removed post-generation commands.
 
 Learning is bounded. It adjusts strategy allocation using real approvals, edits,
-public outcomes, language, source type, and posting hour. Strong real posted replies
+public outcomes, language, source type, and posting hour. `/replyreport` also compares
+author tiers, selection-age buckets, root-view stages, and audience windows, so the
+8k-50k-author and 5k-50k-view "sweet spots" are verified against this account's own
+public outcomes rather than accepted as universal rules. Strong real posted replies
 may supply short style examples, but the prompt forbids copying their wording or
 claims. The bot does not rewrite its source code or base prompt automatically.
 
@@ -377,7 +418,9 @@ REPLY_VIDEO_BATCH_SIZE=3
 - `network` emphasizes author responses and repeat relationships.
 
 The daily value counts only cards the user approves, not pending or rejected drafts,
-and is not a guaranteed posting quota. `/replycap show` displays global and Japanese
+and is not a guaranteed posting quota. Pending cards reserve available daily, hourly,
+per-author, and Japanese generation slots so overlapping scans cannot produce a card
+that is already impossible to approve. `/replycap show` displays global and Japanese
 daily/hourly usage. `/profileaudit` also checks whether the recent timeline contains
 original posts instead of looking reply-only.
 Available candidates, deduplication, quality checks, batch size, X limits, and manual
@@ -408,6 +451,8 @@ one hidden bot process, so a separate `start.ps1` call is not needed after setup
 Dependencies are constrained by `requirements.lock`, the exact versions validated by
 the test suite. `start.ps1` refuses to modify the venv while a current or older bot copy
 is running.
+The locked `tzdata` package is required on Windows so Vietnam daily resets, audience
+windows, and local-hour reports do not silently fall back to UTC.
 
 Operational commands:
 
@@ -434,17 +479,20 @@ Logs are written to `logs/bot.out.log` and `logs/bot.err.log`.
 6. Enable **Auto Run** for queued Gemini work and **Automation** for schedules.
 7. Keep low-resource mode enabled on a small VPS.
 
-The required extension version is `0.8.8`. After replacing project files, press
+The required extension version is `0.9.0`. After replacing project files, press
 **Reload** on the extension card whenever `browser_extension/` changed.
 
-Version `0.8.8` allows up to 60 seconds for Gemini's editor to accept and submit a
+Version `0.9.0` allows up to 60 seconds for Gemini's editor to accept and submit a
 large reply-target prompt on a low-spec VPS, while still bounding frame upload and
 DOM-read operations. It also reduces expensive shadow-DOM scans; fails an attempt with
 no readable Gemini progress after at most two minutes; and wraps the complete attempt
 in a separate deadline so a stuck Chrome API promise cannot look healthy merely by
 sending heartbeats. With the normal 360-second bridge budget, one stalled attempt is
 retried once on a fresh managed Gemini tab. Login, quota, rate-limit, and invalid-frame
-errors fail immediately instead of wasting the second attempt.
+errors fail immediately instead of wasting the second attempt. It also identifies the
+real Gemini composer instead of sidebar search controls, recognizes localized and
+shadow-DOM attachment menus, retries a missing upload control once on a fresh tab, and
+falls back to caption/media-grounded video candidates when at least two remain.
 
 The extension uses a lightweight watchdog only while a provider job is active and
 requeues an interrupted job as soon as its heartbeat lease expires.
@@ -484,6 +532,12 @@ REPLY_TARGET_BATCH_SIZE=3
 REPLY_VIDEO_BATCH_SIZE=3
 REPLY_PENDING_QUEUE_CAP=5
 
+TELEGRAM_FOLLOW_TARGETS_MINUTES=20
+FOLLOW_TARGET_BATCH_SIZE=12
+FOLLOW_TARGET_COOLDOWN_HOURS=24
+FOLLOW_TARGET_MIN_FOLLOWERS=100
+FOLLOW_TARGET_MAX_FOLLOWERS=50000
+
 REPLY_VIDEO_FRAME_ANALYSIS=true
 REPLY_VIDEO_FRAME_COUNT=2
 REPLY_LEARNING_ENABLED=true
@@ -493,11 +547,11 @@ REPLY_DAILY_DIGEST_HOUR=22
 ```
 
 Prefer `/importcookie`, `/replylangs`, `/replygoal`, `/replycap`, `/replybatch`,
-`/replyevery`, and `/videoevery` for settings supported from Telegram. Those commands
+`/replyevery`, `/videoevery`, and `/followevery` for settings supported from Telegram. Those commands
 update the running bot immediately and persist supported values to `.env`.
 
 Do not increase the bridge timeout simply to hide a stuck provider tab. Values are
-clamped to 120-360 seconds, and extension `0.8.8` should recover or recycle a stalled
+clamped to 120-360 seconds, and extension `0.9.0` should recover or recycle a stalled
 tab earlier.
 
 The bridge serializes scheduled, manual, revision, and tracking Gemini requests. A
@@ -556,9 +610,9 @@ node --check browser_extension\background.js
 
 - **No reply-ready posts:** run `/setupcheck` and `/xaccounts`; refresh X cookies if
   the pool reports authentication, challenge, or rate-limit errors.
-- **Chrome never claimed the job:** reload extension `0.8.8`, verify the bridge URL
+- **Chrome never claimed the job:** reload extension `0.9.0`, verify the bridge URL
   and token, and enable Auto Run or click **Run next job**.
-- **Heartbeat stopped:** keep Chrome open. Version `0.8.8` reattaches the page heartbeat
+- **Heartbeat stopped:** keep Chrome open. Version `0.9.0` reattaches the page heartbeat
   after Gemini navigation, preserves interrupted job state, and retries lease reclaim
   every 30 seconds. It still cannot recover a terminated or completely frozen Chrome
   process.

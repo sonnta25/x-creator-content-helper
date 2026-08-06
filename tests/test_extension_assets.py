@@ -79,6 +79,21 @@ def test_replyvideo_has_independent_five_minute_schedule() -> None:
     assert "/replyvideo topic" in popup_html
 
 
+def test_followtargets_uses_twenty_minute_schedule_and_replyvideo_windows() -> None:
+    background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
+        encoding="utf-8"
+    )
+    popup_html = (PROJECT_ROOT / "browser_extension" / "popup.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "followTargetsMinutes: 20" in background_js
+    assert '"/automation/triggers/followtargets"' in background_js
+    assert "config.replyVideoWindows" in background_js
+    assert "/followtargets scan interval" in popup_html
+    assert "same active windows as /replyvideo" in popup_html
+
+
 def test_removed_tweettrend3_scheduler_is_not_exposed() -> None:
     background_js = (PROJECT_ROOT / "browser_extension" / "background.js").read_text(
         encoding="utf-8"
@@ -102,7 +117,12 @@ def test_extension_uploads_replyvideo_frames_before_submitting_prompt() -> None:
     assert "Array.isArray(job.attachments)" in background_js
     assert "Gemini did not confirm the uploaded representative frames" in background_js
     assert "const clickUploadAction" in background_js
+    assert "const clickNearbyAttachmentMenu" in background_js
     assert 'label.includes("upload files")' in background_js
+    assert 'label.includes("mo trinh don tai tep")' in background_js
+    assert "composer=${composerDebug}" in background_js
+    assert "if (direct.length && !alwaysDeep) return direct" in background_js
+    assert "Array.from(new Set([...direct, ...deep]))" in background_js
     assert "triggers=${triggerLog.join" in background_js
 
 
@@ -261,6 +281,10 @@ def test_stalled_gemini_job_is_bounded_and_retried_once_on_a_fresh_tab() -> None
     assert "!isRetryableProviderError(error)" in text_job
     assert '"usage limit"' in text_job
     assert '"rate limit"' in text_job
+    retry_classifier = background_js.split(
+        "function isRetryableProviderError", 1
+    )[1].split("function startJobHeartbeat", 1)[0]
+    assert '"image file input was not found"' not in retry_classifier
 
     auto_alarm = background_js.split("async function ensureAutoAlarm", 1)[1].split(
         "async function ensureAutomationAlarm", 1

@@ -37,12 +37,13 @@ from src.automation import AutomationApproval, AutomationApprovalStore
 from src.config import Settings
 from src.creator_ops import ReplyWatchStore
 from src.env_store import update_env_value
+from src.follow_targets import FollowTargetHistoryStore, rank_follow_candidates
 from src.media_download_service import (
     DownloadedMedia,
     MediaDownloadError,
     MediaDownloadService,
 )
-from src.models import ImageAttachment, ReplyTargetDraft, XSearchResult
+from src.models import FollowCandidate, ImageAttachment, ReplyTargetDraft, XSearchResult
 from src.reply_target_metrics import ReplyTargetMetricStore
 from src.reply_learning import (
     EXPERIMENT_VARIANTS,
@@ -101,13 +102,23 @@ JAPANESE_HIGH_VALUE_REPLY_QUERY = (
 REPLY_TARGET_MAX_CANDIDATES = 6
 REPLY_TARGET_RESULT_LIMIT = 8
 REPLY_TARGET_CONTEXT_ITEMS = 3
+REPLY_TARGET_RANK_POOL_ITEMS = 10
 MIN_REPLY_TARGET_BATCH_ITEMS = 2
 MIN_REPLY_TARGET_VOLUME_FALLBACK_VIEWS = 100
 REPLY_VIDEO_RESULT_LIMIT = 16
 REPLY_VIDEO_CONTEXT_ITEMS = 3
 REPLY_VIDEO_MIN_BATCH_ITEMS = 2
 REPLY_VIDEO_GLOBAL_LANGUAGES = ("en", "ja", "ko", "es", "pt", "zh-cn")
-BOT_RUNTIME_REVISION = "stability-queue-v3"
+FOLLOW_TARGET_SEARCH_QUERIES = (
+    '("Việt Nam" OR Việt OR mình OR "mọi người" OR "hôm nay") lang:vi '
+    "-filter:replies -filter:retweets",
+    "(AI OR ChatGPT OR công nghệ OR crypto OR Bitcoin OR đầu tư OR kinh doanh OR creator) "
+    "lang:vi -filter:replies -filter:retweets",
+    "(thể thao OR bóng đá OR giải trí OR cuộc sống OR startup OR marketing) "
+    "lang:vi -filter:replies -filter:retweets",
+)
+FOLLOW_TARGET_SEARCH_LIMIT = 100
+BOT_RUNTIME_REVISION = "growth-portfolio-v4"
 REPLY_TARGET_TREND_TIMEOUT_SECONDS = 20
 REPLY_TARGET_SEARCH_TIMEOUT_SECONDS = 30
 REPLY_TARGET_POOL_TIMEOUT_SECONDS = 70
@@ -157,6 +168,11 @@ COMMAND_INPUT_PROMPTS = {
         "Send an interval from 3 to 1440 minutes, or send `show`.",
         "Minutes or show",
     ),
+    "followevery": (
+        "Send an interval from 5 to 1440 minutes, or send `show`. "
+        "The active windows are shared with /replyvideo.",
+        "Minutes or show",
+    ),
     "replybatch": (
         "Send `show`, `targets 2-5`, or `video 2-5`.",
         "show, targets 3, or video 2",
@@ -196,6 +212,7 @@ MENU_REPLY_VIDEO = "🎬 Find viral videos"
 MENU_WRITE_REPLY = "💬 Write a standout reply"
 MENU_REPLY_SCHEDULE = "⏱️ Reply-target schedule"
 MENU_VIDEO_SCHEDULE = "🎬 Reply-video schedule"
+MENU_FOLLOW_SCHEDULE = "👥 Follow-candidate schedule"
 MENU_REPLY_BATCH = "🔢 Replies per run"
 MENU_REPLY_CAP = "🛡️ Reply limits"
 MENU_REPLY_LANGS = "🌍 Reply languages"
@@ -232,6 +249,7 @@ MENU_EXPERIMENTS_ON = "✅ Experiments on"
 MENU_EXPERIMENTS_OFF = "🚫 Experiments off"
 MENU_PROFILE_AUDIT = "👤 Profile audit"
 MENU_WINS = "🏆 Winning insights"
+MENU_FOLLOW_TARGETS = "👥 Find people to follow"
 
 MENU_LAYOUTS: dict[str, tuple[tuple[str, ...], ...]] = {
     "main": (
@@ -254,6 +272,7 @@ MENU_LAYOUTS: dict[str, tuple[tuple[str, ...], ...]] = {
     ),
     "automation": (
         (MENU_REPLY_SCHEDULE, MENU_VIDEO_SCHEDULE),
+        (MENU_FOLLOW_SCHEDULE,),
         (MENU_REPLY_BATCH, MENU_REPLY_CAP),
         (MENU_PACE,),
         (MENU_MAIN,),
@@ -270,6 +289,7 @@ MENU_LAYOUTS: dict[str, tuple[tuple[str, ...], ...]] = {
     ),
     "video": ((MENU_DOWNLOAD, MENU_MAIN),),
     "creator": (
+        (MENU_FOLLOW_TARGETS,),
         (MENU_PERSONA, MENU_REPLY_GOAL),
         (MENU_WATCH_AUTHOR, MENU_PROFILE_AUDIT),
         (MENU_MONEY, MENU_RISK),
@@ -320,6 +340,7 @@ MENU_ACTIONS: dict[str, tuple[str, str]] = {
     MENU_WRITE_REPLY: ("command", "reply"),
     MENU_REPLY_SCHEDULE: ("command", "replyevery"),
     MENU_VIDEO_SCHEDULE: ("command", "videoevery"),
+    MENU_FOLLOW_SCHEDULE: ("command", "followevery"),
     MENU_REPLY_BATCH: ("command", "replybatch"),
     MENU_REPLY_CAP: ("command", "replycap"),
     MENU_REPLY_LANGS: ("command", "replylangs"),
@@ -356,6 +377,7 @@ MENU_ACTIONS: dict[str, tuple[str, str]] = {
     MENU_EXPERIMENTS_OFF: ("command_args", "experiments off"),
     MENU_PROFILE_AUDIT: ("command", "profileaudit"),
     MENU_WINS: ("command", "wins"),
+    MENU_FOLLOW_TARGETS: ("command", "followtargets"),
 }
 MENU_BUTTON_PATTERN = re.compile(
     "^(?:" + "|".join(re.escape(label) for label in MENU_ACTIONS) + ")$"
@@ -412,6 +434,7 @@ BOT_COMMANDS = [
     BotCommand("replygoal", "Set qualify, earn, or network scoring goal"),
     BotCommand("replytargets", "Auto-pick or search X posts to reply to"),
     BotCommand("replyvideo", "Find fresh viral videos with low reply competition"),
+    BotCommand("followtargets", "Find Vietnamese Premium accounts likely to follow back"),
     BotCommand("persona", "Show or set creator niche, voice, and audience"),
     BotCommand("importcookie", "Save X auth_token and ct0 cookie for X search"),
     BotCommand("xaccounts", "Show imported X cookie accounts"),
@@ -419,6 +442,7 @@ BOT_COMMANDS = [
     BotCommand("reply", "Generate a witty reply from tweet text or an X post link"),
     BotCommand("replyevery", "Set scheduled replytargets interval in minutes"),
     BotCommand("videoevery", "Set scheduled replyvideo interval in minutes"),
+    BotCommand("followevery", "Set follow-candidate scan interval in minutes"),
     BotCommand("replybatch", "Set replytargets or replyvideo cards per run"),
     BotCommand("replycap", "Set daily and per-author reply-card ceilings"),
     BotCommand("replylangs", "Show, add, or remove reply-target languages"),
@@ -460,6 +484,9 @@ class ContentBot:
             enabled=settings.reply_learning_enabled,
         )
         self.reply_watch = ReplyWatchStore(settings.reply_watch_path)
+        self.follow_target_history = FollowTargetHistoryStore(
+            settings.follow_target_history_path
+        )
         self.revenue_ops = RevenueOpsStore(settings.revenue_ops_path)
         self.approval_chat_id = settings.telegram_approval_chat_id
         self._application: Application | None = None
@@ -516,6 +543,7 @@ class ContentBot:
         app.add_handler(CommandHandler("replygoal", self.replygoal))
         app.add_handler(CommandHandler("replytargets", self.replytargets))
         app.add_handler(CommandHandler("replyvideo", self.replyvideo))
+        app.add_handler(CommandHandler("followtargets", self.followtargets))
         app.add_handler(CommandHandler("persona", self.persona))
         app.add_handler(CommandHandler("importcookie", self.importcookie))
         app.add_handler(CommandHandler("xaccounts", self.xaccounts))
@@ -523,6 +551,7 @@ class ContentBot:
         app.add_handler(CommandHandler("reply", self.reply))
         app.add_handler(CommandHandler("replyevery", self.replyevery))
         app.add_handler(CommandHandler("videoevery", self.videoevery))
+        app.add_handler(CommandHandler("followevery", self.followevery))
         app.add_handler(CommandHandler("replybatch", self.replybatch))
         app.add_handler(CommandHandler("replycap", self.replycap))
         app.add_handler(CommandHandler("replylangs", self.replylangs))
@@ -1175,9 +1204,19 @@ class ContentBot:
             lines = "\n".join(
                 f"- {'OK' if passed else 'FIX'}: {label}" for passed, label in checks
             )
+            follower_count = int(profile.get("followers") or 0)
+            growth_note = (
+                "Growth-stage focus: prioritize recognizable mid-tier authors (8k-50k), "
+                "keep original posts visible, and use large/viral accounts mainly for reach."
+                if 1_000 <= follower_count < 10_000
+                else (
+                    "Keep the profile promise and original/reply mix aligned with the "
+                    "current account stage."
+                )
+            )
             await status.edit_text(
                 f"Profile conversion audit for @{owner}\n"
-                f"Followers: {int(profile.get('followers') or 0):,}\n"
+                f"Followers: {follower_count:,}\n"
                 f"Bio: {bio or '(empty)'}\n"
                 + (
                     f"Recent original/reply mix: {recent_originals}/{recent_replies} "
@@ -1189,7 +1228,8 @@ class ContentBot:
                 + f"\n{lines}\n\n"
                 "The profile should answer in seconds: who this is for, what recurring value "
                 "they get, and why they should follow after seeing one reply. Keep original "
-                "posts active alongside replies so the account does not look reply-only."
+                "posts active alongside replies so the account does not look reply-only.\n"
+                f"{growth_note}"
             )
         except Exception as exc:
             await status.edit_text(_friendly_error(exc))
@@ -1337,10 +1377,13 @@ class ContentBot:
             return
 
         await message.chat.send_action(ChatAction.TYPING)
+        daypart, daypart_label = _creator_daypart(self.settings.creator_timezone)
         status = await message.reply_text(
             f"Building a {minutes}-minute session for goal `{self.settings.creator_goal}`. "
             f"Adaptive video allocation: "
             f"{self.reply_learning.recommended_video_share(self.settings.creator_goal):.0%}. "
+            f"Current audience window: {daypart_label}. "
+            "Target portfolio: mid-tier first, then large accounts and one breakout lane. "
             "Collecting posts and videos into one ranked queue..."
         )
         target_candidates: list[XSearchResult] = []
@@ -1381,7 +1424,10 @@ class ContentBot:
                 diagnostics.append(f"video lane unavailable: {_friendly_error(exc)}")
 
             selected = _select_session_mix(
-                target_candidates,
+                _select_growth_portfolio(
+                    target_candidates,
+                    max_items=max(2, len(target_candidates)),
+                ),
                 video_candidates,
                 max_items=desired,
                 video_share=self.reply_learning.recommended_video_share(
@@ -1418,6 +1464,7 @@ class ContentBot:
                 return
             await status.edit_text(
                 f"Session ready: {created.created} card(s), goal {self.settings.creator_goal}. "
+                f"Audience window: {daypart}. "
                 "Only one card is shown at a time; approving or rejecting it opens the next."
             )
         except Exception as exc:
@@ -1774,12 +1821,63 @@ class ContentBot:
             "Chrome will sync it within about 30 seconds."
         )
 
+    async def followevery(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text("Use /followevery in a private chat with this bot.")
+            return
+        if self.approval_chat_id is not None and int(chat.id) != self.approval_chat_id:
+            await message.reply_text(
+                "Only TELEGRAM_APPROVAL_CHAT_ID can change this schedule."
+            )
+            return
+        if not context.args:
+            await self._request_command_input(update, "followevery")
+            return
+        if str(context.args[0]).strip().lower() in {"show", "current"}:
+            current = self.settings.telegram_follow_targets_minutes
+            value = f"{current} minutes" if current is not None else "Chrome extension default (20)"
+            await message.reply_text(
+                f"Current /followtargets interval: {value}.\n"
+                "Active windows: the same windows configured for /replyvideo."
+            )
+            return
+        try:
+            minutes = int(context.args[0])
+        except (TypeError, ValueError):
+            await message.reply_text("Use a whole number, for example: /followevery 20")
+            return
+        if minutes < 5 or minutes > 1440:
+            await message.reply_text("Interval must be between 5 and 1440 minutes.")
+            return
+        updated_at = int(datetime.now(UTC).timestamp() * 1000)
+        self.settings = replace(
+            self.settings,
+            telegram_follow_targets_minutes=minutes,
+            telegram_follow_targets_updated_at=updated_at,
+        )
+        update_env_value("TELEGRAM_FOLLOW_TARGETS_MINUTES", str(minutes))
+        update_env_value("TELEGRAM_FOLLOW_TARGETS_UPDATED_AT", str(updated_at))
+        await message.reply_text(
+            f"Scheduled /followtargets interval set to {minutes} minutes. "
+            "It shares /replyvideo active windows, and Chrome will sync it within about 30 seconds."
+        )
+
     async def get_automation_config(self) -> dict[str, Any]:
         return {
             "reply_targets_minutes": self.settings.telegram_reply_targets_minutes,
             "reply_targets_updated_at": self.settings.telegram_reply_targets_updated_at,
             "reply_video_minutes": self.settings.telegram_reply_video_minutes,
             "reply_video_updated_at": self.settings.telegram_reply_video_updated_at,
+            "follow_targets_minutes": self.settings.telegram_follow_targets_minutes,
+            "follow_targets_updated_at": self.settings.telegram_follow_targets_updated_at,
             "automation_running": bool(self._automation_running),
             "creator_timezone": self.settings.creator_timezone,
             "creator_goal": self.settings.creator_goal,
@@ -1881,6 +1979,12 @@ class ContentBot:
         source_lines = _format_performance_dimension(report["by_source"])
         experiment_lines = _format_performance_dimension(report["by_experiment"])
         risk_lines = _format_performance_dimension(report["by_risk"])
+        author_tier_lines = _format_performance_dimension(report["by_author_tier"])
+        age_lines = _format_performance_dimension(report["by_age_bucket"])
+        distribution_lines = _format_performance_dimension(
+            report["by_distribution_stage"]
+        )
+        daypart_lines = _format_performance_dimension(report["by_daypart"])
         hour_lines = _format_performance_dimension(report["by_hour_local"])
         await message.reply_text(
             f"Reply performance - last {days} days\n"
@@ -1906,6 +2010,10 @@ class ContentBot:
             f"Best sources:\n{source_lines}\n\n"
             f"Format experiments:\n{experiment_lines}\n\n"
             f"Revenue safety mix:\n{risk_lines}\n\n"
+            f"Author tiers:\n{author_tier_lines}\n\n"
+            f"Post age at selection:\n{age_lines}\n\n"
+            f"Root distribution stage:\n{distribution_lines}\n\n"
+            f"Audience windows:\n{daypart_lines}\n\n"
             f"Best hours ({self.settings.creator_timezone}):\n{hour_lines}\n\n"
             f"Recommendation: {_performance_recommendation(report)}"
         )
@@ -1952,6 +2060,7 @@ class ContentBot:
             and self.reply_learning.path.exists()
             and (learning.measured or learning.tracking or learning.waiting)
         )
+        _daypart, daypart_label = _creator_daypart(self.settings.creator_timezone)
         await message.reply_text(
             f"Creator bot health: {state}\n\n"
             f"Runtime revision: {BOT_RUNTIME_REVISION}\n"
@@ -1971,6 +2080,11 @@ class ContentBot:
             f"{inventory.get('watching', 0)} watching\n"
             f"Reply schedule: {self.settings.telegram_reply_targets_minutes or 'extension default'} minutes\n"
             f"Video-reply schedule: {self.settings.telegram_reply_video_minutes or 'extension default (5)'} minutes\n"
+            f"Follow-candidate schedule: "
+            f"{self.settings.telegram_follow_targets_minutes or 'extension default (20)'} minutes; "
+            "uses the /replyvideo active windows\n"
+            f"Follow candidates per run/cooldown: {self.settings.follow_target_batch_size}/"
+            f"{self.settings.follow_target_cooldown_hours}h\n"
             f"Reply cards per run: targets {self.settings.reply_target_batch_size}; "
             f"video {self.settings.reply_video_batch_size}\n"
             f"Global pending queue: {self._pending_reply_delivery_count()}/"
@@ -1978,6 +2092,8 @@ class ContentBot:
             f"Tracking checks per cycle: "
             f"{self.settings.reply_tracking_checks_per_cycle}\n"
             f"Timezone: {self.settings.creator_timezone}\n"
+            f"Current audience window: {daypart_label}\n"
+            "Growth portfolio: mid-tier 8k-50k + large 50k-300k + breakout lane\n"
             f"Stale mobile approvals: {stale_mobile}\n"
             f"Startup cleanup: {self._approval_migration.get('archived_posts', 0)} "
             f"legacy posts archived; "
@@ -2049,7 +2165,24 @@ class ContentBot:
             )
         if self.revenue_ops.pace_paused:
             return _ReplyApprovalCreationResult(blocked_reason="Reply generation is paused.")
-        hourly_remaining = self._hourly_reply_capacity()
+        pending_reservations = _pending_reply_reservations(self.approvals.items())
+        daily_remaining = max(
+            0,
+            self.settings.creator_daily_reply_cap
+            - _reply_approvals_created_today(
+                self.approvals.items(),
+                timezone_name=self.settings.creator_timezone,
+            )
+            - pending_reservations,
+        )
+        if daily_remaining <= 0:
+            return _ReplyApprovalCreationResult(
+                blocked_reason=(
+                    "The approved-reply ceiling is fully reserved by approved and "
+                    "pending cards."
+                )
+            )
+        hourly_remaining = self._hourly_reply_capacity(reserve_pending=True)
         if hourly_remaining <= 0:
             return _ReplyApprovalCreationResult(
                 blocked_reason="The adaptive hourly card ceiling is full."
@@ -2065,6 +2198,7 @@ class ContentBot:
             )
         requested_batch_size = min(
             5,
+            daily_remaining,
             hourly_remaining,
             queue_slots,
             max(
@@ -2093,48 +2227,103 @@ class ContentBot:
                     "All candidates were removed by per-author or Japanese safety limits."
                 ),
             )
-        strategy_by_url = {
-            result.url: self.reply_learning.choose_strategy()
-            for result in selected
-        }
-        experiment_by_url = {
-            result.url: self.reply_learning.choose_experiment_variant()
-            for result in selected
-        }
-        reply_context = (
-            _summarize_mixed_reply_context(selected)
-            if any(result.has_video for result in selected)
-            and any(not result.has_video for result in selected)
-            else (
-                summarize_reply_video_context(selected, max_items=generation_size)
-                if video_mode
-                else summarize_reply_target_context(selected, max_items=generation_size)
+        def generation_inputs(
+            candidates: list[XSearchResult],
+            attachments: list[ImageAttachment],
+        ) -> tuple[str, dict[str, str], dict[str, str], dict[str, Any]]:
+            strategies = {
+                result.url: self.reply_learning.choose_strategy()
+                for result in candidates
+            }
+            experiments = {
+                result.url: self.reply_learning.choose_experiment_variant()
+                for result in candidates
+            }
+            context = (
+                _summarize_mixed_reply_context(candidates)
+                if any(result.has_video for result in candidates)
+                and any(not result.has_video for result in candidates)
+                else (
+                    summarize_reply_video_context(
+                        candidates,
+                        max_items=generation_size,
+                    )
+                    if video_mode
+                    else summarize_reply_target_context(
+                        candidates,
+                        max_items=generation_size,
+                    )
+                )
             )
+            examples: list[str] = []
+            for result in candidates:
+                source_type = "replyvideo" if result.has_video else "replytargets"
+                for example in self.reply_learning.style_examples(
+                    language=result.language,
+                    source_type=source_type,
+                    limit=2,
+                ):
+                    if example not in examples:
+                        examples.append(example)
+            options: dict[str, Any] = {
+                "strategy_by_url": strategies,
+                "experiment_by_url": experiments,
+                "style_examples": examples[:3],
+            }
+            if video_mode:
+                options["video_mode"] = True
+                options["visual_attachments"] = attachments
+            return context, strategies, experiments, options
+
+        reply_context, strategy_by_url, experiment_by_url, generation_options = (
+            generation_inputs(selected, visual_attachments or [])
         )
-        style_examples: list[str] = []
-        for result in selected:
-            source_type = "replyvideo" if result.has_video else "replytargets"
-            for example in self.reply_learning.style_examples(
-                language=result.language,
-                source_type=source_type,
-                limit=2,
-            ):
-                if example not in style_examples:
-                    style_examples.append(example)
-        generation_options: dict[str, Any] = {
-            "strategy_by_url": strategy_by_url,
-            "experiment_by_url": experiment_by_url,
-            "style_examples": style_examples[:3],
-        }
-        if video_mode:
-            generation_options["video_mode"] = True
-            generation_options["visual_attachments"] = visual_attachments or []
         generation_started = time.monotonic()
-        drafts = await self.ai.generate_reply_targets(
-            query,
-            reply_context,
-            **generation_options,
-        )
+        try:
+            drafts = await self.ai.generate_reply_targets(
+                query,
+                reply_context,
+                **generation_options,
+            )
+        except RuntimeError as exc:
+            if not (
+                video_mode
+                and visual_attachments
+                and _is_gemini_attachment_control_error(exc)
+            ):
+                raise
+            grounded_pool = [
+                result
+                for result in results
+                if result.video_context_quality != "visual_frames"
+            ]
+            grounded, fallback_author_skips, fallback_language_skips = (
+                self._filter_reply_generation_candidates(
+                    _select_diverse_candidates(grounded_pool, len(grounded_pool)),
+                    max_items=generation_size,
+                )
+            )
+            if len(grounded) < MIN_REPLY_TARGET_BATCH_ITEMS:
+                raise
+            LOGGER.warning(
+                "Gemini frame upload control was unavailable; retrying replyvideo "
+                "with %s caption/media-grounded candidates only",
+                len(grounded),
+            )
+            selected = grounded
+            filtered_author_limit += fallback_author_skips
+            filtered_language_limit += fallback_language_skips
+            (
+                reply_context,
+                strategy_by_url,
+                experiment_by_url,
+                generation_options,
+            ) = generation_inputs(selected, [])
+            drafts = await self.ai.generate_reply_targets(
+                query,
+                reply_context,
+                **generation_options,
+            )
         generation_latency_seconds = round(time.monotonic() - generation_started, 1)
         created: list[AutomationApproval] = []
         filtered_active = active_before_generation
@@ -2242,7 +2431,11 @@ class ContentBot:
             - self._pending_reply_delivery_count(),
         )
 
-    def _japanese_reply_slots_remaining(self) -> int | None:
+    def _japanese_reply_slots_remaining(
+        self,
+        *,
+        reserve_pending: bool = False,
+    ) -> int | None:
         guardrails = reply_farming_guardrails(self.revenue_ops.risk_mode)
         if guardrails.japanese_daily_cap is None:
             return None
@@ -2257,11 +2450,20 @@ class ContentBot:
             language="ja",
             since=datetime.now(UTC) - timedelta(hours=1),
         )
+        pending = (
+            _pending_reply_reservations(
+                approvals,
+                language="ja",
+                include_relationship_followups=False,
+            )
+            if reserve_pending
+            else 0
+        )
         return max(
             0,
             min(
-                guardrails.japanese_daily_cap - used_today,
-                (guardrails.japanese_hourly_cap or 0) - used_hour,
+                guardrails.japanese_daily_cap - used_today - pending,
+                (guardrails.japanese_hourly_cap or 0) - used_hour - pending,
             ),
         )
 
@@ -2273,7 +2475,9 @@ class ContentBot:
     ) -> tuple[list[XSearchResult], int, int]:
         """Apply approval-time author/language limits while retaining backups."""
         approvals = self.approvals.items()
-        japanese_slots = self._japanese_reply_slots_remaining()
+        japanese_slots = self._japanese_reply_slots_remaining(
+            reserve_pending=True,
+        )
         selected: list[XSearchResult] = []
         selected_by_author: dict[str, int] = {}
         selected_japanese = 0
@@ -2290,7 +2494,11 @@ class ContentBot:
                 username=author,
                 timezone_name=self.settings.creator_timezone,
             )
-            if author_used + selected_by_author.get(author, 0) >= (
+            author_reserved = _pending_reply_reservations(
+                approvals,
+                username=author,
+            )
+            if author_used + author_reserved + selected_by_author.get(author, 0) >= (
                 self.settings.reply_author_daily_cap
             ):
                 filtered_author_limit += 1
@@ -2459,7 +2667,7 @@ class ContentBot:
             ceiling = max(2, round(ceiling * 0.75))
         return ceiling
 
-    def _hourly_reply_capacity(self) -> int:
+    def _hourly_reply_capacity(self, *, reserve_pending: bool = False) -> int:
         if self.revenue_ops.pace_paused:
             return 0
         ceiling = self._adaptive_hourly_ceiling()
@@ -2467,9 +2675,17 @@ class ContentBot:
             self.approvals.items(),
             since=datetime.now(UTC) - timedelta(hours=1),
         )
+        pending = (
+            _pending_reply_reservations(
+                self.approvals.items(),
+                include_relationship_followups=False,
+            )
+            if reserve_pending
+            else 0
+        )
         return max(
             0,
-            ceiling - used,
+            ceiling - used - pending,
         )
 
     async def _opportunity_status(
@@ -2638,6 +2854,30 @@ class ContentBot:
         )
         if next_card is None:
             return False
+        if global_reply_delivery:
+            safety_block = self._reply_approval_safety_block(next_card)
+            if safety_block:
+                self.approvals.expire(
+                    next_card.id,
+                    error=f"Closed before Telegram delivery: {safety_block}",
+                )
+                self.reply_watch.mark_expired(
+                    next_card.target_url,
+                    reason="approval safety capacity closed before delivery",
+                )
+                LOGGER.info(
+                    "Skipped reply card %s before Telegram delivery: %s",
+                    next_card.id,
+                    safety_block,
+                )
+                return await self._send_next_approval_queue(
+                    queue_id,
+                    queue_key=queue_key,
+                    index_key=index_key,
+                    sent_key=sent_key,
+                    respect_pacing=respect_pacing,
+                    global_reply_delivery=True,
+                )
         if (
             global_reply_delivery
             and datetime.now(UTC) - next_card.created_at
@@ -3202,6 +3442,50 @@ class ContentBot:
             reply_delivery_queue_id = str(
                 (existing.metadata or {}).get("reply_delivery_queue_id") or ""
             )
+            if existing.status == "expired":
+                if existing.chat_id != int(query.message.chat.id):
+                    raise RuntimeError(
+                        "This approval belongs to a different Telegram chat."
+                    )
+                if existing.approver_user_id != int(query.from_user.id):
+                    raise RuntimeError(
+                        "Only the user who requested this draft can close it."
+                    )
+                try:
+                    await query.answer("This card expired and was closed automatically.")
+                    answered = True
+                    original = str(query.message.text or "").strip()
+                    expired_note = (
+                        "Expired. This card was removed from the approval queue "
+                        "automatically. No reply was posted."
+                    )
+                    await query.edit_message_text(
+                        (
+                            original
+                            if expired_note in original
+                            else f"{original}\n\n{expired_note}".strip()
+                        ),
+                        reply_markup=None,
+                    )
+                finally:
+                    # Expiry is a queue event, not negative content feedback.
+                    # Release the next card immediately without applying the
+                    # post-approval pacing delay.
+                    if reply_delivery_queue_id:
+                        await self._send_next_reply_delivery(
+                            reply_delivery_queue_id,
+                            respect_pacing=False,
+                        )
+                    elif (
+                        reply_session_id
+                        and bool(
+                            (existing.metadata or {}).get(
+                                "reply_session_sequential"
+                            )
+                        )
+                    ):
+                        await self._send_next_session_approval(reply_session_id)
+                return
             if decision == "why":
                 await query.answer()
                 answered = True
@@ -3250,7 +3534,41 @@ class ContentBot:
             ):
                 safety_block = self._reply_approval_safety_block(existing)
                 if safety_block:
-                    await query.answer(safety_block, show_alert=True)
+                    self.approvals.expire(
+                        existing.id,
+                        error=f"Closed at approval time: {safety_block}",
+                    )
+                    self.reply_watch.mark_expired(
+                        existing.target_url,
+                        reason="approval safety capacity closed at decision time",
+                    )
+                    try:
+                        await query.answer(
+                            "This card was closed automatically because its safety "
+                            "capacity is no longer available."
+                        )
+                        answered = True
+                        original = str(query.message.text or "").strip()
+                        await query.edit_message_text(
+                            f"{original}\n\nAuto-closed. {safety_block}\n"
+                            "No reply was posted.",
+                            reply_markup=None,
+                        )
+                    finally:
+                        if reply_delivery_queue_id:
+                            await self._send_next_reply_delivery(
+                                reply_delivery_queue_id,
+                                respect_pacing=False,
+                            )
+                        elif (
+                            reply_session_id
+                            and bool(
+                                (existing.metadata or {}).get(
+                                    "reply_session_sequential"
+                                )
+                            )
+                        ):
+                            await self._send_next_session_approval(reply_session_id)
                     return
             approval = self.approvals.decide(
                 approval_id,
@@ -3345,6 +3663,87 @@ class ContentBot:
                         exc_info=True,
                     )
 
+    async def followtargets(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        del context
+        chat = update.effective_chat
+        message = update.effective_message
+        if chat is None or message is None:
+            return
+        if chat.type != "private":
+            await message.reply_text("Use /followtargets in a private chat with this bot.")
+            return
+        await message.chat.send_action(ChatAction.TYPING)
+        status = await message.reply_text(
+            "Finding active Vietnamese Premium accounts you do not already follow..."
+        )
+        try:
+            candidates = await self._discover_follow_targets()
+            if not candidates:
+                await status.edit_text(
+                    "No new Vietnamese Premium follow candidates passed the current "
+                    "network-balance and recent-suggestion checks. The bot did not "
+                    "substitute already-followed accounts."
+                )
+                return
+            await status.edit_text(
+                _follow_target_digest(
+                    candidates,
+                ),
+                reply_markup=_follow_target_keyboard(candidates),
+            )
+            self.follow_target_history.mark_suggested(candidates)
+        except Exception as exc:
+            await status.edit_text(_friendly_error(exc))
+        finally:
+            await self._notify_x_account_errors(message)
+
+    async def _discover_follow_targets(self) -> list[FollowCandidate]:
+        owner = self.settings.x_owner_username.strip().lstrip("@")
+        if not owner:
+            raise RuntimeError(
+                "Set X_OWNER_USERNAME in .env or use /replylearn username @name first."
+            )
+        followed = await self.x_search.owner_following_usernames(owner)
+        excluded = self.follow_target_history.excluded_usernames(
+            cooldown_hours=self.settings.follow_target_cooldown_hours
+        )
+        posts: list[XSearchResult] = []
+        errors: list[str] = []
+        for query in FOLLOW_TARGET_SEARCH_QUERIES:
+            try:
+                posts.extend(
+                    await self.x_search.search(
+                        query,
+                        limit=FOLLOW_TARGET_SEARCH_LIMIT,
+                        product="Latest",
+                    )
+                )
+            except Exception as exc:
+                errors.append(_exception_detail(exc))
+
+        if not posts and errors:
+            raise RuntimeError(
+                "Every Vietnamese follow-candidate search lane failed. "
+                "Check the twscrape account/cookie. "
+                f"First error: {_truncate_text(errors[0], 240)}"
+            )
+        ranked = rank_follow_candidates(
+            posts,
+            owner_username=owner,
+            followed_usernames=followed,
+            excluded_usernames=excluded,
+            min_followers=self.settings.follow_target_min_followers,
+            max_followers=max(
+                self.settings.follow_target_min_followers,
+                self.settings.follow_target_max_followers,
+            ),
+        )
+        return ranked[: self.settings.follow_target_batch_size]
+
     async def trigger_replytargets(self, payload: dict[str, Any]) -> dict[str, Any]:
         query = str(payload.get("query", "")).strip()
         max_age_minutes = _reply_target_max_age_minutes(
@@ -3369,6 +3768,13 @@ class ContentBot:
         return self._spawn_automation(
             "replyvideo",
             lambda: self._run_scheduled_replyvideo(query),
+        )
+
+    async def trigger_followtargets(self, payload: dict[str, Any]) -> dict[str, Any]:
+        del payload
+        return self._spawn_automation(
+            "followtargets",
+            self._run_scheduled_followtargets,
         )
 
     async def next_approved_action(self) -> dict[str, Any] | None:
@@ -3446,6 +3852,28 @@ class ContentBot:
         self._automation_tasks.add(task)
         task.add_done_callback(self._automation_tasks.discard)
         return {"ok": True, "status": "accepted", "kind": kind}
+
+    async def _run_scheduled_followtargets(self) -> None:
+        if self._application is None or self.approval_chat_id is None:
+            raise RuntimeError("Automation chat is not ready.")
+        candidates = await self._discover_follow_targets()
+        if not candidates:
+            await self._application.bot.send_message(
+                chat_id=self.approval_chat_id,
+                text=(
+                    "Scheduled /followtargets found no new eligible Vietnamese Premium "
+                    "accounts. Already-followed and recently suggested accounts were kept out."
+                ),
+            )
+            return
+        await self._application.bot.send_message(
+            chat_id=self.approval_chat_id,
+            text=_follow_target_digest(
+                candidates,
+            ),
+            reply_markup=_follow_target_keyboard(candidates),
+        )
+        self.follow_target_history.mark_suggested(candidates)
 
     async def _run_scheduled_replytargets(
         self,
@@ -4124,7 +4552,7 @@ class ContentBot:
             previous_count = len(results)
             results = _merge_reply_target_search_products(
                 [results, relaxed_results]
-            )[:5]
+            )[:REPLY_TARGET_RANK_POOL_ITEMS]
             if len(results) > previous_count:
                 fallback_level = "relaxed momentum"
 
@@ -4147,7 +4575,7 @@ class ContentBot:
             previous_count = len(results)
             results = _merge_reply_target_search_products(
                 [results, volume_results]
-            )[:5]
+            )[:REPLY_TARGET_RANK_POOL_ITEMS]
             if len(results) > previous_count:
                 fallback_level = (
                     f"volume fallback ({volume_view_floor}+ views when visible)"
@@ -4168,12 +4596,14 @@ class ContentBot:
             previous_count = len(results)
             results = _merge_reply_target_search_products(
                 [results, minimum_batch_results]
-            )[:5]
+            )[:REPLY_TARGET_RANK_POOL_ITEMS]
             if len(results) > previous_count:
                 fallback_level = "minimum-batch fallback (any visible view signal)"
 
+        results = _select_growth_portfolio(results, max_items=5)
         results = await self._enrich_reply_thread_context(results)
         results = self._apply_reply_target_mode(results, selected_mode)
+        results = _select_growth_portfolio(results, max_items=5)
         if results:
             selected_query = search_query_by_url.get(results[0].url, last_search_query)
             if fallback_level:
@@ -4539,6 +4969,9 @@ class ContentBot:
         goal = self.settings.creator_goal
         watched_authors = set(self.revenue_ops.watch_authors())
         risk_mode = self.revenue_ops.risk_mode
+        discovery_daypart, _daypart_label = _creator_daypart(
+            self.settings.creator_timezone
+        )
         for result in results:
             safety = assess_monetization_safety(result)
             if safety.level == MONETIZATION_RED and (
@@ -4614,6 +5047,14 @@ class ContentBot:
                 + affinity * 0.10,
             )
             watched_author = result.username.casefold() in watched_authors
+            author_tier = _reply_author_tier(result.author_followers_count)
+            candidate_age = _candidate_age_minutes(result)
+            age_bucket = _candidate_age_bucket(result)
+            distribution_stage = _distribution_stage(result.view_count)
+            daypart_fit = _daypart_language_fit(
+                result.language,
+                discovery_daypart,
+            )
             if goal == "earn":
                 goal_score = (
                     score * 0.35
@@ -4636,6 +5077,38 @@ class ContentBot:
                     + rankability * 0.20
                     + premium_audience * 0.05
                 )
+            # A growth-stage account converts recognition more efficiently in
+            # mid-tier conversations, while large accounts still supply reach.
+            # Keep these as bounded bonuses so exceptional post-level momentum
+            # can always outrank a weak post from the preferred author tier.
+            tier_bonus = {
+                "mid_8k_50k": 9.0 if goal in {"qualify", "network"} else 6.0,
+                "large_50k_300k": 5.0,
+                "mega_300k_plus": -3.0,
+                "emerging_under_8k": 1.0,
+                "unknown": 0.0,
+            }[author_tier]
+            age_bonus = (
+                8.0
+                if result.created_at_timestamp is not None and candidate_age <= 10
+                else 7.0
+                if result.created_at_timestamp is not None and candidate_age <= 30
+                else 3.0
+                if result.created_at_timestamp is not None and candidate_age <= 60
+                else 2.0
+                if result.momentum_acceleration >= 0.15
+                else 0.0
+            )
+            distribution_bonus = {
+                "early_under_5k": 1.0,
+                "sweet_5k_50k": 6.0,
+                "scaling_50k_250k": 3.0,
+                "mature_250k_1m": 0.0,
+                "mega_1m_plus": -3.0 if result.reply_count >= 50 else 0.0,
+                "unknown": 0.0,
+            }[distribution_stage]
+            goal_score += tier_bonus + age_bonus + distribution_bonus
+            goal_score += daypart_fit * 0.05
             if watched_author:
                 goal_score += 10.0 if goal == "network" else 5.0
             if safety.level == MONETIZATION_YELLOW:
@@ -4663,6 +5136,11 @@ class ContentBot:
                     monetization_risk_reasons=safety.reasons,
                     watched_author=watched_author,
                     goal_score=goal_score,
+                    author_tier=author_tier,
+                    discovery_daypart=discovery_daypart,
+                    daypart_fit_score=daypart_fit,
+                    candidate_age_bucket=age_bucket,
+                    distribution_stage=distribution_stage,
                 )
             )
         return sorted(
@@ -4740,7 +5218,7 @@ class ContentBot:
         ranked = rank_fast_growing_posts(
             available_results,
             # Rank the complete fetched pool, then apply approval-time safety
-            # limits and finally take five. This lets lower-ranked languages
+            # limits and retain a small portfolio pool. This lets lower-ranked languages
             # and authors replace otherwise blocked top results.
             max_items=max(5, len(available_results)),
             max_age_minutes=freshness_minutes,
@@ -4768,7 +5246,10 @@ class ContentBot:
             if not self.approvals.has_active_target(result.url)
         ]
         eligible, _author_skips, _language_skips = (
-            self._filter_reply_generation_candidates(unseen, max_items=5)
+            self._filter_reply_generation_candidates(
+                unseen,
+                max_items=REPLY_TARGET_RANK_POOL_ITEMS,
+            )
         )
         return eligible
 
@@ -4877,6 +5358,34 @@ class ContentBot:
             except Exception:
                 return
 
+def _follow_target_digest(
+    candidates: list[FollowCandidate],
+) -> str:
+    lines = ["Follow candidates"]
+    for index, candidate in enumerate(candidates, start=1):
+        name = candidate.display_name or f"@{candidate.username}"
+        lines.append(
+            f"{index}. {_truncate_text(name, 54)} (@{candidate.username})"
+        )
+    return _truncate_text("\n".join(lines), 4096)
+
+
+def _follow_target_keyboard(
+    candidates: list[FollowCandidate],
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{index}. Open @{candidate.username}",
+                    url=candidate.profile_url,
+                )
+            ]
+            for index, candidate in enumerate(candidates, start=1)
+        ]
+    )
+
+
 def _menu_keyboard(menu_name: str = "main") -> ReplyKeyboardMarkup:
     layout = MENU_LAYOUTS.get(menu_name, MENU_LAYOUTS["main"])
     return ReplyKeyboardMarkup(
@@ -4928,30 +5437,36 @@ def _select_reply_draft_batch(
     if available_slots < minimum_items:
         return [], 0
 
-    selected: list[XSearchResult] = []
+    candidate_pool: list[XSearchResult] = []
     seen: set[str] = set()
-    for result in ready[:available_slots]:
+    for result in ready:
         key = result.url or str(result.id)
         if key in seen:
             continue
         seen.add(key)
-        selected.append(result)
+        candidate_pool.append(result)
 
-    promoted_count = 0
-    if len(selected) < minimum_items:
+    if len(candidate_pool) < minimum_items:
         for result in watching:
             key = result.url or str(result.id)
             if key in seen:
                 continue
             seen.add(key)
-            selected.append(result)
-            promoted_count += 1
-            if len(selected) >= minimum_items:
+            candidate_pool.append(result)
+            if len(candidate_pool) >= minimum_items:
                 break
 
-    if len(selected) < minimum_items:
+    if len(candidate_pool) < minimum_items:
         return [], 0
-    return selected[:available_slots], promoted_count
+    selected = _select_growth_portfolio(
+        candidate_pool,
+        max_items=available_slots,
+    )
+    watching_keys = {result.url or str(result.id) for result in watching}
+    promoted_count = sum(
+        (result.url or str(result.id)) in watching_keys for result in selected
+    )
+    return selected, promoted_count
 
 
 def _reply_tracking_metadata(
@@ -4973,6 +5488,8 @@ def _reply_tracking_metadata(
             "root_author": result.username,
             "root_author_id": result.author_id,
             "root_author_verified": result.author_verified,
+            "root_author_followers": result.author_followers_count,
+            "author_tier": result.author_tier,
             "root_views": result.view_count,
             "root_replies": result.reply_count,
             "reply_opportunity_score": result.reply_opportunity_score,
@@ -4993,6 +5510,10 @@ def _reply_tracking_metadata(
             "monetization_risk_reasons": list(result.monetization_risk_reasons),
             "watched_author": result.watched_author,
             "candidate_age_minutes_at_card": _candidate_age_minutes(result),
+            "candidate_age_bucket": result.candidate_age_bucket,
+            "distribution_stage": result.distribution_stage,
+            "discovery_daypart": result.discovery_daypart,
+            "daypart_fit_score": result.daypart_fit_score,
             "view_velocity_score": result.view_velocity_score,
             "recent_view_velocity_score": result.recent_view_velocity_score,
             "thread_availability_score": result.thread_availability_score,
@@ -5189,6 +5710,10 @@ def _target_explanation(approval: AutomationApproval) -> str:
         f"- Views per competing reply: {float(metadata.get('views_per_reply') or 0.0):,.0f}\n"
         f"- Post age when card was built: "
         f"{float(metadata.get('candidate_age_minutes_at_card') or 0.0):.0f} minutes\n"
+        f"- Author tier: {metadata.get('author_tier') or 'unknown'}\n"
+        f"- Distribution stage: {metadata.get('distribution_stage') or 'unknown'}\n"
+        f"- Audience window: {metadata.get('discovery_daypart') or 'global_offpeak'} "
+        f"(fit {float(metadata.get('daypart_fit_score') or 0.0):.0f}/100)\n"
         f"- Watched author: {watched}\n"
         f"- Revenue safety: {str(metadata.get('monetization_risk_level') or 'green').upper()} "
         f"({risk_reasons})\n"
@@ -5737,6 +6262,42 @@ def _pending_reply_delivery_count(
     )
 
 
+def _pending_reply_reservations(
+    approvals: list[AutomationApproval],
+    *,
+    language: str = "",
+    username: str = "",
+    include_relationship_followups: bool = True,
+) -> int:
+    """Reserve generation capacity without treating pending cards as cap usage."""
+    clean_language = str(language or "").strip().casefold()
+    clean_username = str(username or "").strip().lstrip("@").casefold()
+    return sum(
+        1
+        for approval in approvals
+        if approval.kind == "reply"
+        and approval.status == "pending"
+        and (
+            include_relationship_followups
+            or not bool((approval.metadata or {}).get("relationship_followup"))
+        )
+        and (
+            not clean_language
+            or str((approval.metadata or {}).get("language") or "")
+            .casefold()
+            .startswith(clean_language)
+        )
+        and (
+            not clean_username
+            or str((approval.metadata or {}).get("root_author") or "")
+            .strip()
+            .lstrip("@")
+            .casefold()
+            == clean_username
+        )
+    )
+
+
 def _select_diverse_candidates(
     results: list[XSearchResult],
     limit: int,
@@ -5794,6 +6355,83 @@ def _candidate_age_minutes(result: XSearchResult) -> float:
         max(0.0, (datetime.now(UTC).timestamp() - result.created_at_timestamp) / 60),
         1,
     )
+
+
+def _reply_author_tier(followers: int | None) -> str:
+    if followers is None:
+        return "unknown"
+    if followers < 8_000:
+        return "emerging_under_8k"
+    if followers < 50_000:
+        return "mid_8k_50k"
+    if followers < 300_000:
+        return "large_50k_300k"
+    return "mega_300k_plus"
+
+
+def _candidate_age_bucket(result: XSearchResult) -> str:
+    if result.created_at_timestamp is None:
+        return "unknown"
+    age = _candidate_age_minutes(result)
+    if age <= 10:
+        return "0_10m"
+    if age <= 30:
+        return "10_30m"
+    if age <= 60:
+        return "30_60m"
+    if age <= 120:
+        return "1_2h"
+    return "2h_plus"
+
+
+def _distribution_stage(views: int | None) -> str:
+    if views is None:
+        return "unknown"
+    if views < 5_000:
+        return "early_under_5k"
+    if views < 50_000:
+        return "sweet_5k_50k"
+    if views < 250_000:
+        return "scaling_50k_250k"
+    if views < 1_000_000:
+        return "mature_250k_1m"
+    return "mega_1m_plus"
+
+
+def _creator_daypart(
+    timezone_name: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, str]:
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone = UTC
+    local_now = (now or datetime.now(UTC)).astimezone(timezone)
+    hour = local_now.hour + local_now.minute / 60
+    if 7 <= hour < 11:
+        return "asia_morning", "Asia/Japan morning (07:00-11:00)"
+    if 14 <= hour < 17:
+        return "europe_afternoon", "Europe afternoon (14:00-17:00)"
+    if 20 <= hour < 23.5:
+        return "us_evening", "US evening (20:00-23:30)"
+    return "global_offpeak", "global/off-peak exploration"
+
+
+def _daypart_language_fit(language: str, daypart: str) -> float:
+    code = str(language or "").strip().casefold()
+    preferred = {
+        "asia_morning": {
+            "ja", "ko", "vi", "zh-cn", "zh-tw", "id", "th",
+        },
+        "europe_afternoon": {
+            "en", "de", "fr", "es", "it", "pt", "nl", "pl",
+        },
+        "us_evening": {"en", "es", "pt"},
+    }.get(daypart, set())
+    if not preferred:
+        return 0.0
+    return 100.0 if code in preferred else 20.0
 
 
 def _parse_report_days(raw: str, *, allowed: tuple[int, ...]) -> int:
@@ -5864,7 +6502,11 @@ def _select_session_mix(
     share = max(0.20, min(0.80, float(video_share)))
     video_slots = min(len(videos), max(1, round(limit * share)))
     target_slots = min(len(targets), limit - video_slots)
-    selected = videos[:video_slots] + targets[:target_slots]
+    selected_targets = _select_growth_portfolio(
+        targets,
+        max_items=target_slots,
+    )
+    selected = videos[:video_slots] + selected_targets
     relationship_pool = sorted(
         [
             result
@@ -5894,7 +6536,7 @@ def _select_session_mix(
         )
         selected[selected.index(weakest)] = relationship_pool[0]
     pool = sorted(
-        [*videos[video_slots:], *targets[target_slots:]],
+        [*videos[video_slots:], *targets],
         key=lambda result: (
             result.goal_score or result.reply_opportunity_score,
             result.rankability_score,
@@ -5918,6 +6560,54 @@ def _select_session_mix(
             result.rankability_score,
         ),
         reverse=True,
+    )
+
+
+def _select_growth_portfolio(
+    results: list[XSearchResult],
+    *,
+    max_items: int,
+) -> list[XSearchResult]:
+    """Balance follower conversion, reach, and one unconstrained breakout lane."""
+    limit = max(0, min(max_items, len(results)))
+    if limit == 0:
+        return []
+    ordered: list[XSearchResult] = []
+    seen: set[str] = set()
+    for result in results:
+        key = result.url or str(result.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(result)
+    limit = min(limit, len(ordered))
+    mid_slots = 1 if limit <= 3 else 2
+    large_slots = 1 if limit <= 4 else 2
+    selected: list[XSearchResult] = []
+
+    def take(tier: str, count: int) -> None:
+        for result in ordered:
+            if len([item for item in selected if _reply_author_tier(
+                item.author_followers_count
+            ) == tier]) >= count:
+                break
+            if result in selected:
+                continue
+            if _reply_author_tier(result.author_followers_count) == tier:
+                selected.append(result)
+
+    take("mid_8k_50k", mid_slots)
+    take("large_50k_300k", large_slots)
+    for result in ordered:
+        if result not in selected:
+            selected.append(result)
+        if len(selected) >= limit:
+            break
+    selected = selected[:limit]
+    order = {result.url or str(result.id): index for index, result in enumerate(ordered)}
+    return sorted(
+        selected,
+        key=lambda result: order[result.url or str(result.id)],
     )
 
 
@@ -5946,8 +6636,28 @@ def _format_performance_dimension(
 ) -> str:
     if not values:
         return "- Not enough measured data"
+    labels = {
+        "emerging_under_8k": "Emerging (<8k followers)",
+        "mid_8k_50k": "Mid-tier (8k-50k)",
+        "large_50k_300k": "Large (50k-300k)",
+        "mega_300k_plus": "Mega (300k+)",
+        "0_10m": "0-10 minutes",
+        "10_30m": "10-30 minutes",
+        "30_60m": "30-60 minutes",
+        "1_2h": "1-2 hours",
+        "2h_plus": "2+ hours",
+        "early_under_5k": "Early (<5k root views)",
+        "sweet_5k_50k": "Sweet spot (5k-50k root views)",
+        "scaling_50k_250k": "Scaling (50k-250k root views)",
+        "mature_250k_1m": "Mature (250k-1m root views)",
+        "mega_1m_plus": "Mega (1m+ root views)",
+        "asia_morning": "Asia/Japan morning",
+        "europe_afternoon": "Europe afternoon",
+        "us_evening": "US evening",
+        "global_offpeak": "Global/off-peak",
+    }
     return "\n".join(
-        f"- {name}: n={int(stats['count'])}, score "
+        f"- {labels.get(str(name), str(name))}: n={int(stats['count'])}, score "
         f"{float(stats['average_score']):.1f}, median {int(stats['median_views']):,} views"
         for name, stats in list(values.items())[:limit]
     )
@@ -5970,10 +6680,15 @@ def _performance_recommendation(report: dict[str, Any]) -> str:
         return "Keep collecting outcomes; at least 10 measured replies are needed for a stable split."
     languages = report.get("by_language") or {}
     sources = report.get("by_source") or {}
+    tiers = report.get("by_author_tier") or {}
+    age_buckets = report.get("by_age_bucket") or {}
     best_language = next(iter(languages), "current languages")
     best_source = next(iter(sources), "current source mix")
+    best_tier = next(iter(tiers), "current author tiers")
+    best_age = next(iter(age_buckets), "current post ages")
     return (
-        f"Allocate about 15% more exploration to {best_language} and {best_source}, "
+        f"Allocate about 15% more exploration to {best_language}, {best_source}, "
+        f"{best_tier}, and {best_age}, "
         "while retaining at least 10% exploration elsewhere."
     )
 
@@ -6041,6 +6756,18 @@ def _format_x_account_error_notification(account_name: str, error: str) -> str:
     )
 
 
+def _is_gemini_attachment_control_error(exc: Exception) -> bool:
+    detail = _exception_detail(exc).casefold()
+    return any(
+        marker in detail
+        for marker in (
+            "gemini image file input was not found",
+            "gemini did not confirm the uploaded representative frames",
+            "image attachment upload failed",
+        )
+    )
+
+
 def _friendly_error(exc: Exception) -> str:
     text = _exception_detail(exc)
     if exc.__traceback__ is not None:
@@ -6082,16 +6809,18 @@ def _friendly_error(exc: Exception) -> str:
         detail = _strip_exception_prefix(text).removesuffix(" <- TimeoutError")
         return (
             f"{detail}\n\n"
-            "Reload Chrome extension 0.8.8 or newer. It bounds a stalled Gemini "
+            "Reload Chrome extension 0.9.0 or newer. It bounds a stalled Gemini "
             "attempt and retries once on a fresh managed tab instead of trusting "
             "heartbeat activity alone."
         )
     if "gemini image file input was not found" in text.lower():
         return (
-            "Gemini's attachment control was not detected. Reload Chrome extension "
-            "version 0.8.1 or newer, keep one signed-in Gemini tab open, and retry "
-            "/replyvideo. The bridge endpoint itself is working because Chrome already "
-            "claimed this job. "
+            "Gemini's attachment control was not detected after a fresh-tab retry. "
+            "Reload Chrome extension version 0.9.0 or newer and keep one signed-in "
+            "Gemini tab open. Caption/media-grounded video candidates are retried "
+            "without frame attachments automatically; this error remains only when "
+            "fewer than two safe fallback candidates are available. The bridge endpoint "
+            "itself is working because Chrome already claimed this job. "
             f"Details: {text}"
         )
     if (

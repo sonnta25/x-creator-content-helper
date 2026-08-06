@@ -44,7 +44,14 @@ class XSearchResult:
     like_count: int = 0
     view_count: int | None = None
     author_followers_count: int | None = None
+    author_following_count: int | None = None
+    author_statuses_count: int | None = None
     author_verified: bool = False
+    author_blue_verified: bool = False
+    author_blue_type: str = ""
+    author_description: str = ""
+    author_location: str = ""
+    author_protected: bool = False
     velocity_score: float = 0.0
     view_velocity_score: float = 0.0
     engagement_rate: float = 0.0
@@ -84,6 +91,30 @@ class XSearchResult:
     monetization_risk_reasons: tuple[str, ...] = ()
     watched_author: bool = False
     goal_score: float = 0.0
+    author_tier: str = "unknown"
+    discovery_daypart: str = "global_offpeak"
+    daypart_fit_score: float = 0.0
+    candidate_age_bucket: str = "unknown"
+    distribution_stage: str = "unknown"
+
+
+@dataclass(frozen=True)
+class FollowCandidate:
+    user_id: int
+    username: str
+    display_name: str
+    description: str
+    location: str
+    followers: int
+    following: int
+    statuses: int
+    profile_url: str
+    source_post_url: str
+    source_post_text: str
+    source_post_created_at: str
+    ratio: float
+    score: float
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

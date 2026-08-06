@@ -250,6 +250,8 @@ def test_replytargets_prompt_does_not_force_creator_niche() -> None:
     assert "natural Japanese for a Japanese post" in service.last_prompt
     assert "same language as its candidate post" in service.last_prompt
     assert "original author can actually answer" in service.last_prompt
+    assert "8k-50k mid-tier author" in service.last_prompt
+    assert "credible peer" in service.last_prompt
     assert "source_summary_vi" in service.last_prompt
     assert "reply_translation_vi" in service.last_prompt
     assert "Vietnamese source summary" in service.last_prompt

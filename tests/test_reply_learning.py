@@ -316,6 +316,11 @@ def test_style_memory_and_multidimensional_report_use_real_posted_replies(tmp_pa
                 "language": "ja" if index < 3 else "en",
                 "source_type": "replyvideo" if index < 3 else "replytargets",
                 "creator_timezone": "Asia/Ho_Chi_Minh",
+                "root_author_followers": 20_000 if index < 3 else 100_000,
+                "author_tier": "mid_8k_50k" if index < 3 else "large_50k_300k",
+                "candidate_age_bucket": "10_30m",
+                "distribution_stage": "sweet_5k_50k",
+                "discovery_daypart": "asia_morning" if index < 3 else "us_evening",
             }
         )
         store.register_approval(approval)
@@ -350,6 +355,10 @@ def test_style_memory_and_multidimensional_report_use_real_posted_replies(tmp_pa
     assert report["over_20k"] == 3
     assert report["by_language"]["ja"]["count"] == 3
     assert report["by_source"]["replyvideo"]["count"] == 3
+    assert report["by_author_tier"]["mid_8k_50k"]["count"] == 3
+    assert report["by_age_bucket"]["10_30m"]["count"] == 5
+    assert report["by_distribution_stage"]["sweet_5k_50k"]["count"] == 5
+    assert report["by_daypart"]["asia_morning"]["count"] == 3
     assert report["by_hour_local"]
     assert store.performance_adjustment(
         language="ja",
@@ -431,6 +440,8 @@ def test_author_portfolios_expose_auto_watch_signals(tmp_path) -> None:
         {
             "verified_audience_proxy": 65,
             "monetization_risk_level": "green",
+            "root_author_followers": 25_000,
+            "author_tier": "mid_8k_50k",
         }
     )
     store.register_approval(approval)
@@ -456,5 +467,7 @@ def test_author_portfolios_expose_auto_watch_signals(tmp_path) -> None:
     assert rows[0]["username"] == "source"
     assert rows[0]["median_views"] == 25_000
     assert rows[0]["verified_audience_proxy"] == 65
+    assert rows[0]["author_followers"] == 25_000
+    assert rows[0]["author_tier"] == "mid_8k_50k"
     assert rows[0]["green_rate"] == 1.0
     assert rows[0]["last_interaction_at"] == posted.created_at

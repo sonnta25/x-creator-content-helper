@@ -469,8 +469,14 @@ def test_to_search_result_captures_author_reach() -> None:
         username = "large"
         displayname = "Large Account"
         followersCount = 250_000
+        friendsCount = 200_000
+        statusesCount = 12_000
+        rawDescription = "Vietnamese creator"
+        location = "Vietnam"
+        protected = False
         verified = True
-        blue = False
+        blue = True
+        blueType = None
 
     class Tweet:
         id = 22
@@ -489,10 +495,46 @@ def test_to_search_result_captures_author_reach() -> None:
     result = _to_search_result(Tweet())
 
     assert result.author_followers_count == 250_000
+    assert result.author_following_count == 200_000
+    assert result.author_statuses_count == 12_000
     assert result.author_verified is True
+    assert result.author_blue_verified is True
+    assert result.author_blue_type == ""
+    assert result.author_description == "Vietnamese creator"
+    assert result.author_location == "Vietnam"
+    assert result.author_protected is False
     assert result.author_id == 7
     assert result.conversation_id == 22
     assert result.in_reply_to_tweet_id == 11
+
+
+def test_owner_following_usernames_is_cached() -> None:
+    class FakeAPI:
+        calls = 0
+
+        async def user_by_login(self, username):
+            return SimpleNamespace(id=7, username=username, friendsCount=2)
+
+        def following(self, user_id, limit):
+            del user_id, limit
+            self.calls += 1
+
+            async def stream():
+                yield SimpleNamespace(username="First")
+                yield SimpleNamespace(username="Second")
+
+            return stream()
+
+    service = XSearchService(Settings(telegram_bot_token="123:ABC"))
+    fake = FakeAPI()
+    service._api = fake
+
+    first = asyncio.run(service.owner_following_usernames("Owner"))
+    second = asyncio.run(service.owner_following_usernames("Owner"))
+
+    assert first == {"owner", "first", "second"}
+    assert second == first
+    assert fake.calls == 1
 
 
 def test_to_search_result_marks_video_and_keeps_exposed_alt_text() -> None:

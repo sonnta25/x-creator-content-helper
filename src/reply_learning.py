@@ -152,6 +152,8 @@ class ReplyLearningStore:
             "root_author": str(metadata.get("root_author") or ""),
             "root_author_id": metadata.get("root_author_id"),
             "root_author_verified": bool(metadata.get("root_author_verified")),
+            "root_author_followers": metadata.get("root_author_followers"),
+            "author_tier": str(metadata.get("author_tier") or "unknown"),
             "root_views_at_approval": metadata.get("root_views"),
             "root_replies_at_approval": metadata.get("root_replies"),
             "source_type": str(metadata.get("source_type") or "replytargets"),
@@ -178,6 +180,16 @@ class ReplyLearningStore:
             "candidate_age_minutes_at_card": float(
                 metadata.get("candidate_age_minutes_at_card") or 0.0
             ),
+            "candidate_age_bucket": str(
+                metadata.get("candidate_age_bucket") or "unknown"
+            ),
+            "distribution_stage": str(
+                metadata.get("distribution_stage") or "unknown"
+            ),
+            "discovery_daypart": str(
+                metadata.get("discovery_daypart") or "global_offpeak"
+            ),
+            "daypart_fit_score": float(metadata.get("daypart_fit_score") or 0.0),
             "approval_latency_seconds": float(
                 metadata.get("approval_latency_seconds") or 0.0
             ),
@@ -806,6 +818,13 @@ class ReplyLearningStore:
             "by_source": _dimension_report(measured, "source_type"),
             "by_experiment": _dimension_report(measured, "experiment_variant"),
             "by_risk": _dimension_report(measured, "monetization_risk_level"),
+            "by_author_tier": _dimension_report(measured, "author_tier"),
+            "by_age_bucket": _dimension_report(measured, "candidate_age_bucket"),
+            "by_distribution_stage": _dimension_report(
+                measured,
+                "distribution_stage",
+            ),
+            "by_daypart": _dimension_report(measured, "discovery_daypart"),
             "by_hour_utc": _dimension_report(measured, "posted_hour_utc"),
             "by_hour_local": _dimension_report(measured, "posted_hour_local"),
             "posts": sum(row.get("kind") == "post" for row in rows),
@@ -836,6 +855,11 @@ class ReplyLearningStore:
             if row.get("snapshots")
         ]
         proxies = [float(row.get("verified_audience_proxy") or 0.0) for row in rows]
+        follower_samples = [
+            int(row.get("root_author_followers") or 0)
+            for row in rows
+            if int(row.get("root_author_followers") or 0) > 0
+        ]
         interaction_dates = [
             max(
                 _parse_datetime(row.get("posted_at")),
@@ -860,6 +884,12 @@ class ReplyLearningStore:
             ),
             "verified_audience_proxy": (
                 sum(proxies) / len(proxies) if proxies else 0.0
+            ),
+            "author_followers": (
+                int(statistics.median(follower_samples)) if follower_samples else 0
+            ),
+            "author_tier": _author_tier_from_followers(
+                int(statistics.median(follower_samples)) if follower_samples else 0
             ),
             "relationship_strength": self.relationship_strength(clean),
             "green_rate": green_count / len(rows) if rows else 0.0,
@@ -1014,6 +1044,18 @@ def _dimension_report(
             reverse=True,
         )
     )
+
+
+def _author_tier_from_followers(followers: int) -> str:
+    if followers <= 0:
+        return "unknown"
+    if followers < 8_000:
+        return "emerging_under_8k"
+    if followers < 50_000:
+        return "mid_8k_50k"
+    if followers < 300_000:
+        return "large_50k_300k"
+    return "mega_300k_plus"
 
 
 def _outcome_score(record: dict[str, Any], snapshot: dict[str, Any]) -> float:

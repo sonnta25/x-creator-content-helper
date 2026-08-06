@@ -22,6 +22,8 @@ from src.bot import (
     MENU_GOAL_NETWORK,
     MENU_GOAL_QUALIFY,
     MENU_GOAL_SHOW,
+    MENU_FOLLOW_SCHEDULE,
+    MENU_FOLLOW_TARGETS,
     MENU_PACE,
     MENU_PACE_ADAPTIVE,
     MENU_PACE_CONSERVATIVE,
@@ -51,6 +53,8 @@ from src.bot import (
     _format_reply_target_link,
     _format_reply_target_reply,
     _format_x_account_error_notification,
+    _follow_target_digest,
+    _follow_target_keyboard,
     _no_reply_targets_message,
     _approval_message_text,
     _approval_keyboard,
@@ -67,6 +71,12 @@ from src.bot import (
     _video_context_quality,
     _is_reliable_video_context_text,
     _is_semantic_duplicate,
+    _candidate_age_bucket,
+    _creator_daypart,
+    _daypart_language_fit,
+    _distribution_stage,
+    _reply_author_tier,
+    _select_growth_portfolio,
     _select_reply_draft_batch,
     _select_reply_video_mix,
     _select_session_mix,
@@ -76,12 +86,44 @@ from src.bot import (
 from src.config import Settings
 from src.media_download_service import DownloadedMedia
 from src.models import (
+    FollowCandidate,
     ImageAttachment,
     ReplyRevision,
     ReplyTargetDraft,
     XSearchResult,
     XTrend,
 )
+
+
+def test_follow_target_card_is_only_a_compact_profile_list() -> None:
+    candidate = FollowCandidate(
+        user_id=1,
+        username="vietcreator",
+        display_name="Viet Creator",
+        description="",
+        location="Vietnam",
+        followers=1_000,
+        following=900,
+        statuses=100,
+        profile_url="https://x.com/vietcreator",
+        source_post_url="https://x.com/vietcreator/status/1",
+        source_post_text="Recent post",
+        source_post_created_at="2026-08-06T00:00:00+00:00",
+        ratio=0.9,
+        score=90,
+        reasons=("Premium", "active in Vietnamese"),
+    )
+
+    text = _follow_target_digest([candidate])
+    keyboard = _follow_target_keyboard([candidate])
+
+    assert text == "Follow candidates\n1. Viet Creator (@vietcreator)"
+    assert "Why:" not in text
+    assert "followers" not in text
+    assert "recent" not in text.lower()
+    assert len(keyboard.inline_keyboard) == 1
+    assert len(keyboard.inline_keyboard[0]) == 1
+    assert keyboard.inline_keyboard[0][0].url == "https://x.com/vietcreator"
 
 
 def test_parse_importcookie_args_default_account() -> None:
@@ -101,6 +143,110 @@ def test_content_rejection_does_not_pause_infrastructure_health_circuit() -> Non
     assert _counts_toward_health_circuit_breaker(
         RuntimeError("Extension bridge timed out waiting for Chrome")
     )
+
+
+def test_growth_stage_classification_and_daypart_windows() -> None:
+    assert _reply_author_tier(7_999) == "emerging_under_8k"
+    assert _reply_author_tier(8_000) == "mid_8k_50k"
+    assert _reply_author_tier(50_000) == "large_50k_300k"
+    assert _reply_author_tier(300_000) == "mega_300k_plus"
+    assert _distribution_stage(5_000) == "sweet_5k_50k"
+    assert _distribution_stage(1_000_000) == "mega_1m_plus"
+
+    daypart, _label = _creator_daypart(
+        "Asia/Ho_Chi_Minh",
+        now=datetime(2026, 8, 6, 1, 0, tzinfo=UTC),
+    )
+    assert daypart == "asia_morning"
+    assert _daypart_language_fit("ja", daypart) == 100
+    assert _daypart_language_fit("en", daypart) == 20
+
+
+def test_growth_portfolio_reserves_mid_large_and_breakout_lanes() -> None:
+    follower_counts = [600_000, 700_000, 20_000, 100_000, 30_000, 200_000]
+    results = [
+        XSearchResult(
+            id=index + 1,
+            username=f"author{index}",
+            display_name="Author",
+            text="Specific post",
+            created_at="",
+            url=f"https://x.com/author{index}/status/{index + 1}",
+            author_followers_count=followers,
+            reply_opportunity_score=100 - index,
+        )
+        for index, followers in enumerate(follower_counts)
+    ]
+
+    selected = _select_growth_portfolio(results, max_items=5)
+    tiers = [_reply_author_tier(item.author_followers_count) for item in selected]
+
+    assert tiers.count("mid_8k_50k") == 2
+    assert tiers.count("large_50k_300k") == 2
+    assert tiers.count("mega_300k_plus") == 1
+
+
+def test_growth_stage_scoring_prefers_mid_tier_when_post_quality_is_equal() -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            creator_goal="qualify",
+        )
+    )
+    common = {
+        "display_name": "Author",
+        "text": "A specific AI workflow improvement",
+        "created_at": "",
+        "language": "en",
+        "reply_opportunity_score": 70.0,
+        "viral_score": 70.0,
+        "thread_availability_score": 70.0,
+    }
+    mega = XSearchResult(
+        id=1,
+        username="mega",
+        url="https://x.com/mega/status/1",
+        author_followers_count=500_000,
+        **common,
+    )
+    mid = XSearchResult(
+        id=2,
+        username="mid",
+        url="https://x.com/mid/status/2",
+        author_followers_count=20_000,
+        **common,
+    )
+
+    ranked = bot._apply_reply_target_mode([mega, mid], "balanced")
+
+    assert ranked[0].username == "mid"
+    assert ranked[0].author_tier == "mid_8k_50k"
+    assert ranked[0].reply_opportunity_score > ranked[1].reply_opportunity_score
+
+
+def test_candidate_age_bucket_keeps_early_and_late_breakouts_distinct() -> None:
+    now = datetime.now(UTC)
+    early = XSearchResult(
+        id=1,
+        username="early",
+        display_name="Early",
+        text="Early breakout",
+        created_at=now.isoformat(),
+        url="https://x.com/early/status/1",
+        created_at_timestamp=int((now - timedelta(minutes=20)).timestamp()),
+    )
+    late = XSearchResult(
+        id=2,
+        username="late",
+        display_name="Late",
+        text="Late breakout",
+        created_at=now.isoformat(),
+        url="https://x.com/late/status/2",
+        created_at_timestamp=int((now - timedelta(hours=3)).timestamp()),
+    )
+
+    assert _candidate_age_bucket(early) == "10_30m"
+    assert _candidate_age_bucket(late) == "2h_plus"
 
 
 def test_parse_importcookie_args_named_account() -> None:
@@ -139,7 +285,7 @@ def test_removed_commands_are_not_registered_in_telegram_menu() -> None:
     }.isdisjoint(commands)
     assert {
         "start", "menu", "help", "download", "replytargets", "replyvideo",
-        "reply", "replyevery", "videoevery", "replybatch", "replylangs",
+        "followtargets", "reply", "replyevery", "videoevery", "followevery", "replybatch", "replylangs",
         "replylearn", "replyreport", "setupcheck", "cancel", "session",
         "inbox", "replygoal", "replycap",
         "watchauthor", "money", "risk", "pace", "experiments",
@@ -154,9 +300,13 @@ def test_grouped_menu_keeps_replyvideo_and_automation_controls() -> None:
     assert MENU_REPLY_TARGETS in MENU_LAYOUTS["reply"][0]
     assert MENU_REPLY_VIDEO in MENU_LAYOUTS["reply"][0]
     assert MENU_VIDEO_SCHEDULE in MENU_LAYOUTS["automation"][0]
-    assert MENU_REPLY_BATCH in MENU_LAYOUTS["automation"][1]
+    assert any(MENU_FOLLOW_SCHEDULE in row for row in MENU_LAYOUTS["automation"])
+    assert any(MENU_REPLY_BATCH in row for row in MENU_LAYOUTS["automation"])
+    assert any(MENU_FOLLOW_TARGETS in row for row in MENU_LAYOUTS["creator"])
     assert MENU_ACTIONS[MENU_REPLY_VIDEO] == ("command", "replyvideo")
     assert MENU_ACTIONS[MENU_VIDEO_SCHEDULE] == ("command", "videoevery")
+    assert MENU_ACTIONS[MENU_FOLLOW_TARGETS] == ("command", "followtargets")
+    assert MENU_ACTIONS[MENU_FOLLOW_SCHEDULE] == ("command", "followevery")
 
 
 def test_reply_safety_menu_exposes_every_mode_as_a_button() -> None:
@@ -464,6 +614,132 @@ def test_strict_risk_spreads_japanese_approvals_to_two_per_hour(tmp_path) -> Non
             destination="mobile",
         )
         assert bot._japanese_reply_slots_remaining() == 1 - index
+
+
+def test_pending_japanese_cards_reserve_generation_slots_without_counting_usage(
+    tmp_path,
+) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    bot.revenue_ops.set_risk_mode("strict")
+    for index in range(2):
+        bot.approvals.create(
+            kind="reply",
+            text=f"Reserved Japanese reply {index}",
+            chat_id=1,
+            approver_user_id=1,
+            metadata={
+                "language": "ja",
+                "root_author": f"reserved-author-{index}",
+                "reply_delivery_queue_id": "reserved-batch",
+            },
+        )
+
+    assert bot._japanese_reply_slots_remaining() == 2
+    assert bot._japanese_reply_slots_remaining(reserve_pending=True) == 0
+
+    candidates = [
+        XSearchResult(
+            id=1,
+            username="new-ja",
+            display_name="Japanese",
+            text="Japanese candidate",
+            created_at="",
+            url="https://x.com/new-ja/status/1",
+            language="ja",
+        ),
+        XSearchResult(
+            id=2,
+            username="new-en",
+            display_name="English",
+            text="English candidate",
+            created_at="",
+            url="https://x.com/new-en/status/2",
+            language="en",
+        ),
+    ]
+    selected, _author_skips, language_skips = (
+        bot._filter_reply_generation_candidates(candidates)
+    )
+
+    assert [item.language for item in selected] == ["en"]
+    assert language_skips == 1
+
+
+def test_delivery_expires_safety_blocked_card_before_telegram(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    bot.revenue_ops.set_risk_mode("strict")
+    for index in range(2):
+        approved = bot.approvals.create(
+            kind="reply",
+            text=f"Approved Japanese reply {index}",
+            chat_id=1,
+            approver_user_id=1,
+            metadata={"language": "ja", "root_author": f"approved-{index}"},
+        )
+        bot.approvals.decide(
+            approved.id,
+            approve=True,
+            chat_id=1,
+            user_id=1,
+            destination="mobile",
+        )
+    blocked = bot.approvals.create(
+        kind="reply",
+        text="Blocked Japanese reply",
+        chat_id=1,
+        approver_user_id=1,
+        target_url="https://x.com/blocked/status/10",
+        metadata={
+            "language": "ja",
+            "root_author": "blocked",
+            "reply_delivery_queue_id": "mixed-batch",
+            "reply_delivery_queue_index": 0,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    allowed = bot.approvals.create(
+        kind="reply",
+        text="Allowed English reply",
+        chat_id=1,
+        approver_user_id=1,
+        target_url="https://x.com/allowed/status/11",
+        metadata={
+            "language": "en",
+            "root_author": "allowed",
+            "reply_delivery_queue_id": "mixed-batch",
+            "reply_delivery_queue_index": 1,
+            "reply_delivery_card_sent": False,
+        },
+    )
+    sent = []
+
+    async def send(approval):
+        sent.append(approval.id)
+        return SimpleNamespace(message_id=99)
+
+    bot._send_approval = send
+
+    asyncio.run(bot._send_next_reply_delivery("mixed-batch", respect_pacing=False))
+
+    assert bot.approvals.get(blocked.id).status == "expired"
+    assert sent == [allowed.id]
+    assert bot.approvals.get(allowed.id).metadata["reply_delivery_card_sent"] is True
 
 
 def test_natural_spacing_delays_delivery_without_blocking_approval(tmp_path) -> None:
@@ -1074,6 +1350,112 @@ def test_full_pending_queue_skips_gemini_generation(tmp_path) -> None:
     assert "global reply-card queue" in result.diagnostic()
 
 
+def test_replyvideo_falls_back_to_grounded_text_when_gemini_upload_control_fails(
+    tmp_path,
+) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    calls = []
+
+    class UploadFailThenGroundedAI:
+        async def generate_reply_targets(self, _query, context, **kwargs):
+            calls.append((context, kwargs.get("visual_attachments", [])))
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Gemini image file input was not found. url=https://gemini.google.com/app"
+                )
+            assert "visual/status/1" not in context
+            return [
+                ReplyTargetDraft(
+                    url="https://x.com/caption/status/2",
+                    target="@caption - grounded video",
+                    reply="The clean framing makes the result immediately readable.",
+                ),
+                ReplyTargetDraft(
+                    url="https://x.com/media/status/3",
+                    target="@media - described video",
+                    reply="That contrast is the detail that gives the clip its payoff.",
+                ),
+            ]
+
+    async def opportunity_open(_result, *, video_mode):
+        assert video_mode is True
+        return True, ""
+
+    async def release(_queue_id, *, respect_pacing):
+        assert respect_pacing is True
+        return True
+
+    bot.ai = UploadFailThenGroundedAI()
+    bot._opportunity_status = opportunity_open
+    bot._send_next_reply_delivery = release
+    candidates = [
+        XSearchResult(
+            id=1,
+            username="visual",
+            display_name="Visual",
+            text="",
+            created_at="",
+            url="https://x.com/visual/status/1",
+            language="en",
+            has_video=True,
+            video_context_quality="visual_frames",
+            visual_frame_names=["frame-01.jpg", "frame-02.jpg"],
+        ),
+        XSearchResult(
+            id=2,
+            username="caption",
+            display_name="Caption",
+            text="A runner catches the falling baton",
+            created_at="",
+            url="https://x.com/caption/status/2",
+            language="en",
+            has_video=True,
+            video_context_quality="caption_only",
+        ),
+        XSearchResult(
+            id=3,
+            username="media",
+            display_name="Media",
+            text="A before-and-after demonstration",
+            created_at="",
+            url="https://x.com/media/status/3",
+            language="en",
+            has_video=True,
+            video_context_quality="grounded_text",
+        ),
+    ]
+
+    result = asyncio.run(
+        bot._create_reply_approvals(
+            candidates,
+            query="viral video",
+            chat_id=1,
+            approver_user_id=1,
+            video_mode=True,
+            visual_attachments=[
+                ImageAttachment("frame-01.jpg", "image/jpeg", b"frame")
+            ],
+        )
+    )
+
+    assert result.created == 2
+    assert len(calls) == 2
+    assert len(calls[0][1]) == 1
+    assert calls[1][1] == []
+    assert {item.target_url for item in bot.approvals.items()} == {
+        "https://x.com/caption/status/2",
+        "https://x.com/media/status/3",
+    }
+
+
 def test_tracking_cycle_budget_prioritizes_recent_responses_and_checkpoints() -> None:
     bot = ContentBot(
         Settings(
@@ -1470,6 +1852,8 @@ def test_automation_config_exposes_telegram_reply_interval() -> None:
         "reply_targets_updated_at": None,
         "reply_video_minutes": None,
         "reply_video_updated_at": None,
+        "follow_targets_minutes": None,
+        "follow_targets_updated_at": None,
         "automation_running": False,
         "creator_timezone": "Asia/Ho_Chi_Minh",
         "reply_target_languages": "en,ja",
@@ -2183,6 +2567,152 @@ def test_stop_here_marks_the_parent_conversation_stopped(tmp_path) -> None:
     assert bot.approvals.get(followup.id).status == "rejected"
     assert bot.reply_learning.data["records"][parent.id]["conversation_stopped"] is True
     assert "Conversation stopped" in edits[0][0][0]
+
+
+def test_expired_card_is_closed_and_releases_queue_without_negative_feedback(
+    tmp_path,
+) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+        )
+    )
+    approval = bot.approvals.create(
+        kind="reply",
+        text="A now-expired draft",
+        chat_id=123,
+        approver_user_id=456,
+        target_url="https://x.com/source/status/42",
+        metadata={
+            "reply_strategy": "specific_observation",
+            "root_author": "source",
+            "reply_delivery_queue_id": "expired-batch",
+            "reply_delivery_queue_index": 0,
+            "reply_delivery_card_sent": True,
+        },
+    )
+    approval.created_at = datetime.now(UTC) - timedelta(minutes=31)
+    released = []
+    feedback = []
+    answers = []
+    edits = []
+
+    async def release(queue_id, *, respect_pacing):
+        released.append((queue_id, respect_pacing))
+        return True
+
+    class FakeQuery:
+        data = f"automation:mobile:{approval.id}"
+        from_user = SimpleNamespace(id=456)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=123),
+            text="Expired approval card",
+        )
+
+        async def answer(self, *args, **kwargs):
+            answers.append((args, kwargs))
+
+        async def edit_message_text(self, *args, **kwargs):
+            edits.append((args, kwargs))
+
+    bot._send_next_reply_delivery = release
+    bot.reply_learning.record_feedback = lambda *args, **kwargs: feedback.append(
+        (args, kwargs)
+    )
+
+    asyncio.run(
+        bot.automation_approval(
+            SimpleNamespace(callback_query=FakeQuery()),
+            SimpleNamespace(),
+        )
+    )
+
+    assert bot.approvals.get(approval.id).status == "expired"
+    assert "closed automatically" in answers[0][0][0]
+    assert "No reply was posted" in edits[0][0][0]
+    assert edits[0][1]["reply_markup"] is None
+    assert released == [("expired-batch", False)]
+    assert feedback == []
+
+
+def test_safety_blocked_visible_card_auto_closes_and_releases_queue(tmp_path) -> None:
+    bot = ContentBot(
+        Settings(
+            telegram_bot_token="123:ABC",
+            automation_approvals_path=str(tmp_path / "approvals.json"),
+            reply_learning_path=str(tmp_path / "learning.json"),
+            revenue_ops_path=str(tmp_path / "revenue.json"),
+            reply_watch_path=str(tmp_path / "watch.json"),
+        )
+    )
+    bot.revenue_ops.set_risk_mode("strict")
+    for index in range(2):
+        approved = bot.approvals.create(
+            kind="reply",
+            text=f"Earlier Japanese approval {index}",
+            chat_id=123,
+            approver_user_id=456,
+            metadata={"language": "ja", "root_author": f"earlier-{index}"},
+        )
+        bot.approvals.decide(
+            approved.id,
+            approve=True,
+            chat_id=123,
+            user_id=456,
+            destination="mobile",
+        )
+    blocked = bot.approvals.create(
+        kind="reply",
+        text="Japanese card that became blocked",
+        chat_id=123,
+        approver_user_id=456,
+        target_url="https://x.com/source/status/99",
+        metadata={
+            "language": "ja",
+            "root_author": "source",
+            "reply_delivery_queue_id": "safety-batch",
+            "reply_delivery_card_sent": True,
+        },
+    )
+    answers = []
+    edits = []
+    released = []
+
+    async def release(queue_id, *, respect_pacing):
+        released.append((queue_id, respect_pacing))
+        return False
+
+    class FakeQuery:
+        data = f"automation:mobile:{blocked.id}"
+        from_user = SimpleNamespace(id=456)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=123),
+            text="Japanese approval card",
+        )
+
+        async def answer(self, *args, **kwargs):
+            answers.append((args, kwargs))
+
+        async def edit_message_text(self, *args, **kwargs):
+            edits.append((args, kwargs))
+
+    bot._send_next_reply_delivery = release
+
+    asyncio.run(
+        bot.automation_approval(
+            SimpleNamespace(callback_query=FakeQuery()),
+            SimpleNamespace(),
+        )
+    )
+
+    assert bot.approvals.get(blocked.id).status == "expired"
+    assert "closed automatically" in answers[0][0][0]
+    assert answers[0][1].get("show_alert") is not True
+    assert "Auto-closed" in edits[0][0][0]
+    assert edits[0][1]["reply_markup"] is None
+    assert released == [("safety-batch", False)]
 
 
 def test_saved_approval_releases_queue_even_when_telegram_edit_fails(tmp_path) -> None:
@@ -3344,7 +3874,8 @@ def test_friendly_error_distinguishes_gemini_upload_dom_from_bridge_endpoint() -
     )
 
     assert "attachment control was not detected" in message
-    assert "version 0.8.1" in message
+    assert "version 0.9.0" in message
+    assert "fresh-tab retry" in message
     assert "bridge endpoint itself is working" in message
     assert "endpoint was not found" not in message
 

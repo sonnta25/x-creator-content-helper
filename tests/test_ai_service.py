@@ -372,6 +372,9 @@ def test_bridge_routes_scheduled_trigger_to_automation_handler() -> None:
         async def trigger_replyvideo(self, payload):
             return {"ok": True, "video_query": payload.get("query", "")}
 
+        async def trigger_followtargets(self, payload):
+            return {"ok": True, "minutes": payload.get("follow_targets_minutes")}
+
         async def next_approved_action(self):
             return None
 
@@ -408,6 +411,17 @@ def test_bridge_routes_scheduled_trigger_to_automation_handler() -> None:
         )
         assert video_response.startswith(b"HTTP/1.1 202 Accepted")
         assert b'"video_query": "football"' in video_response
+
+        follow_response = await server._route(
+            {
+                "method": "POST",
+                "target": "/automation/triggers/followtargets",
+                "headers": {"x-extension-bridge-token": "test-token"},
+                "body": b'{"follow_targets_minutes":20}',
+            }
+        )
+        assert follow_response.startswith(b"HTTP/1.1 202 Accepted")
+        assert b'"minutes": 20' in follow_response
 
     asyncio.run(exercise())
 
